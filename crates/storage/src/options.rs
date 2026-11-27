@@ -434,8 +434,8 @@ pub fn preset_from_proto(
         proto_u32(bytes, 36).unwrap_or(defaults.question_action);
     preset.answer_action =
         proto_u32(bytes, 43).unwrap_or(defaults.answer_action);
-    preset.wait_for_audio =
-        anki::protobuf_varint(bytes, 44).unwrap_or_default() == 0;
+    preset.wait_for_audio = anki::protobuf_varint(bytes, 44)
+        .map_or(defaults.wait_for_audio, |value| value != 0);
     preset.skip_question_when_replaying_answer =
         anki::protobuf_varint(bytes, 26).unwrap_or_default() != 0;
     preset.bury_new = anki::protobuf_varint(bytes, 27).unwrap_or_default() != 0;

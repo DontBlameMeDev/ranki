@@ -1,10 +1,17 @@
 #![expect(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
     clippy::excessive_nesting,
     clippy::let_and_return,
+    clippy::identity_op,
+    clippy::indexing_slicing,
     clippy::missing_const_for_fn,
+    clippy::needless_borrows_for_generic_args,
     clippy::needless_pass_by_value,
     clippy::too_many_arguments,
+    clippy::redundant_clone,
     clippy::too_many_lines,
+    clippy::unreadable_literal,
     clippy::unwrap_used,
     reason = "test fixtures use fixed identifiers and explicit SQL"
 )]
@@ -1224,7 +1231,7 @@ fn recomputed_sort_field_strips_html() {
             "html",
             1,
             200,
-            "<b>bold</b> extra\u{001f}one\u{001f}two",
+            "extra\u{001f}<b>one</b>\u{001f}two",
         )],
         &[],
         &[],
@@ -1319,4 +1326,792 @@ fn skipped_update_drops_cards_for_absent_templates() {
     assert_eq!(report.cards, 0);
     let connection = Connection::open(collection).unwrap();
     assert_eq!(ids(&connection, "SELECT id FROM cards"), Vec::<i64>::new());
+}
+
+fn append_varint(bytes: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        bytes.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    bytes.push(value as u8);
+}
+
+fn proto_varint(field: u32, value: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    append_varint(&mut bytes, (u64::from(field) << 3) | 0);
+    append_varint(&mut bytes, value);
+    bytes
+}
+
+#[test]
+fn unknown_preset_fields_survive_changed_and_unchanged_imports() {
+    let fixture = Fixture::new();
+    let mut preset = ranki_storage::preset_from_json(
+        700,
+        &preset(700, "Fast", &[5.0]),
+        true,
+    );
+    let source = fixture.collection18(
+        "preset-raw-source",
+        &preset,
+        &ranki_storage::deck_from_json(
+            1,
+            &json!({"id": 1, "name": "Default", "conf": 700, "dyn": 0}),
+        ),
+        &ranki_storage::models_from_json(
+            &entries(&[model(500, "Extra", &["Front"])][..]).to_string(),
+        )
+        .unwrap()
+        .remove(0),
+        &[],
+        &[],
+    );
+    {
+        let connection = Connection::open(&source).unwrap();
+        let config: Vec<u8> = connection
+            .query_row(
+                "SELECT config FROM deck_config WHERE id = 700",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE deck_config SET config = ?1 WHERE id = 700",
+                params![config],
+            )
+            .unwrap();
+    }
+    let destination = fixture.empty_schema18("preset-raw-dest");
+    {
+        let connection = Connection::open(&destination).unwrap();
+        preset.name = "Other".to_owned();
+        let mut config = ranki_storage::preset_to_proto(&preset);
+        config.extend(proto_varint(99, 7));
+        connection
+            .execute(
+                "INSERT INTO deck_config (id, name, mtime_secs, usn, config) VALUES (700, 'Fast', 0, 0, ?1)",
+                params![config],
+            )
+            .unwrap();
+    }
+    let package = fixture.package(&source, "preset-raw");
+    let (collection, _) = fixture.import(&package, "preset-raw-dest");
+    let connection = Connection::open(collection).unwrap();
+    let config: Vec<u8> = connection
+        .query_row("SELECT config FROM deck_config WHERE id = 700", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(protobuf_varint(&config, 99), Some(7));
+}
+
+#[test]
+fn colliding_preset_id_does_not_replace_unrelated_preset() {
+    let fixture = Fixture::new();
+    let models = entries(&[model(1, "Basic", &["Front", "Back"])]);
+    let decks = entries(&[deck(1, "Default", 7)]);
+    let presets = entries(&[preset(7, "Slow", &[1.0, 10.0])]);
+    fixture.collection11(
+        "collide-dest",
+        models.clone(),
+        decks.clone(),
+        presets,
+        &[],
+        &[],
+        &[],
+    );
+    let source = fixture.collection11(
+        "collide-source",
+        models,
+        decks,
+        entries(&[preset(7, "Fast", &[5.0, 20.0])]),
+        &[],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source, "collide");
+    let (collection, _) = fixture.import(&package, "collide-dest");
+    let connection = Connection::open(collection).unwrap();
+    let presets = col_value(&connection, "dconf");
+    assert_eq!(presets.as_object().unwrap().len(), 2);
+    assert_eq!(presets.get("7").unwrap().get("name").unwrap(), "Slow");
+}
+
+#[test]
+fn no_deck_configs_keeps_matched_deck_preset() {
+    let fixture = Fixture::new();
+    let models = entries(&[model(1, "Basic", &["Front", "Back"])]);
+    let decks = entries(&[deck(1, "Default", 2)]);
+    let presets = entries(&[preset(2, "Default", &[1.0, 10.0])]);
+    fixture.collection11(
+        "keep-preset-dest",
+        models.clone(),
+        decks.clone(),
+        presets.clone(),
+        &[],
+        &[],
+        &[],
+    );
+    let source = fixture.collection11(
+        "keep-preset-source",
+        models,
+        decks,
+        presets,
+        &[],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source, "keep-preset");
+    let (collection, _) = fixture.import_with(
+        &package,
+        "keep-preset-dest",
+        ImportOptions {
+            with_deck_configs: false,
+            ..ImportOptions::default()
+        },
+    );
+    let connection = Connection::open(collection).unwrap();
+    let decks = col_value(&connection, "decks");
+    assert_eq!(decks.get("1").unwrap().get("conf").unwrap(), 2);
+}
+
+#[test]
+fn active_daily_limit_survives_zero_study_counter() {
+    let fixture = Fixture::new();
+    let value = json!({
+        "id": 1, "name": "Default", "conf": 1, "dyn": 0,
+        "newLimitToday": [42, 200], "newToday": [0, 0]
+    });
+    let models = entries(&[model(1, "Basic", &["Front", "Back"])]);
+    let decks = entries(&[value]);
+    let presets = entries(&[preset(1, "Default", &[1.0, 10.0])]);
+    fixture.collection11(
+        "day-limit-dest",
+        models.clone(),
+        entries(&[deck(1, "Default", 1)]),
+        presets.clone(),
+        &[],
+        &[],
+        &[],
+    );
+    let source = fixture.collection11(
+        "day-limit-source",
+        models,
+        decks,
+        presets,
+        &[],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source, "day-limit");
+    let (collection, _) = fixture.import(&package, "day-limit-dest");
+    let connection = Connection::open(collection).unwrap();
+    let decks = col_value(&connection, "decks");
+    let limit = decks.get("1").unwrap().get("newLimitToday").unwrap();
+    assert_eq!(limit.get(0).unwrap(), 42);
+}
+
+#[test]
+fn filtered_parent_replacement_is_shared_between_children() {
+    let fixture = Fixture::new();
+    let destination = fixture.empty_schema18("filtered-parent-dest");
+    let filtered = ranki_storage::deck_from_json(
+        9,
+        &json!({"id": 9, "name": "Trips", "conf": 1, "dyn": 1}),
+    );
+    let (common, kind) = ranki_storage::deck_to_proto(&filtered);
+    let connection = Connection::open(&destination).unwrap();
+    ranki_storage::register_collations(&connection).unwrap();
+    connection
+        .execute(
+            "INSERT INTO decks (id, name, mtime_secs, usn, common, kind) VALUES (9, 'Trips', 0, 0, ?1, ?2)",
+            params![common, kind],
+        )
+        .unwrap();
+    drop(connection);
+    let models = entries(&[model(1, "Basic", &["Front"])]);
+    let decks = entries(&[
+        deck(1, "Default", 1),
+        deck(20, "Trips::One", 1),
+        deck(21, "Trips::Two", 1),
+    ]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    let source = fixture.collection11(
+        "filtered-parent-source",
+        models,
+        decks,
+        presets,
+        &[],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source, "filtered-parent");
+    let (collection, _) = fixture.import(&package, "filtered-parent-dest");
+    let connection = Connection::open(collection).unwrap();
+    ranki_storage::register_collations(&connection).unwrap();
+    let names = strings(&connection, "SELECT name FROM decks ORDER BY name");
+    let replacement = names
+        .iter()
+        .find(|name| name.starts_with("Trips "))
+        .expect("replacement parent");
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| name.starts_with(&format!("{replacement}\u{1f}")))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn merge_notetypes_keeps_cloze_and_normal_separate() {
+    let fixture = Fixture::new();
+    let mut target = model(50, "Basic", &["Front"]);
+    let mut source = model(50, "Basic", &["Front"]);
+    if let Some(object) = source.as_object_mut() {
+        let _ = object.insert("type".to_owned(), json!(1));
+        let _ = object.insert("mod".to_owned(), json!(200));
+    }
+    if let Some(object) = target.as_object_mut() {
+        let _ = object.insert("mod".to_owned(), json!(100));
+    }
+    let decks = entries(&[deck(1, "Default", 1)]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    fixture.collection11(
+        "cloze-dest",
+        entries(slice::from_ref(&target)),
+        decks.clone(),
+        presets.clone(),
+        &[],
+        &[],
+        &[],
+    );
+    let source_path = fixture.collection11(
+        "cloze-source",
+        entries(slice::from_ref(&source)),
+        decks,
+        presets,
+        &[note(1, "cloze", 50, 200, "{{c1::Paris}}\u{001f}back")],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source_path, "cloze");
+    let (collection, _) = fixture.import_with(
+        &package,
+        "cloze-dest",
+        ImportOptions {
+            merge_notetypes: true,
+            ..ImportOptions::default()
+        },
+    );
+    let connection = Connection::open(collection).unwrap();
+    let models = col_value(&connection, "models");
+    assert_eq!(models.as_object().unwrap().len(), 2);
+    let mid = number(&connection, "SELECT mid FROM notes WHERE guid = 'cloze'");
+    assert_eq!(
+        models.get(&mid.to_string()).unwrap().get("type").unwrap(),
+        1
+    );
+}
+
+#[test]
+fn reimport_reuses_original_id_remapped_note_type() {
+    let fixture = Fixture::new();
+    let target = model(50, "Basic", &["Front"]);
+    let mut source = model(50, "Basic", &["Front", "Extra"]);
+    if let Some(object) = source.as_object_mut() {
+        let _ = object.insert("mod".to_owned(), json!(200));
+    }
+    let decks = entries(&[deck(1, "Default", 1)]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    fixture.collection11(
+        "remap-dest",
+        entries(slice::from_ref(&target)),
+        decks.clone(),
+        presets.clone(),
+        &[],
+        &[],
+        &[],
+    );
+    let source_path = fixture.collection11(
+        "remap-source",
+        entries(slice::from_ref(&source)),
+        decks,
+        presets,
+        &[note(1, "remap", 50, 200, "front\u{001f}extra")],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source_path, "remap");
+    let options = ImportOptions::default();
+    let (collection, _) = fixture.import_with(&package, "remap-dest", options);
+    let first_mid = number(
+        &Connection::open(&collection).unwrap(),
+        "SELECT mid FROM notes",
+    );
+    let (_, _) = fixture.import_with(&package, "remap-dest", options);
+    let connection = Connection::open(collection).unwrap();
+    assert_eq!(number(&connection, "SELECT mid FROM notes"), first_mid);
+    assert_eq!(
+        col_value(&connection, "models").as_object().unwrap().len(),
+        2
+    );
+}
+
+#[test]
+fn effective_note_type_mtime_controls_later_updates() {
+    let fixture = Fixture::new();
+    let mut target = model(1, "Basic", &["Front"]);
+    if let Some(object) = target.as_object_mut() {
+        let _ = object.insert("mod".to_owned(), json!(100));
+    }
+    let decks = entries(&[deck(1, "Default", 1)]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    fixture.collection11(
+        "mtime-chain-dest",
+        entries(slice::from_ref(&target)),
+        decks.clone(),
+        presets.clone(),
+        &[],
+        &[],
+        &[],
+    );
+    for (name, modified) in [("newer", 200), ("older", 150)] {
+        let mut source = model(1, "Basic", &["Front"]);
+        if let Some(object) = source.as_object_mut() {
+            let _ = object.insert("mod".to_owned(), json!(modified));
+            let _ = object
+                .insert("css".to_owned(), json!(format!("body {{ {name} }}")));
+        }
+        let source_path = fixture.collection11(
+            &format!("mtime-chain-{name}"),
+            entries(slice::from_ref(&source)),
+            decks.clone(),
+            presets.clone(),
+            &[],
+            &[],
+            &[],
+        );
+        let package = fixture.package(&source_path, name);
+        let (_, _) = fixture.import(&package, "mtime-chain-dest");
+    }
+    let connection =
+        Connection::open(fixture.path("mtime-chain-dest")).unwrap();
+    let models = col_value(&connection, "models");
+    assert_eq!(
+        models.get("1").unwrap().get("css").unwrap(),
+        "body { newer }"
+    );
+}
+
+#[test]
+fn appended_template_keeps_existing_ordinal() {
+    let fixture = Fixture::new();
+    let mut target = model(1, "Basic", &["Front"]);
+    let template = target
+        .get_mut("tmpls")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()
+        .first_mut()
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    let _ = template.insert("ord".to_owned(), json!(1));
+    let mut source = target.clone();
+    add_template(&mut source, "Card 2", 2);
+    if let Some(object) = source.as_object_mut() {
+        let _ = object.insert("mod".to_owned(), json!(200));
+    }
+    let decks = entries(&[deck(1, "Default", 1)]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    fixture.collection11(
+        "template-ord-dest",
+        entries(slice::from_ref(&target)),
+        decks.clone(),
+        presets.clone(),
+        &[],
+        &[],
+        &[],
+    );
+    let source_path = fixture.collection11(
+        "template-ord-source",
+        entries(slice::from_ref(&source)),
+        decks,
+        presets,
+        &[],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source_path, "template-ord");
+    let (collection, _) = fixture.import(&package, "template-ord-dest");
+    let connection = Connection::open(collection).unwrap();
+    let models = col_value(&connection, "models");
+    let ords: Vec<i64> = models
+        .get("1")
+        .unwrap()
+        .get("tmpls")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.get("ord").unwrap().as_i64().unwrap())
+        .collect();
+    assert_eq!(ords, vec![1, 2]);
+}
+
+#[test]
+fn cloze_deletion_ordinals_survive_equal_mtime() {
+    let fixture = Fixture::new();
+    let mut target = model(50, "Cloze", &["Text"]);
+    let mut source = target.clone();
+    if let Some(object) = target.as_object_mut() {
+        let _ = object.insert("type".to_owned(), json!(1));
+    }
+    if let Some(object) = source.as_object_mut() {
+        let _ = object.insert("type".to_owned(), json!(1));
+    }
+    let decks = entries(&[deck(1, "Default", 1)]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    fixture.collection11(
+        "cloze-ord-dest",
+        entries(slice::from_ref(&target)),
+        decks.clone(),
+        presets.clone(),
+        &[note(1, "cloze-ord", 50, 100, "{{c1::one}} {{c2::two}}")],
+        &[],
+        &[],
+    );
+    let source_path = fixture.collection11(
+        "cloze-ord-source",
+        entries(slice::from_ref(&source)),
+        decks,
+        presets,
+        &[note(1, "cloze-ord", 50, 100, "{{c1::one}} {{c2::two}}")],
+        &[Card {
+            id: 20,
+            nid: 1,
+            did: 1,
+            ord: 2,
+        }],
+        &[],
+    );
+    let package = fixture.package(&source_path, "cloze-ord");
+    let (collection, _) = fixture.import(&package, "cloze-ord-dest");
+    let connection = Connection::open(collection).unwrap();
+    assert_eq!(
+        number(&connection, "SELECT ord FROM cards WHERE id = 20"),
+        2
+    );
+}
+
+#[test]
+fn no_scheduling_returns_filtered_cards_to_home_deck() {
+    let fixture = Fixture::new();
+    let models = entries(&[model(1, "Basic", &["Front", "Back"])]);
+    let decks = entries(&[deck(1, "Default", 1), deck(9, "Filtered", 1)]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    let source = fixture.collection11(
+        "home-deck-source",
+        models,
+        decks,
+        presets,
+        &[note(1, "home", 1, 100, "front\u{001f}back")],
+        &[Card {
+            id: 20,
+            nid: 1,
+            did: 9,
+            ord: 0,
+        }],
+        &[],
+    );
+    {
+        let connection = Connection::open(&source).unwrap();
+        connection
+            .execute("UPDATE cards SET odid = 3 WHERE id = 20", [])
+            .unwrap();
+    }
+    let package = fixture.package(&source, "home-deck");
+    let (collection, _) = fixture.import_with(
+        &package,
+        "home-deck-dest",
+        ImportOptions {
+            with_scheduling: false,
+            ..ImportOptions::default()
+        },
+    );
+    let connection = Connection::open(collection).unwrap();
+    assert_eq!(
+        number(&connection, "SELECT did FROM cards WHERE id = 20"),
+        3
+    );
+    assert_eq!(
+        number(&connection, "SELECT odid FROM cards WHERE id = 20"),
+        0
+    );
+}
+
+#[test]
+fn col_mod_advances_past_existing_stamp() {
+    let fixture = Fixture::new();
+    let models = entries(&[model(1, "Basic", &["Front", "Back"])]);
+    let decks = entries(&[deck(1, "Default", 1)]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    let destination = fixture.collection11(
+        "stamp-monotonic-dest",
+        models.clone(),
+        decks.clone(),
+        presets.clone(),
+        &[],
+        &[],
+        &[],
+    );
+    {
+        let connection = Connection::open(&destination).unwrap();
+        connection
+            .execute(
+                "UPDATE col SET mod = 9999999999999, scm = 4242 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+    }
+    let source = fixture.collection11(
+        "stamp-monotonic-source",
+        models,
+        decks,
+        presets,
+        &[note(1, "stamp", 1, 100, "front\u{001f}back")],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source, "stamp-monotonic");
+    let (collection, _) = fixture.import(&package, "stamp-monotonic-dest");
+    let connection = Connection::open(collection).unwrap();
+    assert!(
+        number(&connection, "SELECT mod FROM col WHERE id = 1") > 9999999999999
+    );
+    assert_eq!(
+        number(&connection, "SELECT scm FROM col WHERE id = 1"),
+        4242
+    );
+}
+
+#[test]
+fn target_collection_selections_stay_local() {
+    let fixture = Fixture::new();
+    let models = entries(&[model(1, "Basic", &["Front", "Back"])]);
+    let decks = entries(&[deck(7, "Study", 1)]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    let destination = fixture.collection11(
+        "selections-dest",
+        models.clone(),
+        decks.clone(),
+        presets.clone(),
+        &[],
+        &[],
+        &[],
+    );
+    {
+        let connection = Connection::open(&destination).unwrap();
+        connection
+            .execute(
+                "UPDATE col SET conf = ?1 WHERE id = 1",
+                params![
+                    json!({"curDeck": 7, "curModel": 1, "activeDecks": [7]})
+                        .to_string()
+                ],
+            )
+            .unwrap();
+    }
+    let source = fixture.collection11(
+        "selections-source",
+        models,
+        entries(&[deck(7, "Travel", 1)]),
+        presets,
+        &[],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source, "selections");
+    let (collection, _) = fixture.import(&package, "selections-dest");
+    let connection = Connection::open(collection).unwrap();
+    let conf = col_value(&connection, "conf");
+    assert_eq!(conf.get("curDeck").unwrap(), 7);
+    assert_eq!(conf.get("activeDecks").unwrap(), &json!([7]));
+}
+
+#[test]
+fn normalized_deck_description_reaches_kind_blob() {
+    let fixture = Fixture::new();
+    let destination = fixture.empty_schema18("description-dest");
+    let deck = ranki_storage::deck_from_json(
+        1,
+        &json!({"id": 1, "name": "Default", "conf": 1, "desc": "old", "dyn": 0}),
+    );
+    let (common, kind) = ranki_storage::deck_to_proto(&deck);
+    let connection = Connection::open(&destination).unwrap();
+    ranki_storage::register_collations(&connection).unwrap();
+    connection
+        .execute(
+            "INSERT INTO decks (id, name, mtime_secs, usn, common, kind) VALUES (1, 'Default', 0, 0, ?1, ?2)",
+            params![common, kind],
+        )
+        .unwrap();
+    drop(connection);
+    let models = entries(&[model(1, "Basic", &["Front"])]);
+    let source = fixture.collection11(
+        "description-source",
+        models,
+        entries(&[json!({"id": 1, "name": "Default", "conf": 1, "desc": "new", "dyn": 0})]),
+        entries(&[preset(1, "Default", &[1.0])]),
+        &[],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source, "description");
+    let (collection, _) = fixture.import(&package, "description-dest");
+    let connection = Connection::open(collection).unwrap();
+    let kind: Vec<u8> = connection
+        .query_row("SELECT kind FROM decks WHERE id = 1", [], |row| row.get(0))
+        .unwrap();
+    let normal = read_proto_bytes_for_test(&kind, 1);
+    assert_eq!(
+        String::from_utf8_lossy(&read_proto_bytes_for_test(&normal, 4)),
+        "new"
+    );
+}
+
+#[test]
+fn unchanged_normalized_note_type_keeps_mtime() {
+    let fixture = Fixture::new();
+    let destination = fixture.empty_schema18("mtime-keep-dest");
+    let model_entry = ranki_storage::models_from_json(
+        &entries(&[model(1, "Basic", &["Front"])][..]).to_string(),
+    )
+    .unwrap()
+    .remove(0);
+    let connection = Connection::open(&destination).unwrap();
+    ranki_storage::register_collations(&connection).unwrap();
+    ranki_storage::insert_model_tables_for_import(
+        &connection,
+        &model_entry,
+        50,
+        0,
+    )
+    .unwrap();
+    drop(connection);
+    let source = fixture.collection11(
+        "mtime-keep-source",
+        entries(&[model(1, "Basic", &["Front"])]),
+        entries(&[deck(1, "Default", 1)]),
+        entries(&[preset(1, "Default", &[1.0])]),
+        &[note(1, "keep", 1, 100, "front")],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source, "mtime-keep");
+    let (collection, _) = fixture.import(&package, "mtime-keep-dest");
+    let connection = Connection::open(collection).unwrap();
+    assert_eq!(
+        number(&connection, "SELECT mtime_secs FROM notetypes WHERE id = 1"),
+        50
+    );
+}
+
+fn read_proto_bytes_for_test(bytes: &[u8], wanted: u64) -> Vec<u8> {
+    let mut position = 0;
+    while position < bytes.len() {
+        let tag = read_varint(bytes, &mut position).unwrap();
+        if (tag >> 3, tag & 7) == (wanted, 2) {
+            let length = read_varint(bytes, &mut position).unwrap() as usize;
+            return bytes[position..position + length].to_vec();
+        }
+        match tag & 7 {
+            2 => {
+                let length =
+                    read_varint(bytes, &mut position).unwrap() as usize;
+                position += length;
+            }
+            0 => {
+                read_varint(bytes, &mut position).unwrap();
+            }
+            1 => position += 8,
+            5 => position += 4,
+            _ => break,
+        }
+    }
+    Vec::new()
+}
+
+#[test]
+fn remapped_preset_keeps_unknown_fields() {
+    let fixture = Fixture::new();
+    let mut fast =
+        ranki_storage::preset_from_json(7, &preset(7, "Fast", &[5.0]), true);
+    fast.name = "Fast".to_owned();
+    let slow =
+        ranki_storage::preset_from_json(7, &preset(7, "Slow", &[1.0]), true);
+    let model = ranki_storage::models_from_json(
+        &entries(&[model(500, "Extra", &["Front"])][..]).to_string(),
+    )
+    .unwrap()
+    .remove(0);
+    let deck = ranki_storage::deck_from_json(
+        1,
+        &json!({"id": 1, "name": "Default", "conf": 7, "dyn": 0}),
+    );
+    fixture.collection18(
+        "remapped-preset-dest",
+        &slow,
+        &deck,
+        &model,
+        &[],
+        &[],
+    );
+    let source = fixture.collection18(
+        "remapped-preset-source",
+        &fast,
+        &deck,
+        &model,
+        &[],
+        &[],
+    );
+    {
+        let connection = Connection::open(&source).unwrap();
+        let mut config: Vec<u8> = connection
+            .query_row(
+                "SELECT config FROM deck_config WHERE id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        config.extend(proto_varint(99, 7));
+        connection
+            .execute(
+                "UPDATE deck_config SET config = ?1 WHERE id = 7",
+                params![config],
+            )
+            .unwrap();
+    }
+    let package = fixture.package(&source, "remapped-preset");
+    let (collection, _) = fixture.import(&package, "remapped-preset-dest");
+    let connection = Connection::open(collection).unwrap();
+    ranki_storage::register_collations(&connection).unwrap();
+    let id: i64 = connection
+        .query_row(
+            "SELECT id FROM deck_config WHERE name = 'Fast'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_ne!(id, 7);
+    let config: Vec<u8> = connection
+        .query_row(
+            "SELECT config FROM deck_config WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(protobuf_varint(&config, 99), Some(7));
 }

@@ -13,6 +13,7 @@ use clap::Parser;
 use clap::Subcommand;
 use ranki_core::FsrsScheduler;
 use ranki_format::ExportOptions;
+use ranki_format::UpdateCondition;
 use ranki_format::export_apkg_with_options;
 use ranki_format::export_colpkg_with_options;
 use ranki_format::import_apkg;
@@ -303,11 +304,21 @@ enum Command {
     Import {
         package: PathBuf,
         /// Update matching notes: if-newer, always, or never.
-        #[arg(long, value_name = "WHEN", default_value = "if-newer")]
-        update_notes: String,
+        #[arg(
+            long,
+            value_name = "WHEN",
+            default_value = "if-newer",
+            value_parser = parse_update_condition
+        )]
+        update_notes: UpdateCondition,
         /// Update matching note types: if-newer, always, or never.
-        #[arg(long, value_name = "WHEN", default_value = "if-newer")]
-        update_notetypes: String,
+        #[arg(
+            long,
+            value_name = "WHEN",
+            default_value = "if-newer",
+            value_parser = parse_update_condition
+        )]
+        update_notetypes: UpdateCondition,
         /// Merge fields and templates of incompatible same-id note types.
         #[arg(long)]
         merge_notetypes: bool,
@@ -380,6 +391,10 @@ enum Command {
     },
     /// Serve the Model Context Protocol over stdio.
     Mcp,
+}
+
+fn parse_update_condition(value: &str) -> Result<UpdateCondition, String> {
+    value.parse()
 }
 
 fn parse_rating(value: &str) -> Result<Rating, String> {
@@ -532,12 +547,8 @@ fn run_with_sync(
                 )
             } else {
                 let options = ranki_format::ImportOptions {
-                    update_notes: update_notes
-                        .parse()
-                        .map_err(CliError::Message)?,
-                    update_notetypes: update_notetypes
-                        .parse()
-                        .map_err(CliError::Message)?,
+                    update_notes,
+                    update_notetypes,
                     merge_notetypes,
                     with_scheduling: !no_scheduling,
                     with_deck_configs: !no_deck_configs,
