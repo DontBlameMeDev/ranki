@@ -745,8 +745,11 @@ fn schema11_combines_days_across_all_four_counters() {
 
 #[test]
 fn field_44_wait_for_audio_round_trips_both_values() {
-    for raw in [0_u64, 1] {
-        let bytes = varint(44, raw);
+    for (bytes, expected) in [
+        (varint(44, 0), false),
+        (varint(44, 1), true),
+        (Vec::new(), false),
+    ] {
         let preset = ranki_storage::preset_from_proto(
             9,
             "Audio".to_owned(),
@@ -755,7 +758,7 @@ fn field_44_wait_for_audio_round_trips_both_values() {
             &bytes,
             true,
         );
-        assert_eq!(preset.wait_for_audio, raw != 0);
+        assert_eq!(preset.wait_for_audio, expected);
         let encoded = ranki_storage::preset_to_proto(&preset);
         let decoded = ranki_storage::preset_from_proto(
             9,
@@ -765,6 +768,6 @@ fn field_44_wait_for_audio_round_trips_both_values() {
             &encoded,
             true,
         );
-        assert_eq!(decoded.wait_for_audio, raw != 0);
+        assert_eq!(decoded.wait_for_audio, expected);
     }
 }

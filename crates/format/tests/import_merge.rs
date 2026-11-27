@@ -1758,7 +1758,8 @@ fn appended_template_keeps_existing_ordinal() {
         .iter()
         .map(|entry| entry.get("ord").unwrap().as_i64().unwrap())
         .collect();
-    assert_eq!(ords, vec![1, 2]);
+    assert_eq!(ords, vec![1]);
+    assert_eq!(models.as_object().unwrap().len(), 2);
 }
 
 #[test]
@@ -2164,4 +2165,332 @@ fn identity_field_map_preserves_source_sort_field_and_checksum() {
         ),
         12345
     );
+}
+
+#[test]
+fn explicit_renamed_parent_is_reused_by_children() {
+    let fixture = Fixture::new();
+    fixture.collection18(
+        "explicit-parent-dest",
+        &ranki_storage::preset_from_json(
+            1,
+            &preset(1, "Default", &[1.0]),
+            true,
+        ),
+        &ranki_storage::deck_from_json(
+            9,
+            &json!({"id": 9, "name": "Trips", "conf": 1, "dyn": 1}),
+        ),
+        &ranki_storage::models_from_json(
+            &entries(&[model(1, "Basic", &["Front"])][..]).to_string(),
+        )
+        .unwrap()
+        .remove(0),
+        &[],
+        &[],
+    );
+    let models = entries(&[model(1, "Basic", &["Front"])]);
+    let decks = entries(&[
+        deck(1, "Default", 1),
+        deck(20, "Trips", 1),
+        deck(21, "Trips::One", 1),
+    ]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    let source = fixture.collection11(
+        "explicit-parent-source",
+        models,
+        decks,
+        presets,
+        &[],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source, "explicit-parent");
+    let (collection, _) = fixture.import(&package, "explicit-parent-dest");
+    let connection = Connection::open(collection).unwrap();
+    ranki_storage::register_collations(&connection).unwrap();
+    let names = strings(&connection, "SELECT name FROM decks ORDER BY name");
+    let parent = names
+        .iter()
+        .find(|name| name.starts_with("Trips "))
+        .expect("renamed parent");
+    assert!(
+        names
+            .iter()
+            .any(|name| name == &format!("{parent}\u{1f}One"))
+    );
+    assert_eq!(names.iter().filter(|name| *name == parent).count(), 1);
+}
+
+#[test]
+fn active_limit_marker_is_translated_once() {
+    let fixture = Fixture::new();
+    let value = json!({
+        "id": 1, "name": "Default", "conf": 1, "dyn": 0,
+        "newLimitToday": [42, 200], "newToday": [0, 0]
+    });
+    let models = entries(&[model(1, "Basic", &["Front"])]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    fixture.collection11(
+        "limit-once-dest",
+        models.clone(),
+        entries(&[deck(1, "Default", 1)]),
+        presets.clone(),
+        &[],
+        &[],
+        &[],
+    );
+    let source = fixture.collection11(
+        "limit-once-source",
+        models,
+        entries(&[value]),
+        presets,
+        &[],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source, "limit-once");
+    let (collection, _) = fixture.import(&package, "limit-once-dest");
+    let connection = Connection::open(collection).unwrap();
+    let decks = col_value(&connection, "decks");
+    assert_eq!(
+        decks.get("1").unwrap().get("newLimitToday").unwrap(),
+        &json!([42, 200])
+    );
+}
+
+#[test]
+fn accepted_notetype_mtime_is_persisted_and_rejected_one_is_not() {
+    let fixture = Fixture::new();
+    let destination = fixture.empty_schema18("accepted-mtime-dest");
+    let target = ranki_storage::models_from_json(
+        &entries(&[model(1, "Basic", &["Front"])][..]).to_string(),
+    )
+    .unwrap()
+    .remove(0);
+    let connection = Connection::open(&destination).unwrap();
+    ranki_storage::register_collations(&connection).unwrap();
+    ranki_storage::insert_model_tables_for_import(&connection, &target, 100, 0)
+        .unwrap();
+    drop(connection);
+    for (name, modified) in [("accepted", 200), ("rejected", 150)] {
+        let mut source = model(1, "Basic", &["Front"]);
+        if let Some(object) = source.as_object_mut() {
+            let _ = object.insert("mod".to_owned(), json!(modified));
+            let _ = object
+                .insert("css".to_owned(), json!(format!("body {{ {name} }}")));
+        }
+        let source_path = fixture.collection11(
+            &format!("mtime-persist-{name}"),
+            entries(slice::from_ref(&source)),
+            entries(&[deck(1, "Default", 1)]),
+            entries(&[preset(1, "Default", &[1.0])]),
+            &[],
+            &[],
+            &[],
+        );
+        let package = fixture.package(&source_path, name);
+        let (_, _) = fixture.import(&package, "accepted-mtime-dest");
+    }
+    let connection = Connection::open(destination).unwrap();
+    assert_eq!(
+        number(&connection, "SELECT mtime_secs FROM notetypes WHERE id = 1"),
+        200
+    );
+    let models =
+        ranki_storage::models_from_tables_with_prefix(&connection, "main")
+            .unwrap();
+    assert_eq!(models[0].css, "body { accepted }");
+}
+
+#[test]
+fn identity_bypass_requires_equal_field_count_and_sort_index() {
+    let fixture = Fixture::new();
+    let mut target = model(1, "Basic", &["Front", "Back", "Extra"]);
+    if let Some(object) = target.as_object_mut() {
+        let _ = object.insert("sortf".to_owned(), json!(1));
+    }
+    let mut source = model(1, "Basic", &["Front", "Back"]);
+    if let Some(object) = source.as_object_mut() {
+        let _ = object.insert("mod".to_owned(), json!(200));
+        let _ = object.insert("sortf".to_owned(), json!(0));
+    }
+    let decks = entries(&[deck(1, "Default", 1)]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    fixture.collection11(
+        "field-count-dest",
+        entries(slice::from_ref(&target)),
+        decks.clone(),
+        presets.clone(),
+        &[],
+        &[],
+        &[],
+    );
+    let source_path = fixture.collection11(
+        "field-count-source",
+        entries(slice::from_ref(&source)),
+        decks,
+        presets,
+        &[note(1, "fields", 1, 200, "front\u{001f}back")],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source_path, "field-count");
+    let (collection, _) = fixture.import(&package, "field-count-dest");
+    let connection = Connection::open(collection).unwrap();
+    let models = col_value(&connection, "models");
+    let fields = models
+        .get("1")
+        .unwrap()
+        .get("flds")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(fields.len(), 3);
+    assert_eq!(models.as_object().unwrap().len(), 2);
+    assert_eq!(
+        field(&connection, "SELECT sfld FROM notes WHERE guid = 'fields'"),
+        "front"
+    );
+}
+
+#[test]
+fn normalized_kind_keeps_merged_limits_and_unknown_common() {
+    let fixture = Fixture::new();
+    let destination = fixture.empty_schema18("kind-limit-dest");
+    let target = ranki_storage::deck_from_json(
+        1,
+        &json!({"id": 1, "name": "Default", "conf": 1, "dyn": 0}),
+    );
+    let (common, kind) = ranki_storage::deck_to_proto(&target);
+    let mut common = common;
+    common.extend(proto_varint(99, 7));
+    let connection = Connection::open(&destination).unwrap();
+    ranki_storage::register_collations(&connection).unwrap();
+    connection
+        .execute(
+            "INSERT INTO decks (id, name, mtime_secs, usn, common, kind) VALUES (1, 'Default', 0, 0, ?1, ?2)",
+            params![common, kind],
+        )
+        .unwrap();
+    drop(connection);
+    let source = fixture.collection11(
+        "kind-limit-source",
+        entries(&[model(1, "Basic", &["Front"])]),
+        entries(&[json!({
+            "id": 1, "name": "Default", "conf": 1, "dyn": 0,
+            "newLimit": 42, "md": true, "desc": "new"
+        })]),
+        entries(&[preset(1, "Default", &[1.0])]),
+        &[],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source, "kind-limit");
+    let (collection, _) = fixture.import(&package, "kind-limit-dest");
+    let connection = Connection::open(collection).unwrap();
+    let kind: Vec<u8> = connection
+        .query_row("SELECT kind FROM decks WHERE id = 1", [], |row| row.get(0))
+        .unwrap();
+    let normal = read_proto_bytes_for_test(&kind, 1);
+    assert_eq!(protobuf_varint(&normal, 7), Some(42));
+    assert_eq!(protobuf_varint(&normal, 5), Some(1));
+    let common: Vec<u8> = connection
+        .query_row("SELECT common FROM decks WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(protobuf_varint(&common, 99), Some(7));
+}
+
+#[test]
+fn template_blob_without_deck_remap_is_kept() {
+    let fixture = Fixture::new();
+    fixture.empty_schema18("template-raw-dest");
+    let mut model = ranki_storage::models_from_json(
+        &entries(&[model(500, "Extra", &["Front"])][..]).to_string(),
+    )
+    .unwrap()
+    .remove(0);
+    let source = fixture.collection18(
+        "template-raw-source",
+        &ranki_storage::preset_from_json(
+            1,
+            &preset(1, "Default", &[1.0]),
+            true,
+        ),
+        &ranki_storage::deck_from_json(
+            1,
+            &json!({"id": 1, "name": "Default", "conf": 1, "dyn": 0}),
+        ),
+        &model,
+        &[],
+        &[],
+    );
+    {
+        let connection = Connection::open(&source).unwrap();
+        let config: Vec<u8> = connection
+            .query_row(
+                "SELECT config FROM templates WHERE ntid = 500",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut extended = config;
+        extended.extend(proto_varint(99, 7));
+        connection
+            .execute(
+                "UPDATE templates SET config = ?1 WHERE ntid = 500",
+                params![extended],
+            )
+            .unwrap();
+    }
+    let package = fixture.package(&source, "template-raw");
+    let (collection, _) = fixture.import(&package, "template-raw-dest");
+    let connection = Connection::open(collection).unwrap();
+    let config: Vec<u8> = connection
+        .query_row("SELECT config FROM templates WHERE ntid = 500", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(protobuf_varint(&config, 99), Some(7));
+    model.raw_json = None;
+}
+
+#[test]
+fn no_scheduling_import_does_not_read_target_revlogs() {
+    let fixture = Fixture::new();
+    let models = entries(&[model(1, "Basic", &["Front", "Back"])]);
+    let decks = entries(&[deck(1, "Default", 1)]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    fixture.collection11(
+        "no-sched-revlog-dest",
+        models.clone(),
+        decks.clone(),
+        presets.clone(),
+        &[],
+        &[],
+        &[Review { id: 5, cid: 99 }],
+    );
+    let source = fixture.collection11(
+        "no-sched-revlog-source",
+        models,
+        decks,
+        presets,
+        &[note(1, "no-sched", 1, 100, "front\u{001f}back")],
+        &[],
+        &[Review { id: 5, cid: 1 }],
+    );
+    let package = fixture.package(&source, "no-sched-revlog");
+    let (collection, report) = fixture.import_with(
+        &package,
+        "no-sched-revlog-dest",
+        ImportOptions {
+            with_scheduling: false,
+            ..ImportOptions::default()
+        },
+    );
+    assert_eq!(report.revlogs, 0);
+    let connection = Connection::open(collection).unwrap();
+    assert_eq!(ids(&connection, "SELECT id FROM revlog"), vec![5]);
 }

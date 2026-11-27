@@ -64,6 +64,7 @@ struct Metadata {
     models: Vec<NoteModel>,
     model_mtimes: BTreeMap<i64, i64>,
     kind_blobs: BTreeMap<i64, Vec<u8>>,
+    common_blobs: BTreeMap<i64, Vec<u8>>,
     preset_blobs: BTreeMap<i64, Vec<u8>>,
     template_blobs: BTreeMap<(i64, i64), Vec<u8>>,
 }
@@ -86,12 +87,15 @@ struct MergeState {
     model_map: BTreeMap<i64, i64>,
     field_maps: BTreeMap<i64, FieldMap>,
     sort_fields: BTreeMap<i64, usize>,
+    source_sort_fields: BTreeMap<i64, usize>,
     template_maps: BTreeMap<i64, BTreeMap<i64, i64>>,
     restricted_templates: HashSet<i64>,
     changed_presets: HashSet<i64>,
     changed_models: HashSet<i64>,
+
     parent_renames: BTreeMap<String, String>,
     cloze_models: HashSet<i64>,
+    accepted_mtimes: BTreeMap<i64, i64>,
     deck_map: BTreeMap<i64, i64>,
     preset_map: BTreeMap<i64, i64>,
     note_map: BTreeMap<i64, Option<i64>>,
@@ -252,7 +256,7 @@ impl MergeState {
         options: ImportOptions,
         layout: Layout,
     ) -> Result<Self, FormatError> {
-        let mut used_ids = HashSet::new();
+        let mut maximum = 0_i64;
         for table in [
             "notes",
             "cards",
@@ -261,31 +265,23 @@ impl MergeState {
             "deck_config",
             "notetypes",
         ] {
-            for id in all_ids(connection, "main", table)? {
-                let _ = used_ids.insert(id);
-            }
+            maximum = maximum.max(max_table_id(connection, "main", table)?);
+            maximum = maximum.max(max_table_id(connection, "incoming", table)?);
         }
         for model in &target.models {
-            let _ = used_ids.insert(model.id);
+            maximum = maximum.max(model.id);
         }
         for preset in &target.presets {
-            let _ = used_ids.insert(preset.id);
+            maximum = maximum.max(preset.id);
         }
         for deck in &target.decks {
-            let _ = used_ids.insert(deck.id);
+            maximum = maximum.max(deck.id);
         }
+        let used_ids = HashSet::new();
         Ok(Self {
-            next_id: used_ids
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(0)
-                .checked_add(1)
-                .ok_or_else(|| {
-                    FormatError::new(
-                        "identifier overflow while importing package",
-                    )
-                })?,
+            next_id: maximum.checked_add(1).ok_or_else(|| {
+                FormatError::new("identifier overflow while importing package")
+            })?,
             used_ids,
             usn,
             now_secs,
@@ -297,12 +293,14 @@ impl MergeState {
             model_map: BTreeMap::new(),
             field_maps: BTreeMap::new(),
             sort_fields: BTreeMap::new(),
+            source_sort_fields: BTreeMap::new(),
             template_maps: BTreeMap::new(),
             restricted_templates: HashSet::new(),
             changed_presets: HashSet::new(),
             changed_models: HashSet::new(),
             parent_renames: BTreeMap::new(),
             cloze_models: HashSet::new(),
+            accepted_mtimes: BTreeMap::new(),
             deck_map: BTreeMap::new(),
             preset_map: BTreeMap::new(),
             note_map: BTreeMap::new(),
@@ -310,9 +308,11 @@ impl MergeState {
             note_model: BTreeMap::new(),
             kind_blobs_new: BTreeMap::new(),
             template_blob_overrides: BTreeMap::new(),
-            used_revlog_ids: all_ids(connection, "main", "revlog")?
-                .into_iter()
-                .collect(),
+            used_revlog_ids: if options.with_scheduling {
+                all_ids(connection, "main", "revlog")?.into_iter().collect()
+            } else {
+                HashSet::new()
+            },
             report: ImportReport::default(),
         })
     }
@@ -344,12 +344,14 @@ impl MergeState {
             model_map: BTreeMap::new(),
             field_maps: BTreeMap::new(),
             sort_fields: BTreeMap::new(),
+            source_sort_fields: BTreeMap::new(),
             template_maps: BTreeMap::new(),
             restricted_templates: HashSet::new(),
             changed_presets: HashSet::new(),
             changed_models: HashSet::new(),
             parent_renames: BTreeMap::new(),
             cloze_models: HashSet::new(),
+            accepted_mtimes: BTreeMap::new(),
             deck_map: BTreeMap::new(),
             preset_map: BTreeMap::new(),
             note_map: BTreeMap::new(),
@@ -379,6 +381,22 @@ fn claim_id(
     }
 }
 
+fn max_table_id(
+    connection: &Connection,
+    prefix: &str,
+    table: &str,
+) -> Result<i64, FormatError> {
+    if !has_table(connection, prefix, table)? {
+        return Ok(0);
+    }
+    let sql = format!("SELECT MAX(id) FROM {prefix}.{table}");
+    let maximum: Option<i64> = connection
+        .query_row(&sql, [], |row| row.get(0))
+        .map_err(db_error(format!(
+            "cannot read identifiers from {prefix}.{table}"
+        )))?;
+    Ok(maximum.unwrap_or_default())
+}
 fn all_ids(
     connection: &Connection,
     prefix: &str,
@@ -639,6 +657,7 @@ fn read_decks(
             .map_err(db_error("cannot read package decks"))?;
         for (id, name, common, kind) in rows {
             let _ = metadata.kind_blobs.insert(id, kind.clone());
+            let _ = metadata.common_blobs.insert(id, common.clone());
             decks.push(ranki_storage::deck_from_proto(
                 id, &name, &common, &kind,
             ));
@@ -756,6 +775,29 @@ fn settings_equal(preset: &DeckPreset, other: &DeckPreset) -> bool {
     left == right
 }
 
+fn templates_match(target: &NoteModel, source: &NoteModel) -> bool {
+    target.templates.len() == source.templates.len()
+        && target.templates.iter().zip(source.templates.iter()).all(
+            |(target, source)| {
+                target.name.eq_ignore_ascii_case(&source.name)
+                    && target.ord == source.ord
+            },
+        )
+}
+
+fn set_model_mtime(model: &mut NoteModel, mtime: i64) {
+    let Some(raw) = model.raw_json.as_deref() else {
+        return;
+    };
+    let Ok(mut entry) = serde_json::from_str::<Value>(raw) else {
+        return;
+    };
+    if let Some(object) = entry.as_object_mut() {
+        let _ = object.insert("mod".to_owned(), json!(mtime));
+        model.raw_json = serde_json::to_string(&entry).ok();
+    }
+}
+
 fn merge_presets(
     destination: &mut Vec<DeckPreset>,
     incoming: &[DeckPreset],
@@ -849,22 +891,18 @@ fn merge_decks(
             .get(&deck.preset_id)
             .copied()
             .unwrap_or(deck.preset_id);
-        if let Some(limit) = shift_limit(
+        let new_today = shift_limit(
             deck.overrides.new_today,
             state.source_day_delta,
             state.source_today,
             state.target_today,
-        ) {
-            deck.overrides.new_today = limit;
-        }
-        if let Some(limit) = shift_limit(
+        );
+        let review_today = shift_limit(
             deck.overrides.review_today,
             state.source_day_delta,
             state.source_today,
             state.target_today,
-        ) {
-            deck.overrides.review_today = limit;
-        }
+        );
         let mut by_name = BTreeMap::new();
         for (position, existing) in destination.decks.iter().enumerate() {
             let _ = by_name
@@ -877,15 +915,46 @@ fn merge_decks(
             .is_some_and(|existing| existing.kind == deck.kind);
         if let Some(position) = match_position.filter(|_| same_kind) {
             let target_id = destination.decks[position].id;
-            merge_deck_fields(&mut destination.decks[position], &deck, state);
+            merge_deck_fields(
+                &mut destination.decks[position],
+                &deck,
+                new_today,
+                review_today,
+                state,
+            );
             let _ = mapping.insert(original.id, target_id);
             let _ = ImportCounts::increment(
                 &mut state.report.deck_outcomes.updated,
             );
             continue;
         }
+        if let Some(limit) = new_today {
+            deck.overrides.new_today = limit;
+        }
+        if let Some(limit) = review_today {
+            deck.overrides.review_today = limit;
+        }
         if match_position.is_some_and(|_| !same_kind) {
-            deck.name = format!("{} {}", deck.name, state.now_secs);
+            let mut suffix = 0_u32;
+            loop {
+                let candidate = format!(
+                    "{} {}",
+                    original.name,
+                    state.now_secs.saturating_add(i64::from(suffix))
+                );
+                if !destination
+                    .decks
+                    .iter()
+                    .any(|entry| entry.name.eq_ignore_ascii_case(&candidate))
+                {
+                    deck.name = candidate;
+                    break;
+                }
+                suffix = suffix.saturating_add(1);
+            }
+            let _ = state
+                .parent_renames
+                .insert(original.name.to_lowercase(), deck.name.clone());
         }
         ensure_parents(&mut destination.decks, &mut deck, state, &mut used)?;
         let id = claim_id(state, &mut used, deck.id)?;
@@ -904,6 +973,8 @@ fn merge_decks(
 fn merge_deck_fields(
     target: &mut EffectiveDeck,
     incoming: &EffectiveDeck,
+    new_today: Option<ranki_model::DayLimit>,
+    review_today: Option<ranki_model::DayLimit>,
     state: &MergeState,
 ) {
     if !incoming.description.is_empty() {
@@ -919,20 +990,10 @@ fn merge_deck_fields(
         .overrides
         .review_limit
         .or(target.overrides.review_limit);
-    if let Some(limit) = shift_limit(
-        incoming.overrides.new_today,
-        state.source_day_delta,
-        state.source_today,
-        state.target_today,
-    ) {
+    if let Some(limit) = new_today {
         target.overrides.new_today = limit;
     }
-    if let Some(limit) = shift_limit(
-        incoming.overrides.review_today,
-        state.source_day_delta,
-        state.source_today,
-        state.target_today,
-    ) {
+    if let Some(limit) = review_today {
         target.overrides.review_today = limit;
     }
 }
@@ -1155,9 +1216,9 @@ fn merge_models(
         if let Some(position) = position {
             let target_id = destination[position].id;
             let _ = mapping.insert(source.id, target_id);
-            let compatible = schema_key(&destination[position])
-                == schema_key(&source)
-                || same_names(&destination[position], &source);
+            let compatible = templates_match(&destination[position], &source)
+                && (schema_key(&destination[position]) == schema_key(&source)
+                    || same_names(&destination[position], &source));
             let kind_conflict = destination[position].kind != source.kind;
             if kind_conflict || (!compatible && !state.options.merge_notetypes)
             {
@@ -1174,6 +1235,9 @@ fn merge_models(
                 let _ = state
                     .sort_fields
                     .insert(source.id, usize::from(added.sort_field_index));
+                let _ = state
+                    .source_sort_fields
+                    .insert(source.id, usize::from(source.sort_field_index));
                 let _ = state.changed_models.insert(id);
                 destination.push(added);
                 let _ = mapping.insert(source.id, id);
@@ -1247,12 +1311,17 @@ fn merge_models(
             };
             let _ = state.field_maps.insert(source.id, field_map);
             let _ = state.sort_fields.insert(source.id, sort_index);
+            let _ = state
+                .source_sort_fields
+                .insert(source.id, usize::from(source.sort_field_index));
             let _ = state.template_maps.insert(source.id, template_map.clone());
             if let Some(updated) = committed {
                 destination[position] = updated;
                 let _ = state.changed_models.insert(target_id);
-                let _ =
-                    effective_mtimes.insert(target_id, model_mtime(&source));
+                let accepted = model_mtime(&source);
+                let _ = effective_mtimes.insert(target_id, accepted);
+                let _ = state.accepted_mtimes.insert(target_id, accepted);
+                set_model_mtime(&mut destination[position], accepted);
                 record_template_blobs(
                     state,
                     source.id,
@@ -1299,6 +1368,9 @@ fn merge_models(
         let _ = state
             .sort_fields
             .insert(source.id, usize::from(added.sort_field_index));
+        let _ = state
+            .source_sort_fields
+            .insert(source.id, usize::from(source.sort_field_index));
         let _ = state.field_maps.insert(source.id, identity_fields(&added));
         let _ = state
             .template_maps
@@ -1688,23 +1760,22 @@ fn merge_notes(
         }
         let model_id =
             state.model_map.get(&note.mid).copied().unwrap_or(note.mid);
-        let (identity, sort_index) = {
-            let map = state.field_maps.get(&note.mid);
-            (
-                map.is_some_and(|map| {
-                    map.positions.iter().enumerate().all(
-                        |(position, target)| {
-                            *target == u16::try_from(position).ok()
-                        },
-                    )
-                }),
-                state
-                    .sort_fields
-                    .get(&note.mid)
-                    .copied()
-                    .unwrap_or_default(),
-            )
-        };
+        let sort_index = state
+            .sort_fields
+            .get(&note.mid)
+            .copied()
+            .unwrap_or_default();
+        let identity = state.field_maps.get(&note.mid).is_some_and(|map| {
+            map.positions.len() == map.len
+                && map.positions.iter().enumerate().all(|(position, target)| {
+                    *target == u16::try_from(position).ok()
+                })
+        }) && state
+            .source_sort_fields
+            .get(&note.mid)
+            .copied()
+            .unwrap_or_default()
+            == sort_index;
         if !identity
             && let Some(fields) = state.field_maps.get(&note.mid)
             && !fields.is_empty()
@@ -2225,13 +2296,15 @@ fn write_normalized_metadata(
             .map_err(db_error("cannot write imported deck preset"))?;
     }
     for deck in &metadata.decks {
-        let (common, generated_kind) = ranki_storage::deck_to_proto(deck);
+        let (generated_common, generated_kind) =
+            ranki_storage::deck_to_proto(deck);
+        let common = metadata
+            .common_blobs
+            .get(&deck.id)
+            .cloned()
+            .unwrap_or(generated_common);
         let from_blob = metadata.kind_blobs.get(&deck.id).and_then(|blob| {
-            let normal = read_proto_bytes(blob, 1)?;
-            let mut normal =
-                replace_proto_string(&normal, 4, &deck.description)?;
-            normal = replace_proto_varint(&normal, 1, deck.preset_id)?;
-            replace_proto_bytes(blob, 1, normal)
+            overlay_normal_kind(blob, &generated_kind, deck.preset_id)
         });
         let kind = from_blob.unwrap_or(generated_kind);
         transaction
@@ -2254,7 +2327,11 @@ fn write_normalized_metadata(
             transaction,
             model,
             if state.changed_models.contains(&model.id) {
-                state.now_secs
+                state
+                    .accepted_mtimes
+                    .get(&model.id)
+                    .copied()
+                    .unwrap_or(state.now_secs)
             } else {
                 model_mtime(model)
             },
@@ -2267,17 +2344,16 @@ fn write_normalized_metadata(
             if *ntid != model.id {
                 continue;
             }
-            let source_deck = read_proto_varint(blob, 5).unwrap_or(1);
-            if let Some(mapped) = state.deck_map.get(&source_deck).copied()
-                && let Some(rewritten) = replace_proto_varint(blob, 5, mapped)
-            {
-                transaction
-                    .execute(
-                        "UPDATE templates SET config = ?1 WHERE ntid = ?2 AND ord = ?3",
-                        params![rewritten, model.id, ord],
-                    )
-                    .map_err(db_error("cannot remap template target deck"))?;
-            }
+            let applied = read_proto_varint(blob, 5)
+                .and_then(|source| state.deck_map.get(&source).copied())
+                .and_then(|mapped| replace_proto_varint(blob, 5, mapped))
+                .unwrap_or_else(|| blob.clone());
+            transaction
+                .execute(
+                    "UPDATE templates SET config = ?1 WHERE ntid = ?2 AND ord = ?3",
+                    params![applied, model.id, ord],
+                )
+                .map_err(db_error("cannot remap template target deck"))?;
         }
     }
     Ok(())
@@ -2287,6 +2363,84 @@ impl FieldMap {
     fn is_empty(&self) -> bool {
         self.positions.is_empty()
     }
+}
+
+fn overlay_normal_kind(
+    kind: &[u8],
+    generated: &[u8],
+    preset_id: i64,
+) -> Option<Vec<u8>> {
+    let mut normal = read_proto_bytes(kind, 1)?;
+    let generated_normal = read_proto_bytes(generated, 1)?;
+    normal = set_proto_varint(&normal, 1, preset_id)?;
+    for field in [2_u32, 3, 5, 6, 7, 8, 9, 10] {
+        normal = match read_proto_varint(&generated_normal, field) {
+            Some(value) => set_proto_varint(&normal, field, value)?,
+            None => remove_proto_field(&normal, field)?,
+        };
+    }
+    normal = match read_proto_bytes(&generated_normal, 4) {
+        Some(value) => set_proto_bytes(&normal, 4, value)?,
+        None => remove_proto_field(&normal, 4)?,
+    };
+    replace_proto_bytes(kind, 1, normal)
+}
+
+fn set_proto_varint(bytes: &[u8], field: u32, value: i64) -> Option<Vec<u8>> {
+    if read_proto_varint(bytes, field).is_some() {
+        return replace_proto_varint(bytes, field, value);
+    }
+    let mut result = bytes.to_vec();
+    append_varint(&mut result, u64::from(field) << 3);
+    append_varint(&mut result, u64::try_from(value).ok()?);
+    Some(result)
+}
+
+fn set_proto_bytes(
+    bytes: &[u8],
+    field: u32,
+    value: Vec<u8>,
+) -> Option<Vec<u8>> {
+    if read_proto_bytes(bytes, field).is_some() {
+        return replace_proto_bytes(bytes, field, value);
+    }
+    let mut result = bytes.to_vec();
+    append_varint(&mut result, (u64::from(field) << 3) | 2);
+    append_varint(&mut result, u64::try_from(value.len()).ok()?);
+    result.extend(value);
+    Some(result)
+}
+
+fn remove_proto_field(bytes: &[u8], wanted: u32) -> Option<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut position = 0;
+    while position < bytes.len() {
+        let start = position;
+        let tag = read_varint(bytes, &mut position)?;
+        let field = u32::try_from(tag >> 3).ok()?;
+        let end = match tag & 7 {
+            0 => {
+                let _ = read_varint(bytes, &mut position)?;
+                position
+            }
+            1 => position.checked_add(8)?,
+            2 => {
+                let size =
+                    usize::try_from(read_varint(bytes, &mut position)?).ok()?;
+                position.checked_add(size)?
+            }
+            5 => position.checked_add(4)?,
+            _ => return None,
+        };
+        position = end;
+        if position > bytes.len() {
+            return None;
+        }
+        if field != wanted {
+            result.extend_from_slice(bytes.get(start..end)?);
+        }
+    }
+    Some(result)
 }
 fn write_preset_config(
     preset: &DeckPreset,
@@ -2426,14 +2580,6 @@ fn replace_proto_bytes(
         }
     }
     None
-}
-
-fn replace_proto_string(
-    bytes: &[u8],
-    field: u32,
-    value: &str,
-) -> Option<Vec<u8>> {
-    replace_proto_bytes(bytes, field, value.as_bytes().to_vec())
 }
 
 fn read_proto_varint(bytes: &[u8], wanted: u32) -> Option<i64> {
