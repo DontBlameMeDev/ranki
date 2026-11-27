@@ -1688,15 +1688,28 @@ fn merge_notes(
         }
         let model_id =
             state.model_map.get(&note.mid).copied().unwrap_or(note.mid);
-        let fields =
-            state.field_maps.get(&note.mid).cloned().unwrap_or_default();
-        if !fields.is_empty() {
-            let sort_index = state
-                .sort_fields
-                .get(&note.mid)
-                .copied()
-                .unwrap_or_default();
-            note.fields = reorder_fields(&note.fields, &fields);
+        let (identity, sort_index) = {
+            let map = state.field_maps.get(&note.mid);
+            (
+                map.is_some_and(|map| {
+                    map.positions.iter().enumerate().all(
+                        |(position, target)| {
+                            *target == u16::try_from(position).ok()
+                        },
+                    )
+                }),
+                state
+                    .sort_fields
+                    .get(&note.mid)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+        };
+        if !identity
+            && let Some(fields) = state.field_maps.get(&note.mid)
+            && !fields.is_empty()
+        {
+            note.fields = reorder_fields(&note.fields, fields);
             let reordered = note
                 .fields
                 .split('\u{001f}')

@@ -2115,3 +2115,53 @@ fn remapped_preset_keeps_unknown_fields() {
         .unwrap();
     assert_eq!(protobuf_varint(&config, 99), Some(7));
 }
+
+#[test]
+fn identity_field_map_preserves_source_sort_field_and_checksum() {
+    let fixture = Fixture::new();
+    let models = entries(&[model(1, "Basic", &["Front", "Back"])]);
+    let decks = entries(&[deck(1, "Default", 1)]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    let source = fixture.collection11(
+        "identity-source",
+        models,
+        decks,
+        presets,
+        &[note(1, "identity", 1, 100, "<b>front</b>\u{001f}back")],
+        &[],
+        &[],
+    );
+    {
+        let connection = Connection::open(&source).unwrap();
+        connection
+            .execute(
+                "UPDATE notes SET sfld = 'custom-sort', csum = 12345 WHERE guid = 'identity'",
+                [],
+            )
+            .unwrap();
+    }
+    let package = fixture.package(&source, "identity");
+    let (collection, _) = fixture.import(&package, "identity-dest");
+    let connection = Connection::open(collection).unwrap();
+    assert_eq!(
+        field(
+            &connection,
+            "SELECT flds FROM notes WHERE guid = 'identity'"
+        ),
+        "<b>front</b>\u{001f}back"
+    );
+    assert_eq!(
+        field(
+            &connection,
+            "SELECT sfld FROM notes WHERE guid = 'identity'"
+        ),
+        "custom-sort"
+    );
+    assert_eq!(
+        number(
+            &connection,
+            "SELECT csum FROM notes WHERE guid = 'identity'"
+        ),
+        12345
+    );
+}
