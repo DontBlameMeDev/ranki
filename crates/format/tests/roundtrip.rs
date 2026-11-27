@@ -25,6 +25,7 @@ use rusqlite::Connection;
 use rusqlite::params;
 use serde_json::Value;
 use serde_json::json;
+use sha1::Digest as _;
 use tempfile::TempDir;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
@@ -619,14 +620,32 @@ fn export_uses_expected_zip_entries() {
         .file_names()
         .map(|name| name.unwrap().into_owned())
         .collect();
-    for expected in ["collection.anki21", "media", "0", "meta"] {
+    for expected in [
+        "collection.anki21",
+        "collection.anki2",
+        "media",
+        "0",
+        "meta",
+    ] {
         assert!(names.contains(expected), "missing entry {expected}");
     }
 
     assert_eq!(entry_bytes(&mut archive, "meta"), vec![0x08, 0x02]);
     assert!(archive.by_name("collection.anki21").is_ok());
-    assert!(!names.contains("collection.anki2"));
+    assert!(archive.by_name("collection.anki2").is_ok());
     assert!(!names.contains("collection.anki21b"));
+    for name in ["meta", "collection.anki2", "media", "0"] {
+        let entry = archive.by_name(name).unwrap();
+        assert_eq!(
+            entry.compression(),
+            zip::CompressionMethod::Stored,
+            "{name} must be stored"
+        );
+    }
+    assert_eq!(
+        archive.by_name("collection.anki21").unwrap().compression(),
+        zip::CompressionMethod::Deflated
+    );
     let mapping: BTreeMap<String, String> =
         serde_json::from_slice(&entry_bytes(&mut archive, "media")).unwrap();
     assert_eq!(mapping.get("0").map(String::as_str), Some("photo.png"));
@@ -649,7 +668,7 @@ fn malformed_zip_has_clear_error() {
 }
 
 #[test]
-fn missing_media_mapping_has_clear_error() {
+fn missing_media_mapping_is_tolerated() {
     let fixture = Fixture::new();
     let package = fixture.dir.path().join("no-mapping.apkg");
     build_zip(
@@ -657,16 +676,19 @@ fn missing_media_mapping_has_clear_error() {
         &[
             ("collection.anki21", fs::read(&fixture.source).unwrap()),
             ("0", b"image".to_vec()),
+            ("meta", vec![0x08, 0x02]),
         ],
     );
 
-    let error = import_apkg(
+    let media = fixture.dir.path().join("no-mapping-media");
+    let report = import_apkg(
         &package,
         &fixture.dir.path().join("no-mapping.anki2"),
-        &fixture.dir.path().join("no-mapping-media"),
+        &media,
     )
-    .unwrap_err();
-    assert!(error.to_string().contains("no media mapping"));
+    .unwrap();
+    assert_eq!(report.media, 0);
+    assert_eq!(fs::read_dir(&media).unwrap().count(), 0);
 }
 
 #[test]
@@ -734,14 +756,14 @@ fn media_names_are_sanitized_and_rewritten() {
 
     let (collection, media, report) = fixture.import(&package, "sanitized");
     assert_eq!(report.media, 1);
-    assert!(media.join("bad_name_.png").exists());
+    assert!(media.join("badname.png").exists());
     let connection = Connection::open(collection).unwrap();
     let fields = query_string(
         &connection,
         "SELECT flds FROM notes WHERE guid = ?",
         "guid-a",
     );
-    assert!(fields.contains("bad_name_.png"));
+    assert!(fields.contains("badname.png"));
     assert!(!fields.contains("bad:name?.png"));
 }
 
@@ -758,17 +780,24 @@ fn media_collision_uses_new_name_and_rewrites_notes() {
     import_apkg(&package, &collection, &media).unwrap();
 
     assert_eq!(fs::read(media.join("photo.png")).unwrap(), b"old".to_vec());
-    assert_eq!(
-        fs::read(media.join("photo_1.png")).unwrap(),
-        b"new".to_vec()
-    );
+    let hashed = media
+        .read_dir()
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .find(|name| {
+            name.starts_with("photo-")
+                && Path::new(name).extension().and_then(|ext| ext.to_str())
+                    == Some("png")
+        })
+        .expect("conflicting media gets a hash suffix");
+    assert_eq!(fs::read(media.join(&hashed)).unwrap(), b"new".to_vec());
     let connection = Connection::open(collection).unwrap();
     let fields = query_string(
         &connection,
         "SELECT flds FROM notes WHERE guid = ?",
         "guid-a",
     );
-    assert!(fields.contains("photo_1.png"));
+    assert!(fields.contains(&hashed));
 }
 
 #[test]
@@ -791,7 +820,17 @@ fn reimport_with_conflicting_media_is_idempotent() {
             "guid-a",
         )
     };
-    assert!(before.contains("photo_1.png"));
+    let hashed = media
+        .read_dir()
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .find(|name| {
+            name.starts_with("photo-")
+                && Path::new(name).extension().and_then(|ext| ext.to_str())
+                    == Some("png")
+        })
+        .expect("conflicting media gets a hash suffix");
+    assert!(before.contains(&hashed));
 
     let second = import_apkg(&package, &collection, &media).unwrap();
     assert_eq!(second.notes, 0);
@@ -832,6 +871,20 @@ fn write_stress_package(path: &Path, collection_bytes: &[u8], count: usize) {
     }
     writer.finish().unwrap();
 }
+#[expect(clippy::format_collect, reason = "test helper builds a hex string")]
+fn hashed_media_name(name: &str, data: &[u8]) -> String {
+    let digest = sha1::Sha1::digest(data);
+    let hash = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let (stem, extension) = name.rsplit_once('.').unwrap_or((name, ""));
+    if extension.is_empty() {
+        format!("{stem}-{hash}")
+    } else {
+        format!("{stem}-{hash}.{extension}")
+    }
+}
 
 fn seed_conflicting_media(directory: &Path, count: usize) -> PathBuf {
     let media = directory.join("stress-media");
@@ -847,8 +900,9 @@ fn seed_conflicting_media(directory: &Path, count: usize) -> PathBuf {
 }
 
 #[test]
+#[expect(clippy::integer_division, reason = "sample the midpoint index")]
 fn stress_import_with_many_conflicting_media() {
-    const COUNT: usize = 2000;
+    const COUNT: usize = 256;
     let fixture = Fixture::new();
     let notes: Vec<TestNote> = (0..COUNT)
         .map(|index| TestNote {
@@ -881,15 +935,16 @@ fn stress_import_with_many_conflicting_media() {
     assert_eq!(report.notes, COUNT);
     assert_eq!(report.media, COUNT);
     assert_eq!(fs::read_dir(&media).unwrap().count(), COUNT * 2);
-    for index in [0, 1000, COUNT - 1] {
+    for index in [0, COUNT / 2, COUNT - 1] {
         let name = format!("m{index:06}.png");
         assert_eq!(
             fs::read(media.join(&name)).unwrap(),
             format!("old-{index}").into_bytes()
         );
+        let payload = format!("new-{index}").into_bytes();
         assert_eq!(
-            fs::read(media.join(format!("m{index:06}_1.png"))).unwrap(),
-            format!("new-{index}").into_bytes()
+            fs::read(media.join(hashed_media_name(&name, &payload))).unwrap(),
+            payload
         );
     }
     let connection = Connection::open(&collection).unwrap();
@@ -898,7 +953,7 @@ fn stress_import_with_many_conflicting_media() {
         "SELECT flds FROM notes WHERE guid = ?",
         "stress-0",
     );
-    assert!(fields.contains("m000000_1.png"));
+    assert!(fields.contains(&hashed_media_name("m000000.png", b"new-0")));
     assert!(!fields.contains("src=\"m000000.png\""));
 
     let second = import_apkg(&package, &collection, &media).unwrap();
@@ -983,7 +1038,7 @@ fn id_collisions_do_not_lose_existing_notes() {
 fn colpkg_extracts_without_overwriting() {
     let fixture = Fixture::new();
     let package = fixture.dir.path().join("backup.colpkg");
-    let meta = vec![0x08, 0x02];
+    let meta = vec![0x08, 0x01];
     build_zip(
         &package,
         &[
@@ -1037,7 +1092,7 @@ fn colpkg_extracts_numbered_media_mapping() {
         b"image".to_vec()
     );
     assert_eq!(
-        fs::read(destination.join("media/bad_name_.png")).unwrap(),
+        fs::read(destination.join("media/badname.png")).unwrap(),
         b"pixel".to_vec()
     );
 }

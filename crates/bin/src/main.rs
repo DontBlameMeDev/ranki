@@ -12,9 +12,11 @@ mod sync;
 use clap::Parser;
 use clap::Subcommand;
 use ranki_core::FsrsScheduler;
-use ranki_format::export_apkg;
-use ranki_format::export_colpkg;
+use ranki_format::ExportOptions;
+use ranki_format::export_apkg_with_options;
+use ranki_format::export_colpkg_with_options;
 use ranki_format::import_apkg;
+use ranki_format::restore_colpkg;
 use ranki_model::Id;
 use ranki_model::NewNote;
 use ranki_model::Rating;
@@ -230,9 +232,37 @@ enum Command {
     /// Import an Anki package into the collection.
     Import { package: PathBuf },
     /// Export the collection as an Anki package.
-    Export { package: PathBuf },
+    Export {
+        package: PathBuf,
+        /// Write a legacy package instead of the latest format.
+        #[arg(long)]
+        legacy: bool,
+        /// Do not include scheduling information.
+        #[arg(long)]
+        no_scheduling: bool,
+        /// Do not include deck configurations.
+        #[arg(long)]
+        no_deck_configs: bool,
+        /// Do not include media files.
+        #[arg(long)]
+        no_media: bool,
+    },
     /// Export the collection as an Anki colpkg.
-    ExportColpkg { package: PathBuf },
+    ExportColpkg {
+        package: PathBuf,
+        /// Write a legacy package instead of the latest format.
+        #[arg(long)]
+        legacy: bool,
+        /// Do not include scheduling information.
+        #[arg(long)]
+        no_scheduling: bool,
+        /// Do not include deck configurations.
+        #[arg(long)]
+        no_deck_configs: bool,
+        /// Do not include media files.
+        #[arg(long)]
+        no_media: bool,
+    },
     /// Check that the collection can be read.
     Check,
     /// Serve the AnkiConnect-compatible JSON-RPC API.
@@ -346,6 +376,8 @@ fn run_with_sync(
     let warn_shutdown_sync = !matches!(&command, Command::Gui);
     #[cfg(not(feature = "desktop"))]
     let warn_shutdown_sync = true;
+    let restore_command =
+        matches!(&command, Command::Import { package } if is_colpkg(package));
     let result = match command {
         Command::Mcp => mcp::serve(&settings.paths, scheduler),
         #[cfg(feature = "desktop")]
@@ -359,18 +391,55 @@ fn run_with_sync(
             Err(error) => Err(error),
         },
         Command::Import { package } => {
-            let result = import_package(collection_path, media_dir, &package);
+            let result = if is_colpkg(&package) {
+                restore_package(
+                    collection_path,
+                    media_dir,
+                    &settings.paths.sync_state,
+                    &package,
+                )
+            } else {
+                import_package(collection_path, media_dir, &package)
+            };
             if result.is_ok() {
                 maybe_optimize(config, &settings);
             }
             result
         }
-        Command::Export { package } => {
-            export_package(collection_path, media_dir, &package)
-        }
-        Command::ExportColpkg { package } => {
-            export_colpkg_package(collection_path, media_dir, &package)
-        }
+        Command::Export {
+            package,
+            legacy,
+            no_scheduling,
+            no_deck_configs,
+            no_media,
+        } => export_package(
+            collection_path,
+            media_dir,
+            &package,
+            ExportOptions {
+                legacy,
+                with_scheduling: !no_scheduling,
+                with_deck_configs: !no_deck_configs,
+                with_media: !no_media,
+            },
+        ),
+        Command::ExportColpkg {
+            package,
+            legacy,
+            no_scheduling,
+            no_deck_configs,
+            no_media,
+        } => export_colpkg_package(
+            collection_path,
+            media_dir,
+            &package,
+            ExportOptions {
+                legacy,
+                with_scheduling: !no_scheduling,
+                with_deck_configs: !no_deck_configs,
+                with_media: !no_media,
+            },
+        ),
         Command::Check => check(collection_path),
         Command::Connect { port } => {
             connect::serve(collection_path, port, media_dir, &scheduler)
@@ -417,13 +486,15 @@ fn run_with_sync(
             run_store_command(&mut collection, command, &scheduler, media_dir)
         }
     };
-    let (shutdown_auth, shutdown_sync) =
-        if auto_sync && final_settings.sync.enabled && final_settings.sync.auto
-        {
-            sync::startup_credentials(&final_settings, false)
-        } else {
-            (None, false)
-        };
+    let (shutdown_auth, shutdown_sync) = if auto_sync
+        && !restore_command
+        && final_settings.sync.enabled
+        && final_settings.sync.auto
+    {
+        sync::startup_credentials(&final_settings, false)
+    } else {
+        (None, false)
+    };
     let startup_settled = startup_sync.as_ref().is_some_and(|outcome| {
         !matches!(outcome, SyncOutcome::RetryLater { .. })
     });
@@ -713,40 +784,129 @@ fn import_package(
     Ok(())
 }
 
-type Exporter =
-    fn(&Path, &Path, &Path) -> Result<(), ranki_format::FormatError>;
+fn is_colpkg(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("colpkg"))
+}
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "the export helper needs collection, media, destination, and exporter"
+    reason = "collection, media, sync state, and package are separate inputs"
+)]
+fn restore_package(
+    path: &Path,
+    media_dir: &Path,
+    sync_state: &Path,
+    package: &Path,
+) -> CliResult<()> {
+    let report = restore_colpkg(package, path, media_dir)?;
+    let backup = report.backup.clone();
+    match &backup {
+        Some(path) => println!(
+            "restored media={} backup={}",
+            report.media,
+            path.display()
+        ),
+        None => println!("restored media={}", report.media),
+    }
+    if let Err(error) = invalidate_sync_state(sync_state) {
+        eprintln!(
+            "ranki: restore committed; sync state could not be invalidated: {error}"
+        );
+        if backup.is_some() {
+            eprintln!(
+                "ranki: do not retry the restore; the backup above holds the previous collection"
+            );
+        } else {
+            eprintln!(
+                "ranki: do not retry the restore; no previous collection was backed up"
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn invalidate_sync_state(path: &Path) -> CliResult<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let bytes = fs::read(path)?;
+    let Ok(mut state) = serde_json::from_slice::<serde_json::Value>(&bytes)
+    else {
+        return Ok(());
+    };
+    if let Some(object) = state.as_object_mut() {
+        let _ = object.insert("last_scm".to_owned(), serde_json::json!(0));
+        let _ =
+            object.insert("last_local_mod".to_owned(), serde_json::json!(0));
+    }
+    fs::write(path, serde_json::to_string(&state)?)?;
+    Ok(())
+}
+
+type Exporter = fn(
+    &Path,
+    &Path,
+    &Path,
+    ExportOptions,
+) -> Result<(), ranki_format::FormatError>;
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the export helper takes collection, media, package, options, and exporter"
 )]
 fn export_with_checkpoint(
     path: &Path,
     media_dir: &Path,
     package: &Path,
+    options: ExportOptions,
     exporter: Exporter,
 ) -> CliResult<()> {
     let collection = open_or_create(path)?;
     collection.checkpoint()?;
     collection.close()?;
-    exporter(path, media_dir, package)?;
+    exporter(path, media_dir, package, options)?;
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "collection, media, package, and options are separate inputs"
+)]
 fn export_package(
     path: &Path,
     media_dir: &Path,
     package: &Path,
+    options: ExportOptions,
 ) -> CliResult<()> {
-    export_with_checkpoint(path, media_dir, package, export_apkg)
+    export_with_checkpoint(
+        path,
+        media_dir,
+        package,
+        options,
+        export_apkg_with_options,
+    )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "collection, media, package, and options are separate inputs"
+)]
 fn export_colpkg_package(
     path: &Path,
     media_dir: &Path,
     package: &Path,
+    options: ExportOptions,
 ) -> CliResult<()> {
-    export_with_checkpoint(path, media_dir, package, export_colpkg)
+    export_with_checkpoint(
+        path,
+        media_dir,
+        package,
+        options,
+        export_colpkg_with_options,
+    )
 }
 
 fn run_deck_command(
@@ -1075,6 +1235,10 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     use clap::Parser;
+    use ranki_format::export_colpkg;
+    use ranki_model::NewNote;
+    use ranki_model::Store as _;
+    use ranki_storage::Collection;
     use ranki_sync::MockResponse;
     use ranki_sync::MockTransport;
     use ranki_sync::SyncMethod;
@@ -1256,6 +1420,91 @@ mod tests {
                 SyncMethod::Upload,
                 SyncMethod::Meta,
             ]
+        );
+    }
+
+    #[test]
+    fn colpkg_restore_does_not_upload_at_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = ranki_model::DataPaths::new(directory.path());
+        assert!(crate::open_or_create(&paths.collection).is_ok());
+        let source = directory.path().join("source.anki2");
+        {
+            let mut store = Collection::create(&source).unwrap();
+            store
+                .add_note(&NewNote {
+                    model_id: ranki_model::DEFAULT_MODEL_ID,
+                    deck_id: ranki_model::DEFAULT_DECK_ID,
+                    fields: vec!["restore me".to_owned(), "back".to_owned()],
+                    tags: Vec::new(),
+                })
+                .unwrap();
+        }
+        let package = directory.path().join("backup.colpkg");
+        export_colpkg(&source, &paths.media_dir, &package).unwrap();
+        fs::write(
+            &paths.sync_state,
+            serde_json::json!({
+                "version": 1,
+                "endpoint": ranki_sync::DEFAULT_ENDPOINT,
+                "host_key": "stored-hkey",
+                "last_mod": null,
+                "last_scm": null,
+                "last_usn": 0,
+                "last_media_usn": 0,
+                "last_success": null,
+                "failures": 0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut seed = ranki_sync::SyncClient::new(
+            MockTransport::new()
+                .with_response(SyncMethod::Upload, uploaded())
+                .with_response(SyncMethod::Meta, remote_meta()),
+            &paths.collection,
+            &paths.media_dir,
+            &paths.sync_state,
+        )
+        .unwrap();
+        seed.full_upload().unwrap();
+        let mut transport = MockTransport::new()
+            .with_response(SyncMethod::Meta, remote_meta())
+            .with_response(SyncMethod::Meta, remote_meta())
+            .with_response(SyncMethod::Meta, remote_meta());
+        let sync_state = paths.sync_state.clone();
+        let next_paths = paths.clone();
+        let mut config = ranki_model::Config::default();
+        config.sync.enabled = true;
+        config.scheduler.auto_optimize = false;
+        let cli = parse(&["ranki", "import", package.to_str().unwrap()]);
+        run_with_sync(cli, &mut config, &mut transport, paths).unwrap();
+        assert!(
+            !transport
+                .requests()
+                .iter()
+                .any(|request| request.method == SyncMethod::Upload)
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&sync_state).unwrap()).unwrap();
+        assert_eq!(state["last_scm"], 0);
+        assert_eq!(state["last_local_mod"], 0);
+
+        let mut next_transport =
+            MockTransport::new().with_response(SyncMethod::Meta, remote_meta());
+        let mut next_config = config.clone();
+        run_with_sync(
+            parse(&["ranki", "decks"]),
+            &mut next_config,
+            &mut next_transport,
+            next_paths,
+        )
+        .unwrap();
+        assert!(
+            !next_transport
+                .requests()
+                .iter()
+                .any(|request| request.method == SyncMethod::Upload)
         );
     }
 
