@@ -2494,3 +2494,200 @@ fn no_scheduling_import_does_not_read_target_revlogs() {
     let connection = Connection::open(collection).unwrap();
     assert_eq!(ids(&connection, "SELECT id FROM revlog"), vec![5]);
 }
+
+#[test]
+fn stale_source_field_maps_use_final_target_field_count() {
+    let fixture = Fixture::new();
+    let target = model(1, "Basic", &["Front"]);
+    let decks = entries(&[deck(1, "Default", 1)]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    fixture.collection11(
+        "stale-fields-dest",
+        entries(slice::from_ref(&target)),
+        decks.clone(),
+        presets.clone(),
+        &[],
+        &[],
+        &[],
+    );
+    let mut first = model(10, "Basic", &["Front", "Back"]);
+    if let Some(object) = first.as_object_mut() {
+        let _ = object.insert("mod".to_owned(), json!(150));
+        let _ = object.insert("originalId".to_owned(), json!(1));
+    }
+    let mut second = model(20, "Basic", &["Front", "Back", "Extra"]);
+    if let Some(object) = second.as_object_mut() {
+        let _ = object.insert("mod".to_owned(), json!(200));
+        let _ = object.insert("originalId".to_owned(), json!(1));
+    }
+    let source = fixture.collection11(
+        "stale-fields-source",
+        entries(&[first, second]),
+        decks,
+        presets,
+        &[
+            note(10, "first", 10, 150, "front\u{001f}back"),
+            note(20, "second", 20, 200, "front\u{001f}back\u{001f}extra"),
+        ],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source, "stale-fields");
+    let (_, _) = fixture.import_with(
+        &package,
+        "stale-fields-dest",
+        ImportOptions {
+            merge_notetypes: true,
+            ..ImportOptions::default()
+        },
+    );
+    let connection =
+        Connection::open(fixture.path("stale-fields-dest")).unwrap();
+    for guid in ["first", "second"] {
+        let stored = field(
+            &connection,
+            &format!("SELECT flds FROM notes WHERE guid = '{guid}'"),
+        );
+        assert_eq!(stored.split('\u{001f}').count(), 3, "{guid}");
+    }
+}
+
+#[test]
+fn stale_source_sort_index_uses_final_target_sort_field() {
+    let fixture = Fixture::new();
+    let mut target = model(1, "Basic", &["Front", "Back"]);
+    if let Some(object) = target.as_object_mut() {
+        let _ = object.insert("sortf".to_owned(), json!(0));
+    }
+    let decks = entries(&[deck(1, "Default", 1)]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    fixture.collection11(
+        "stale-sort-dest",
+        entries(slice::from_ref(&target)),
+        decks.clone(),
+        presets.clone(),
+        &[],
+        &[],
+        &[],
+    );
+    let mut first = model(10, "Basic", &["Front", "Back"]);
+    if let Some(object) = first.as_object_mut() {
+        let _ = object.insert("sortf".to_owned(), json!(0));
+        let _ = object.insert("mod".to_owned(), json!(150));
+        let _ = object.insert("originalId".to_owned(), json!(1));
+    }
+    let mut second = model(20, "Basic", &["Front", "Back"]);
+    if let Some(object) = second.as_object_mut() {
+        let _ = object.insert("sortf".to_owned(), json!(1));
+        let _ = object.insert("mod".to_owned(), json!(200));
+        let _ = object.insert("originalId".to_owned(), json!(1));
+    }
+    let source = fixture.collection11(
+        "stale-sort-source",
+        entries(&[first, second]),
+        decks,
+        presets,
+        &[
+            note(10, "first", 10, 150, "front\u{001f}back"),
+            note(20, "second", 20, 200, "front\u{001f}back"),
+        ],
+        &[],
+        &[],
+    );
+    let package = fixture.package(&source, "stale-sort");
+    let (_, _) = fixture.import_with(
+        &package,
+        "stale-sort-dest",
+        ImportOptions {
+            merge_notetypes: true,
+            ..ImportOptions::default()
+        },
+    );
+    let connection = Connection::open(fixture.path("stale-sort-dest")).unwrap();
+    assert_eq!(
+        field(&connection, "SELECT sfld FROM notes WHERE guid = 'first'"),
+        "back"
+    );
+}
+
+#[test]
+fn new_deck_keeps_source_common_unknown_fields() {
+    let fixture = Fixture::new();
+    fixture.empty_schema18("new-deck-common-dest");
+    let source = fixture.empty_schema18("new-deck-common-source");
+    {
+        let connection = Connection::open(&source).unwrap();
+        ranki_storage::register_collations(&connection).unwrap();
+        let deck = ranki_storage::deck_from_json(
+            700,
+            &json!({"id": 700, "name": "Flags", "conf": 1, "dyn": 0}),
+        );
+        let (common, kind) = ranki_storage::deck_to_proto(&deck);
+        let mut common = common;
+        common.extend(proto_varint(99, 7));
+        connection
+            .execute(
+                "INSERT INTO decks (id, name, mtime_secs, usn, common, kind) VALUES (700, 'Flags', 0, 0, ?1, ?2)",
+                params![common, kind],
+            )
+            .unwrap();
+    }
+    let package = fixture.package(&source, "new-deck-common");
+    let (collection, _) = fixture.import(&package, "new-deck-common-dest");
+    let connection = Connection::open(collection).unwrap();
+    ranki_storage::register_collations(&connection).unwrap();
+    let common: Vec<u8> = connection
+        .query_row("SELECT common FROM decks WHERE id = 700", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(protobuf_varint(&common, 99), Some(7));
+}
+
+#[test]
+fn added_note_types_initialize_accepted_mtime() {
+    let fixture = Fixture::new();
+    let target = model(1, "Basic", &["Front"]);
+    let decks = entries(&[deck(1, "Default", 1)]);
+    let presets = entries(&[preset(1, "Default", &[1.0])]);
+    let mut target = target;
+    if let Some(object) = target.as_object_mut() {
+        object
+            .get_mut("flds")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": "Extra"}));
+    }
+    fixture.collection11(
+        "add-mtime-dest",
+        entries(slice::from_ref(&target)),
+        decks.clone(),
+        presets.clone(),
+        &[],
+        &[],
+        &[],
+    );
+    for (mid, modified) in [(10, 200), (20, 150)] {
+        let mut source = model(mid, "Basic", &["Front"]);
+        if let Some(object) = source.as_object_mut() {
+            let _ = object.insert("mod".to_owned(), json!(modified));
+        }
+        let source_path = fixture.collection11(
+            &format!("add-mtime-{mid}"),
+            entries(slice::from_ref(&source)),
+            decks.clone(),
+            presets.clone(),
+            &[],
+            &[],
+            &[],
+        );
+        let package =
+            fixture.package(&source_path, &format!("add-mtime-{mid}"));
+        let (_, _) = fixture.import(&package, "add-mtime-dest");
+    }
+    let connection = Connection::open(fixture.path("add-mtime-dest")).unwrap();
+    let models = col_value(&connection, "models");
+    assert_eq!(models.get("10").unwrap().get("mod").unwrap(), 200);
+    assert!(models.get("20").is_none());
+}

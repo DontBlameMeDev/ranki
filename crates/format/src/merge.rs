@@ -963,6 +963,18 @@ fn merge_decks(
         if let Some(blob) = state.kind_blobs_new.get(&old_id).cloned() {
             let _ = destination.kind_blobs.insert(id, blob);
         }
+        if let Some(blob) = source.common_blobs.get(&old_id).cloned() {
+            let mut common = blob;
+            if let Some(day) = read_proto_varint(&common, 3) {
+                let shifted = day.saturating_sub(state.source_day_delta);
+                common = if shifted >= 0 {
+                    set_proto_varint(&common, 3, shifted).unwrap_or(common)
+                } else {
+                    remove_proto_field(&common, 3).unwrap_or(common)
+                };
+            }
+            let _ = destination.common_blobs.insert(id, common);
+        }
         let _ = mapping.insert(original.id, id);
         let _ = ImportCounts::increment(&mut state.report.deck_outcomes.new);
         destination.decks.push(deck);
@@ -1238,6 +1250,9 @@ fn merge_models(
                 let _ = state
                     .source_sort_fields
                     .insert(source.id, usize::from(source.sort_field_index));
+                let accepted = model_mtime(&source);
+                let _ = effective_mtimes.insert(id, accepted);
+                let _ = state.accepted_mtimes.insert(id, accepted);
                 let _ = state.changed_models.insert(id);
                 destination.push(added);
                 let _ = mapping.insert(source.id, id);
@@ -1371,6 +1386,9 @@ fn merge_models(
         let _ = state
             .source_sort_fields
             .insert(source.id, usize::from(source.sort_field_index));
+        let accepted = model_mtime(&source);
+        let _ = effective_mtimes.insert(id, accepted);
+        let _ = state.accepted_mtimes.insert(id, accepted);
         let _ = state.field_maps.insert(source.id, identity_fields(&added));
         let _ = state
             .template_maps
@@ -1386,7 +1404,67 @@ fn merge_models(
         destination.push(added);
         let _ = mapping.insert(source.id, id);
     }
+    let sources: BTreeMap<i64, &NoteModel> =
+        incoming.iter().map(|model| (model.id, model)).collect();
+    for (source_id, target_id) in &mapping {
+        let Some(source) = sources.get(source_id) else {
+            continue;
+        };
+        let Some(target) =
+            destination.iter().find(|model| model.id == *target_id)
+        else {
+            continue;
+        };
+        let _ = state
+            .field_maps
+            .insert(*source_id, final_field_map(target, source));
+        let _ = state
+            .sort_fields
+            .insert(*source_id, usize::from(target.sort_field_index));
+        let _ = state
+            .source_sort_fields
+            .insert(*source_id, usize::from(source.sort_field_index));
+        let _ = state
+            .template_maps
+            .insert(*source_id, final_template_map(target, source));
+    }
     Ok(mapping)
+}
+
+fn final_field_map(target: &NoteModel, source: &NoteModel) -> FieldMap {
+    let mut positions = Vec::with_capacity(source.fields.len());
+    for field in &source.fields {
+        let position = target
+            .fields
+            .iter()
+            .position(|existing| existing.eq_ignore_ascii_case(field))
+            .and_then(|position| u16::try_from(position).ok());
+        positions.push(position);
+    }
+    FieldMap {
+        positions,
+        len: target.fields.len(),
+    }
+}
+
+fn final_template_map(
+    target: &NoteModel,
+    source: &NoteModel,
+) -> BTreeMap<i64, i64> {
+    let mut map = BTreeMap::new();
+    for (position, template) in source.templates.iter().enumerate() {
+        if let Some(target_template) = target
+            .templates
+            .iter()
+            .find(|existing| existing.name.eq_ignore_ascii_case(&template.name))
+        {
+            let old_ord =
+                source.template_ordinals.get(position).copied().unwrap_or(0);
+            let _ =
+                map.insert(i64::from(old_ord), i64::from(target_template.ord));
+        }
+    }
+    map
 }
 
 fn record_template_blobs(
