@@ -2079,16 +2079,17 @@ mod tests {
                 super::serve_incoming(&server, &store, media(), &scheduler)
             });
 
+            let mut stop = StopServer {
+                server: &server,
+                stalled: None,
+            };
             let mut stalled = TcpStream::connect(addr).unwrap();
             stalled
                 .write_all(
                     b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4096\r\n\r\n",
                 )
                 .unwrap();
-            let stop = StopServer {
-                server: &server,
-                stalled: Some(stalled),
-            };
+            stop.stalled = Some(stalled);
             thread::sleep(Duration::from_millis(100));
 
             let body = r#"{"action":"version","version":6}"#;
