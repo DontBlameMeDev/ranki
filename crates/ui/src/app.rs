@@ -2263,6 +2263,17 @@ impl Root {
         self.toast = None;
     }
 
+    /// Clears a toast only when the message still belongs to this task.
+    pub(crate) fn clear_toast_if(&mut self, seq: Option<u64>) {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| Some(toast.seq) == seq)
+        {
+            self.toast = None;
+        }
+    }
+
     /// Errors from the create-deck dialog belong next to its input, not in a
     /// toast behind the modal.
     pub(crate) fn set_create_error(
@@ -2459,13 +2470,21 @@ impl Root {
     /// Opens a picker for `.apkg` and `.colpkg` files, then imports the choice.
     pub(crate) fn import_deck(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let _ = this.update(cx, |root, cx| {
-                root.show_toast(ToastKind::Success, "Importing package...", cx);
-            });
+            let seq = this
+                .update(cx, |root, cx| {
+                    root.show_toast(
+                        ToastKind::Success,
+                        "Importing package...",
+                        cx,
+                    );
+                    root.toast.as_ref().map(|toast| toast.seq)
+                })
+                .ok()
+                .flatten();
             let chosen = choose_import_path(cx).await;
             let _ = this.update(cx, |root, cx| match chosen {
                 Ok(Some(path)) => root.import_path(path, cx),
-                Ok(None) => root.clear_toast(),
+                Ok(None) => root.clear_toast_if(seq),
                 Err(error) => root.show_toast(
                     ToastKind::Error,
                     format!("Could not choose package: {error}"),
@@ -2569,6 +2588,7 @@ impl Root {
             format!("Exporting {deck_name}..."),
             cx,
         );
+        let seq = self.toast.as_ref().map(|toast| toast.seq);
         let suggested = Self::export_file_name(&deck.name);
         let directory = collection
             .parent()
@@ -2580,7 +2600,7 @@ impl Root {
                 Ok(Ok(Some(path))) => path,
                 Ok(Ok(None)) => {
                     let _ = this.update(cx, |root, cx| {
-                        root.clear_toast();
+                        root.clear_toast_if(seq);
                         cx.notify();
                     });
                     return;

@@ -73,21 +73,25 @@ impl eframe::App for MobileApp {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         if reviewing && !text_field_focused(ctx) {
-            let phase = self.state.review.phase;
-            let can_undo = self.state.review.last.is_some();
-            let actions = ctx.input(|input| {
+            let keys = ctx.input(|input| {
                 input
                     .events
                     .iter()
                     .filter_map(|event| match event {
                         Event::Key {
                             key, pressed: true, ..
-                        } => review_shortcut(*key, phase, can_undo, false),
+                        } => Some(*key),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
             });
-            for action in actions {
+            for key in keys {
+                let phase = self.state.review.phase;
+                let can_undo = self.state.review.last.is_some();
+                let Some(action) = review_shortcut(key, phase, can_undo, false)
+                else {
+                    continue;
+                };
                 match action {
                     ReviewShortcut::Reveal => self.state.reveal(),
                     ReviewShortcut::Grade(rating) => {
