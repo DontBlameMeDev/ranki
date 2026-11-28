@@ -30,6 +30,10 @@ impl Isolated {
         self.data.join("ranki/collection.anki2")
     }
 
+    fn media(&self) -> PathBuf {
+        self.data.join("ranki/collection.media")
+    }
+
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ranki"));
         command
@@ -409,4 +413,116 @@ fn ranki_leaves_a_local_anki_profile_untouched() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(snapshot(&anki), before);
+}
+
+#[test]
+fn export_flags_control_envelope_and_media() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = Isolated::new(&dir, "flags-source");
+    let destination = Isolated::new(&dir, "flags-destination");
+    let package = dir.path().join("flags.apkg");
+    let package_arg = package.to_str().unwrap();
+
+    source.run(&[
+        "add-note",
+        "--model",
+        "1",
+        "--deck",
+        "1",
+        "--field",
+        "<img src=flag.png> flagged front",
+        "--field",
+        "back",
+    ]);
+    fs::create_dir_all(source.media()).unwrap();
+    fs::write(source.media().join("flag.png"), b"image").unwrap();
+    source.run(&[
+        "export",
+        package_arg,
+        "--legacy",
+        "--no-scheduling",
+        "--no-deck-configs",
+        "--no-media",
+    ]);
+
+    let bytes = fs::read(&package).unwrap();
+    let names = String::from_utf8_lossy(&bytes);
+    assert!(names.contains("collection.anki21"));
+    assert!(names.contains("collection.anki2"));
+    assert!(!names.contains("collection.anki21b"));
+
+    let report = destination.run(&["import", package_arg]);
+    assert!(report.contains("media=0"), "{report}");
+    let media = destination.media();
+    assert_eq!(fs::read_dir(&media).unwrap().count(), 0);
+    assert_ne!(destination.run(&["search", "flagged"]).trim(), "");
+}
+
+#[test]
+fn colpkg_import_replaces_collection_and_restores_conflicting_media() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = Isolated::new(&dir, "restore-source");
+    let destination = Isolated::new(&dir, "restore-destination");
+    let package = dir.path().join("backup.colpkg");
+    let package_arg = package.to_str().unwrap();
+
+    source.run(&[
+        "add-note",
+        "--model",
+        "1",
+        "--deck",
+        "1",
+        "--field",
+        "<img src=pic.png> restored front",
+        "--field",
+        "back",
+    ]);
+    fs::create_dir_all(source.media()).unwrap();
+    fs::write(source.media().join("pic.png"), b"new").unwrap();
+    source.run(&["export-colpkg", package_arg]);
+
+    destination.run(&[
+        "add-note",
+        "--model",
+        "1",
+        "--deck",
+        "1",
+        "--field",
+        "old front",
+        "--field",
+        "back",
+    ]);
+    fs::create_dir_all(destination.media()).unwrap();
+    fs::write(destination.media().join("pic.png"), b"old").unwrap();
+
+    let output = destination.run(&["import", package_arg]);
+    assert!(output.contains("restored media=1"), "{output}");
+
+    let backup = destination.collection().with_extension("pre-restore.anki2");
+    assert!(backup.is_file());
+    let backup_bytes = fs::read(&backup).unwrap();
+    let backup_text = String::from_utf8_lossy(&backup_bytes);
+    assert!(backup_text.contains("old front"));
+    assert!(!backup_text.contains("restored front"));
+
+    let collection = destination.collection();
+    let restored_bytes = fs::read(&collection).unwrap();
+    let restored = String::from_utf8_lossy(&restored_bytes);
+    assert!(restored.contains("restored front"));
+    assert!(!restored.contains("old front"));
+
+    let media = destination.media();
+    let files = fs::read_dir(&media)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().any(|path| fs::read(path).unwrap() == b"old"));
+    assert!(files.iter().any(|path| fs::read(path).unwrap() == b"new"));
+
+    let db = media.with_extension("media.db2");
+    let db_bytes = fs::read(db).unwrap();
+    let db_text = String::from_utf8_lossy(&db_bytes);
+    assert!(db_text.contains("CREATE TABLE media"));
+    assert!(db_text.contains("pic-"), "{db_text}");
 }

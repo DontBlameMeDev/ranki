@@ -5414,11 +5414,14 @@ version = "0.1.0"
 dependencies = [
  "ranki-model",
  "ranki-storage",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha1",
  "tempfile",
  "thiserror 2.0.21",
+ "unicode-normalization",
  "zip",
  "zstd",
 ]
