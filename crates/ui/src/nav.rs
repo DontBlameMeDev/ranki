@@ -232,7 +232,6 @@ impl Root {
                 true,
             ))
             .child(div().flex_1())
-            .children(self.render_nav_sync(compact))
             .child(nav(
                 "Settings",
                 "icon-settings",

@@ -7965,3 +7965,51 @@ fn startup_sync_runs_after_the_window_opens(cx: &mut gpui::TestAppContext) {
         Some(String::from("earlier choice"))
     );
 }
+
+#[gpui::test]
+fn sync_activity_only_appears_in_settings(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.update_entity(&root, |root, cx| {
+        root.sync.running =
+            Some(crate::sync_view::SyncActivity::DownloadingMedia);
+        cx.notify();
+    });
+    let draw = |cx: &mut gpui::VisualTestContext, width: f32| {
+        cx.draw(point(px(0.), px(0.)), size(px(width), px(800.)), |_, _| {
+            root.clone()
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    };
+    draw(cx, 1280.);
+    assert!(
+        cx.debug_bounds("sync-nav-activity").is_none(),
+        "nav rail must not show sync activity"
+    );
+    draw(cx, 800.);
+    assert!(
+        cx.debug_bounds("sync-nav-dot").is_none(),
+        "compact nav rail must not show sync activity"
+    );
+    cx.update_entity(&root, |root, cx| {
+        root.view = View::Settings;
+        cx.notify();
+    });
+    draw(cx, 1280.);
+    assert!(
+        cx.debug_bounds("sync-panel-activity").is_some(),
+        "settings must still show sync activity"
+    );
+}

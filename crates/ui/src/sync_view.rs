@@ -647,7 +647,7 @@ impl Root {
         }
     }
 
-    /// Running-sync indicator shared by the settings panel and the nav rail.
+    /// Running-sync indicator in the settings panel.
     pub(crate) fn render_sync_activity(&self) -> Option<Div> {
         let activity = self.sync.running?;
         Some(activity_line(
@@ -657,27 +657,6 @@ impl Root {
             self.sync.media,
             "sync-panel-activity",
         ))
-    }
-
-    /// Status line for the wide nav rail, or a dot when the rail is compact.
-    pub(crate) fn render_nav_sync(&self, compact: bool) -> Option<AnyElement> {
-        let activity = self.sync.running?;
-        let text = activity_text(activity, self.sync.media);
-        let colors = self.colors();
-        let motion_ms = self.motion_ms(PULSE_MS);
-        if compact {
-            return Some(sync_dot("sync-nav-dot", text, colors, motion_ms));
-        }
-        Some(
-            activity_line(
-                activity,
-                colors,
-                motion_ms,
-                self.sync.media,
-                "sync-nav-activity",
-            )
-            .into_any_element(),
-        )
     }
 
     /// Keeps session progress visible while the study footer is on screen.
@@ -886,6 +865,7 @@ fn activity_line(
             .into_any_element()
     };
     div()
+        .debug_selector(move || id.to_owned())
         .flex()
         .items_center()
         .gap(px(SPACE_GROUP))
@@ -922,6 +902,7 @@ fn sync_dot(
     };
     let label = SharedString::from(text);
     div()
+        .debug_selector(move || id.to_owned())
         .id(SharedString::from(format!("{id}-tooltip")))
         .flex_none()
         .child(marker)
