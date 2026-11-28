@@ -1427,10 +1427,14 @@ impl RankiMcp {
             let store = self.store()?;
             store.checkpoint()?;
         }
-        ranki_format::export_apkg(
+        ranki_format::export_apkg_with_options(
             &self.paths.collection,
             &self.media_dir(),
             &path,
+            ranki_format::ExportOptions {
+                overwrite: false,
+                ..ranki_format::ExportOptions::default()
+            },
         )?;
         let bytes = fs::metadata(&path)
             .map_err(|error| ToolError::call(error.to_string()))?
