@@ -936,6 +936,9 @@ fn rating_row(
     {
         let code = rating.code();
         let action = UiAction::Grade(rating);
+        let answer_key = crate::app::display_answer_key(
+            root.options.study.answer_key(rating),
+        );
         let theme = theme_from(colors);
         let hue = rating_fill(code, theme);
         let label_color = rating_label(code, theme);
@@ -986,15 +989,15 @@ fn rating_row(
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(label_color)
                     .child(rating_name(rating))
-                    .child(
+                    .children((!answer_key.is_empty()).then(|| {
                         div()
                             .px(px(SPACE_GROUP))
                             .py(px(SPACE_INLINE))
                             .rounded(px(6.))
                             .bg(alpha(hue, 0.2))
                             .text_size(px(11.))
-                            .child(format!("{}", index + 1)),
-                    ),
+                            .child(SharedString::from(answer_key.clone()))
+                    })),
             );
         if compact {
             grade = grade.w(px(cell_width)).flex_none();

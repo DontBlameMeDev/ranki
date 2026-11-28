@@ -9,6 +9,37 @@ use serde::{Deserialize, Serialize};
 
 use crate::Id;
 
+/// Collection-wide Anki configuration.
+///
+/// `rollover` is the local hour at which a new Anki day starts, `0..=23`.
+/// Anki defaults to 04:00.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnkiConfig {
+    pub rollover: u8,
+}
+
+impl Default for AnkiConfig {
+    fn default() -> Self {
+        Self { rollover: 4 }
+    }
+}
+
+/// Options for persisting a review.
+///
+/// A `false` `leech_enabled` skips leech marking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApplyReviewOptions {
+    pub leech_enabled: bool,
+}
+
+impl Default for ApplyReviewOptions {
+    fn default() -> Self {
+        Self {
+            leech_enabled: true,
+        }
+    }
+}
+
 /// Anki's deck kind, stored as `dyn` in schema 11 and as a oneof in schema 18.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,

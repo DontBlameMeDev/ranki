@@ -74,7 +74,7 @@ pub fn run(
     Application::new()
         .with_assets(assets::Assets { media_dir })
         .run(move |app: &mut App| {
-            app.bind_keys(app::key_bindings());
+            app.bind_keys(app::key_bindings_for(&options.study));
             let bounds = Bounds::centered(None, size(px(1280.), px(800.)), app);
             let window = app.open_window(
                 WindowOptions {

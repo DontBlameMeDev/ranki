@@ -16,14 +16,14 @@ pub use cloze::cloze_markers;
 pub use cloze::cloze_ordinal;
 pub use cloze::cloze_ordinals;
 pub use config::{
-    Config, DataPaths, SchedulerConfig, Settings, SyncConfig, SyncSettings,
-    ThemeChoice, UiConfig, UiState, UiView,
+    Config, DataPaths, SchedulerConfig, Settings, StudyConfig, SyncConfig,
+    SyncSettings, ThemeChoice, UiConfig, UiState, UiView,
 };
 pub use id::next_id;
 pub use image_occlusion::parse_image_occlusion_field;
 pub use options::{
-    DayLimit, DeckCommon, DeckKind, DeckOverrides, DeckPreset, EffectiveDeck,
-    LeechAction,
+    AnkiConfig, ApplyReviewOptions, DayLimit, DeckCommon, DeckKind,
+    DeckOverrides, DeckPreset, EffectiveDeck, LeechAction,
 };
 pub use raw::decode_hex;
 pub use raw::encode_hex;
@@ -762,6 +762,27 @@ pub trait Store {
         Ok(1200)
     }
 
+    /// Returns the collection-wide Anki config, including the rollover hour.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] if the collection cannot be read.
+    fn anki_config(&self) -> Result<AnkiConfig, StoreError> {
+        Ok(AnkiConfig::default())
+    }
+
+    /// Sets the collection-wide Anki day rollover hour, `0..=23`.
+    ///
+    /// Stores that cannot write collection config return
+    /// [`StoreError::Unsupported`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] if `hour` is invalid or the write fails.
+    fn set_rollover(&mut self, hour: u8) -> Result<(), StoreError> {
+        Err(StoreError::Unsupported(format!(
+            "set_rollover is not supported for hour {hour}"
+        )))
+    }
+
     /// Returns the learning and relearning steps configured for a deck.
     ///
     /// Implementations without deck presets return
@@ -781,6 +802,28 @@ pub trait Store {
     /// Returns [`StoreError`] if the collection metadata cannot be read.
     fn max_taken_secs(&self, _deck_id: Id) -> Result<u32, StoreError> {
         Ok(60)
+    }
+
+    /// Returns the Anki deck presets available in this collection.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] if the collection metadata cannot be read.
+    fn deck_presets(&self) -> Result<Vec<DeckPreset>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    /// Writes one Anki deck preset, replacing it when the id already exists.
+    ///
+    /// Stores that cannot write preset metadata return
+    /// [`StoreError::Unsupported`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] if the preset is invalid or the write fails.
+    fn write_preset(&mut self, preset: &DeckPreset) -> Result<(), StoreError> {
+        Err(StoreError::Unsupported(format!(
+            "write_preset is not supported for preset {}",
+            preset.id
+        )))
     }
 
     /// Returns the time of a card's last review log, in Unix seconds.
@@ -895,6 +938,20 @@ pub trait Store {
         decision: &ReviewDecision,
     ) -> Result<Id, StoreError>;
 
+    /// Persists a review with leech-marking options.
+    ///
+    /// Stores that do not handle leech options fall back to [`Self::apply_review`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] if the card does not exist or the write fails.
+    fn apply_review_with_options(
+        &mut self,
+        decision: &ReviewDecision,
+        _options: &ApplyReviewOptions,
+    ) -> Result<Id, StoreError> {
+        self.apply_review(decision)
+    }
+
     /// Writes card state without creating a review log.
     ///
     /// The card's stored modification time and sync revision must still match
@@ -931,6 +988,27 @@ pub trait Store {
             "undo_review is not supported for card {}",
             before.id
         )))
+    }
+
+    /// Reverses a review and restores note tags changed by leech marking.
+    ///
+    /// `before_note` is the note snapshot taken before the review, when leech
+    /// marking changed its tags. Stores without note undo fall back to
+    /// [`Self::undo_review`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] if the card or note cannot be restored.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "undo needs the card, note snapshot, and review log id"
+    )]
+    fn undo_review_with_note(
+        &mut self,
+        before: &Card,
+        _before_note: Option<&Note>,
+        revlog_id: Id,
+    ) -> Result<bool, StoreError> {
+        self.undo_review(before, revlog_id)
     }
 
     /// Returns every review log, ordered by card and then by log id.

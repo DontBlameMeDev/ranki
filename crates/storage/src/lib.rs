@@ -72,6 +72,8 @@ pub use records::models_from_tables_with_prefix;
 pub use records::models_to_json;
 
 use ranki_model::AddNoteOptions;
+use ranki_model::AnkiConfig;
+use ranki_model::ApplyReviewOptions;
 use ranki_model::Card;
 use ranki_model::CardQueue;
 use ranki_model::CardType;
@@ -82,6 +84,7 @@ use ranki_model::DeckSteps;
 use ranki_model::DeckTotals;
 use ranki_model::DuplicateScope;
 use ranki_model::Id;
+use ranki_model::LeechAction;
 use ranki_model::NewNote;
 use ranki_model::Note;
 use ranki_model::NoteModel;
@@ -581,6 +584,45 @@ params![stamp.modified, stamp.scm, json],
         Ok(timing)
     }
 
+    /// Sets the local hour when Anki starts a new day.
+    ///
+    /// # Errors
+    /// Returns an error when the collection config cannot be written.
+    pub fn write_rollover(&mut self, hour: u8) -> Result<(), StoreError> {
+        let clamped = hour.min(23);
+        let transaction = self.conn.transaction().map_err(backend)?;
+        let _ = update_col(&transaction, false)?;
+        if records::table_exists(&transaction, "config")? {
+            transaction
+                .execute(
+                    "INSERT INTO config (key, usn, mtime_secs, val) \
+                     VALUES ('rollover', -1, ?1, ?2) \
+                     ON CONFLICT(key) DO UPDATE SET val = excluded.val, \
+                     mtime_secs = excluded.mtime_secs, usn = excluded.usn",
+                    params![
+                        anki::now_secs()?,
+                        json!(clamped).to_string().into_bytes()
+                    ],
+                )
+                .map_err(backend)?;
+        } else {
+            let col = records::read_col(&transaction)?;
+            let mut config = parse_conf(&col.conf)?;
+            let object = config
+                .as_object_mut()
+                .ok_or_else(|| invalid("conf is not an object"))?;
+            let _ = object.insert(String::from("rollover"), json!(clamped));
+            let text = serde_json::to_string(&config).map_err(backend)?;
+            transaction
+                .execute("UPDATE col SET conf = ?1 WHERE id = 1", [text])
+                .map_err(backend)?;
+        }
+        transaction.commit().map_err(backend)?;
+        let _ = self.timing_config.take();
+        let _ = self.timing_now.take();
+        Ok(())
+    }
+
     /// Returns Anki's learn-ahead window in seconds, from `collapseTime`.
     ///
     /// # Errors
@@ -667,10 +709,36 @@ params![stamp.modified, stamp.scm, json],
         let transaction = self.conn.transaction().map_err(backend)?;
         let usn = update_col(&transaction, false)?;
         for decision in decisions {
-            write_review(&transaction, usn, decision, today)?;
+            write_review(&transaction, usn, decision, today, true)?;
         }
         transaction.commit().map_err(backend)?;
         Ok(())
+    }
+
+    fn apply_review_with_leech(
+        &mut self,
+        decision: &ReviewDecision,
+        leech_enabled: bool,
+    ) -> Result<Id, StoreError> {
+        let today = self.timing(anki::now_secs()?)?.days_elapsed;
+        let transaction = self.conn.transaction().map_err(backend)?;
+        let current: Option<(i64, i32)> = transaction
+            .query_row(
+                "SELECT mod, usn FROM cards WHERE id = ?1",
+                [decision.card.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(backend)?;
+        if current != Some((decision.expected_modified, decision.expected_usn))
+        {
+            return Err(invalid("card changed since it was loaded"));
+        }
+        let usn = update_col(&transaction, false)?;
+        let log_id =
+            write_review(&transaction, usn, decision, today, leech_enabled)?;
+        transaction.commit().map_err(backend)?;
+        Ok(log_id)
     }
 
     /// Lists every deck, including an empty Default deck.
@@ -971,6 +1039,28 @@ impl Store for Collection {
             .into_iter()
             .filter(|deck| deck.id != DEFAULT_DECK_ID)
             .collect())
+    }
+
+    fn anki_config(&self) -> Result<AnkiConfig, StoreError> {
+        let rollover = timing_config(&self.conn)?.rollover.unwrap_or(4).min(23);
+        Ok(AnkiConfig { rollover })
+    }
+
+    fn set_rollover(&mut self, hour: u8) -> Result<(), StoreError> {
+        self.write_rollover(hour)
+    }
+
+    fn deck_presets(&self) -> Result<Vec<DeckPreset>, StoreError> {
+        self.presets()
+    }
+
+    #[expect(
+        clippy::explicit_auto_deref,
+        clippy::needless_borrow,
+        reason = "the borrowed receiver selects Collection's inherent write_preset"
+    )]
+    fn write_preset(&mut self, preset: &DeckPreset) -> Result<(), StoreError> {
+        (&*self).write_preset(preset)
     }
 
     #[expect(
@@ -1401,24 +1491,15 @@ impl Store for Collection {
         &mut self,
         decision: &ReviewDecision,
     ) -> Result<Id, StoreError> {
-        let today = self.timing(anki::now_secs()?)?.days_elapsed;
-        let transaction = self.conn.transaction().map_err(backend)?;
-        let current: Option<(i64, i32)> = transaction
-            .query_row(
-                "SELECT mod, usn FROM cards WHERE id = ?1",
-                [decision.card.id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(backend)?;
-        if current != Some((decision.expected_modified, decision.expected_usn))
-        {
-            return Err(invalid("card changed since it was loaded"));
-        }
-        let usn = update_col(&transaction, false)?;
-        let log_id = write_review(&transaction, usn, decision, today)?;
-        transaction.commit().map_err(backend)?;
-        Ok(log_id)
+        self.apply_review_with_leech(decision, true)
+    }
+
+    fn apply_review_with_options(
+        &mut self,
+        decision: &ReviewDecision,
+        options: &ApplyReviewOptions,
+    ) -> Result<Id, StoreError> {
+        self.apply_review_with_leech(decision, options.leech_enabled)
     }
 
     fn update_card(
@@ -1471,13 +1552,22 @@ impl Store for Collection {
         Ok(())
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "undo restores the card, buried siblings and counters in one transaction"
-    )]
     fn undo_review(
         &mut self,
         before: &Card,
+        revlog_id: Id,
+    ) -> Result<bool, StoreError> {
+        Store::undo_review_with_note(self, before, None, revlog_id)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "undo restores the card, note, buried siblings and counters in one transaction"
+    )]
+    fn undo_review_with_note(
+        &mut self,
+        before: &Card,
+        before_note: Option<&Note>,
         revlog_id: Id,
     ) -> Result<bool, StoreError> {
         let today = self.timing(anki::now_secs()?)?.days_elapsed;
@@ -1587,6 +1677,38 @@ impl Store for Collection {
                 new_delta,
                 review_delta,
             )?;
+        }
+        if let Some(note) = before_note {
+            let stored: Option<String> = transaction
+                .query_row(
+                    "SELECT tags FROM notes WHERE id = ?1",
+                    [note.id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(backend)?;
+            let current =
+                stored.as_deref().map_or_else(Vec::new, anki::decode_tags);
+            if current != note.tags {
+                let tags = tags::canonify(&note.tags, &transaction, usn)?;
+                let updated = transaction
+                    .execute(
+                        "UPDATE notes SET tags = ?1, mod = ?2, usn = ?3 WHERE id = ?4",
+                        params![
+                            anki::encode_tags(&tags),
+                            note.modified,
+                            usn,
+                            note.id
+                        ],
+                    )
+                    .map_err(backend)?;
+                if updated == 0 {
+                    return Err(StoreError::NotFound(format!(
+                        "note {}",
+                        note.id
+                    )));
+                }
+            }
         }
         transaction.commit().map_err(backend)?;
         Ok(true)
@@ -2882,6 +3004,7 @@ fn write_review(
     usn: i32,
     decision: &ReviewDecision,
     today: u32,
+    leech_enabled: bool,
 ) -> Result<Id, StoreError> {
     let card = &decision.card;
     let previous: Option<(i64, i64, i64)> = transaction
@@ -2959,7 +3082,87 @@ fn write_review(
     };
     adjust_deck_counts(transaction, home, today, new_delta, review_delta)?;
     bury_siblings_after_answer(transaction, decision, from_queue, usn)?;
+    mark_leech(transaction, decision, from_queue, home, usn, leech_enabled)?;
     Ok(log_id)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "leech marking needs the review and deck context"
+)]
+fn mark_leech(
+    conn: &Connection,
+    decision: &ReviewDecision,
+    from_queue: CardQueue,
+    home: Id,
+    usn: i32,
+    leech_enabled: bool,
+) -> Result<(), StoreError> {
+    if !leech_enabled
+        || decision.revlog.ease != 1
+        || from_queue != CardQueue::Review
+    {
+        return Ok(());
+    }
+    let home_preset_id = options::effective_decks(conn)?
+        .into_iter()
+        .find(|deck| deck.id == home)
+        .map(|deck| deck.preset_id);
+    let Some(preset_id) = home_preset_id else {
+        return Ok(());
+    };
+    let Some(preset) = options::presets(conn)?
+        .into_iter()
+        .find(|preset| preset.id == preset_id)
+    else {
+        return Ok(());
+    };
+    let threshold = preset.leech_threshold;
+    if threshold == 0 {
+        return Ok(());
+    }
+    let half = threshold.div_ceil(2).max(1);
+    let lapses = decision.card.lapses;
+    let extra = lapses.saturating_sub(threshold);
+    if lapses < threshold || !extra.is_multiple_of(half) {
+        return Ok(());
+    }
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT tags FROM notes WHERE id = ?1",
+            [decision.card.note_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    let mut tags = stored.as_deref().map_or_else(Vec::new, anki::decode_tags);
+    let added = if tags.iter().any(|tag| tag.eq_ignore_ascii_case("leech")) {
+        false
+    } else {
+        tags.push(String::from("leech"));
+        true
+    };
+    if added {
+        let canonified = tags::canonify(&tags, conn, usn)?;
+        conn.execute(
+            "UPDATE notes SET tags = ?1, mod = ?2, usn = ?3 WHERE id = ?4",
+            params![
+                anki::encode_tags(&canonified),
+                anki::now_secs()?,
+                usn,
+                decision.card.note_id
+            ],
+        )
+        .map_err(backend)?;
+    }
+    if preset.leech_action == LeechAction::Suspend {
+        conn.execute(
+            "UPDATE cards SET queue = -1 WHERE id = ?1",
+            [decision.card.id],
+        )
+        .map_err(backend)?;
+    }
+    Ok(())
 }
 
 /// Reads the next new-card position.

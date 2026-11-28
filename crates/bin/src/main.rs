@@ -1124,10 +1124,11 @@ fn open_gui(
         let mut config_guard = saved
             .lock()
             .map_err(|_| String::from("config lock poisoned"))?;
-        let sync_changed = config_guard.sync.enabled != current.sync.enabled
-            || config_guard.sync.username != current.sync.username;
-        let config_result = if sync_changed {
-            let mut updated = config_guard.clone();
+        let mut updated = config_guard.clone();
+        let sync_changed = updated.sync.enabled != current.sync.enabled
+            || updated.sync.username != current.sync.username;
+        let study_changed = config::apply_study_settings(&mut updated, current);
+        let config_result = if sync_changed || study_changed {
             updated.sync.enabled = current.sync.enabled;
             updated.sync.username.clone_from(&current.sync.username);
             config::save(&updated).map(|()| *config_guard = updated)

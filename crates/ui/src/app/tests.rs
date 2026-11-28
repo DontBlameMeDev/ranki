@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 
 use ranki_model::Store as _;
 use ranki_model::{
-    Card, CardQueue, CardTemplate, CardType, Deck, DeckStats, Id, NewNote,
-    Note, NoteKind, NoteModel, ReviewDecision, StockModelKind, StoreError,
+    Card, CardQueue, CardTemplate, CardType, Deck, DeckPreset, DeckStats, Id,
+    LeechAction, NewNote, Note, NoteKind, NoteModel, ReviewDecision,
+    StockModelKind, StoreError,
 };
 
 use crate::Options;
@@ -5346,6 +5347,7 @@ fn external_change_aborts_grade_undo_and_save_note(
             rating: ranki_model::Rating::Again,
             spent: Duration::ZERO,
             requeued: false,
+            note: None,
         });
         root.last_change_check = Instant::now()
             .checked_sub(Duration::from_secs(2))
@@ -7226,6 +7228,7 @@ struct ExternalChangeStore {
     models: Vec<NoteModel>,
     card: Card,
     note: Note,
+    preset: DeckPreset,
     stamp: Arc<AtomicI64>,
     writes: Arc<AtomicUsize>,
 }
@@ -7241,6 +7244,17 @@ impl ranki_model::Store for ExternalChangeStore {
 
     fn models(&self) -> Result<Vec<NoteModel>, StoreError> {
         Ok(self.models.clone())
+    }
+
+    fn deck_presets(&self) -> Result<Vec<DeckPreset>, StoreError> {
+        Ok(vec![self.preset.clone()])
+    }
+
+    fn write_preset(&mut self, preset: &DeckPreset) -> Result<(), StoreError> {
+        self.preset = preset.clone();
+        let _ = self.stamp.fetch_add(1, Ordering::Relaxed);
+        let _ = self.writes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     fn find_cards(&self, _: &str) -> Result<Vec<Id>, StoreError> {
@@ -7397,6 +7411,7 @@ impl ExternalChangeStore {
             models,
             card,
             note,
+            preset: DeckPreset::default(),
             stamp: Arc::clone(&stamp),
             writes: Arc::clone(&writes),
         };
@@ -7963,5 +7978,245 @@ fn startup_sync_runs_after_the_window_opens(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         cx.update(|_, app| root.read(app).sync.conflict.clone()),
         Some(String::from("earlier choice"))
+    );
+}
+
+#[test]
+fn configured_grade_keys_are_bound_and_empty_keys_are_disabled() {
+    let mut study = ranki_model::StudyConfig::default();
+    study.set_answer_key(ranki_model::Rating::Again, "e");
+    study.set_answer_key(ranki_model::Rating::Hard, "");
+    let mut keymap = gpui::Keymap::default();
+    keymap.add_bindings(super::key_bindings_for(&study));
+    let contexts = [
+        gpui::KeyContext::parse("ranki").expect("ranki context"),
+        gpui::KeyContext::parse("ranki_review").expect("review context"),
+    ];
+    let count = |key: &str| {
+        let stroke = gpui::Keystroke::parse(key).expect("keystroke");
+        keymap
+            .bindings_for_input(std::slice::from_ref(&stroke), &contexts)
+            .0
+            .len()
+    };
+    assert_eq!(count("e"), 1, "configured Again key");
+    assert_eq!(count("1"), 0, "old Again key");
+    assert_eq!(count("2"), 0, "empty Hard key");
+    assert_eq!(count("3"), 1, "untouched Good key");
+    assert_eq!(count("4"), 1, "untouched Easy key");
+}
+
+#[test]
+fn configured_grade_keys_win_over_reveal_conflicts() {
+    let mut study = ranki_model::StudyConfig::default();
+    study.set_answer_key(ranki_model::Rating::Again, "Space");
+    let mut keymap = gpui::Keymap::default();
+    keymap.add_bindings(super::key_bindings_for(&study));
+    let contexts = [
+        gpui::KeyContext::parse("ranki").expect("ranki context"),
+        gpui::KeyContext::parse("ranki_review").expect("review context"),
+    ];
+    let stroke = gpui::Keystroke::parse("space").expect("keystroke");
+    let (bindings, _) = keymap.bindings_for_input(&[stroke], &contexts);
+    assert!(
+        bindings.first().is_some_and(|binding| binding
+            .action()
+            .name()
+            .ends_with("GradeAgain")),
+        "the configured answer key must win over reveal"
+    );
+}
+
+#[gpui::test]
+fn preset_writes_are_recorded_as_local_changes(cx: &mut gpui::TestAppContext) {
+    let (store, stamp, _) = ExternalChangeStore::new();
+    let before = stamp.load(Ordering::Relaxed);
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update(|_, cx| {
+        root.update(cx, |root, cx| {
+            root.set_leech_threshold(9, cx);
+        });
+    });
+    let (modified, external) = cx.update(|_, cx| {
+        root.update(cx, |root, cx| {
+            (root.collection_modified, root.poll_external_change(cx))
+        })
+    });
+    assert_eq!(modified, before + 1);
+    assert!(!external);
+}
+
+#[gpui::test]
+fn suspended_leech_leaves_the_review_queue(cx: &mut gpui::TestAppContext) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let collection = dir.path().join("collection.anki2");
+    let mut store =
+        ranki_storage::Collection::create(&collection).expect("collection");
+    let mut preset = store
+        .deck_presets()
+        .expect("presets")
+        .into_iter()
+        .next()
+        .expect("default preset");
+    preset.leech_action = LeechAction::Suspend;
+    store.write_preset(&preset).expect("write preset");
+    let ids: Vec<i64> = ["First?", "Second?"]
+        .iter()
+        .map(|front| {
+            store
+                .add_note(&NewNote {
+                    model_id: 1,
+                    deck_id: 1,
+                    fields: vec![(*front).into(), String::from("Answer!")],
+                    tags: Vec::new(),
+                })
+                .expect("note")[0]
+        })
+        .collect();
+    let mut review_card = store.card(ids[0]).expect("card").expect("exists");
+    review_card.card_type = CardType::Review;
+    review_card.queue = CardQueue::Review;
+    review_card.due = 0;
+    review_card.interval = 10;
+    review_card.lapses = 7;
+    store
+        .update_card(&review_card, super::Root::now())
+        .expect("review card");
+    let options = Options {
+        paths: ranki_model::DataPaths::new(dir.path()),
+        ..Options::default()
+    };
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options,
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| root.study_all(window, cx));
+    });
+    let current = cx.read_entity(&root, |root, _| {
+        root.review.current.as_ref().map(|card| card.id)
+    });
+    assert_eq!(current, Some(ids[0]));
+    cx.update_entity(&root, |root, cx| {
+        root.review.phase = Phase::Answer;
+        root.review.last_grade_at = None;
+        root.grade(ranki_model::Rating::Again, cx);
+    });
+    let (requeued, pending) = cx.read_entity(&root, |root, _| {
+        (
+            root.review
+                .last_grade
+                .as_ref()
+                .expect("last grade")
+                .requeued,
+            root.review.pending.iter().any(|card| card.id == ids[0]),
+        )
+    });
+    assert!(!requeued);
+    assert!(!pending);
+    let reopened = ranki_storage::Collection::open(&collection).expect("open");
+    assert_eq!(
+        reopened.card(ids[0]).expect("card").expect("exists").queue,
+        CardQueue::Suspended
+    );
+}
+
+#[test]
+fn gpu_keystroke_maps_qt_key_names() {
+    for (input, expected) in [
+        ("1", "1"),
+        ("e", "e"),
+        ("Space", "space"),
+        ("Left", "left"),
+        ("Ctrl+1", "ctrl-1"),
+        ("Shift+A", "shift-a"),
+        ("Alt+x", "alt-x"),
+        ("Cmd+Return", "cmd-enter"),
+    ] {
+        assert_eq!(
+            super::gpu_keystroke(input).as_deref(),
+            Some(expected),
+            "{input}"
+        );
+    }
+    assert_eq!(super::gpu_keystroke(""), None);
+}
+
+#[test]
+fn display_answer_key_maps_keycaps_and_keeps_unknown_text() {
+    assert_eq!(super::display_answer_key("Space"), "Space");
+    assert_eq!(super::display_answer_key("Ctrl+1"), "Ctrl+1");
+    assert_eq!(super::display_answer_key("cmd+Return"), "Cmd+Enter");
+    assert_eq!(super::display_answer_key("Ctrl+"), "Ctrl+");
+    assert_eq!(super::display_answer_key(""), "");
+}
+
+#[gpui::test]
+fn set_answer_key_persists_and_rebinds(cx: &mut gpui::TestAppContext) {
+    let (saver, latest) = recording_saver();
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: saver,
+            },
+            window,
+            cx,
+        )
+    });
+    let contexts = [
+        gpui::KeyContext::parse("ranki").expect("ranki context"),
+        gpui::KeyContext::parse("ranki_review").expect("review context"),
+    ];
+    let count = |cx: &mut gpui::TestAppContext, key: &str| {
+        let stroke = gpui::Keystroke::parse(key).expect("keystroke");
+        let keymap = cx.update(|app| app.key_bindings());
+        keymap
+            .borrow()
+            .bindings_for_input(std::slice::from_ref(&stroke), &contexts)
+            .0
+            .len()
+    };
+    assert_eq!(count(&mut *cx, "1"), 1, "default Again key");
+    assert_eq!(count(&mut *cx, "e"), 0, "custom key before the change");
+
+    cx.update_entity(&root, |root, cx| {
+        root.set_answer_key(ranki_model::Rating::Again, " e ".into(), cx);
+    });
+
+    let persisted = latest
+        .lock()
+        .expect("settings lock")
+        .clone()
+        .expect("settings must be saved");
+    assert_eq!(persisted.study.again, "e");
+    assert_eq!(count(&mut *cx, "e"), 1, "custom key after the change");
+    assert_eq!(count(&mut *cx, "1"), 0, "old key after the change");
+    assert_eq!(
+        cx.read_entity(&root, |root, cx| {
+            root.answer_field(ranki_model::Rating::Again)
+                .read(cx)
+                .text()
+        }),
+        "e"
     );
 }

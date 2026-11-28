@@ -47,6 +47,15 @@ pub fn save(config: &Config) -> io::Result<()> {
     fs::write(path, text)
 }
 
+/// Copies resolved study settings into the config saved to `config.toml`.
+#[must_use]
+pub fn apply_study_settings(config: &mut Config, settings: &Settings) -> bool {
+    let study = settings.study.clone();
+    let changed = config.study != study;
+    config.study = study;
+    changed
+}
+
 #[cfg(feature = "desktop")]
 /// Reads the GUI's layout state from `ui-state.toml` beside the config file.
 pub fn load_ui_state() -> UiState {
@@ -202,7 +211,8 @@ mod tests {
     #[cfg(feature = "desktop")]
     use super::UiState;
     use super::{
-        Config, DataPaths, config_path, data_dir_path, resolve_settings,
+        Config, DataPaths, Settings, apply_study_settings, config_path,
+        data_dir_path, resolve_settings,
     };
     use crate::Cli;
 
@@ -339,5 +349,20 @@ mod tests {
         );
         assert!(settings.sync.enabled);
         assert!(!settings.sync.auto);
+    }
+
+    #[test]
+    fn study_settings_are_written_into_config() {
+        let mut config = Config::default();
+        let mut settings = Settings::default();
+        settings.study.leech_enabled = false;
+        settings.study.again = String::from("a");
+        settings.study.hard = String::from("h");
+        settings.study.good = String::from("g");
+        settings.study.easy = String::from("e");
+
+        assert!(apply_study_settings(&mut config, &settings));
+        assert_eq!(config.study, settings.study);
+        assert!(!apply_study_settings(&mut config, &settings));
     }
 }

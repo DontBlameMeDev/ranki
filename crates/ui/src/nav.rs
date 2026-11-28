@@ -897,6 +897,21 @@ impl Root {
             let close = self.action_click(UiAction::ToggleHelp);
             let help_width = (viewport_width - 32.0).clamp(0.0, 300.0);
             let help_height = (viewport_height - 32.0).max(0.0);
+            let grade_keys = [
+                ranki_model::Rating::Again,
+                ranki_model::Rating::Hard,
+                ranki_model::Rating::Good,
+                ranki_model::Rating::Easy,
+            ]
+            .into_iter()
+            .map(|rating| {
+                crate::app::display_answer_key(
+                    self.options.study.answer_key(rating),
+                )
+            })
+            .filter(|key| !key.is_empty())
+            .collect::<Vec<_>>()
+            .join(" / ");
             layers.push(
                 div()
                     .absolute()
@@ -970,7 +985,7 @@ impl Root {
                                         colors,
                                     ))
                                     .child(help_row(
-                                        "1 - 4",
+                                        grade_keys,
                                         "Grade card",
                                         colors,
                                     ))
@@ -1184,7 +1199,7 @@ fn action(
 }
 
 fn help_row(
-    key: &'static str,
+    key: impl Into<SharedString>,
     label: &'static str,
     colors: crate::theme::Palette,
 ) -> impl IntoElement {

@@ -40,6 +40,12 @@ cat > "$config/ranki/config.toml" <<EOF
 [ui]
 theme = "dark"
 reduce_motion = true
+
+[study]
+again = "a"
+hard = "s"
+good = "d"
+easy = "f"
 EOF
 seed_env=(env XDG_CONFIG_HOME="$config" XDG_DATA_HOME="$data")
 "${seed_env[@]}" "$bin" --no-sync deck-create 'Visual Deck' >/dev/null
@@ -251,6 +257,10 @@ capture decks decks
 capture question question
 capture answer answer 1
 capture add add
+capture settings settings
+hidden swaymsg output '*' resolution 1280x1600 >/dev/null
+capture settings-full settings
+hidden swaymsg output '*' resolution 1280x800 >/dev/null
 
 hidden swaymsg output '*' resolution 900x600 >/dev/null
 capture small question

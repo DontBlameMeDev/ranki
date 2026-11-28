@@ -113,6 +113,7 @@ pub struct Settings {
     pub last_optimized: u32,
     pub reviews_since: u32,
     pub sync: SyncSettings,
+    pub study: StudyConfig,
     pub ui_state: UiState,
 }
 
@@ -144,6 +145,61 @@ impl Default for SyncSettings {
     }
 }
 
+/// Local study preferences stored in `[study]`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StudyConfig {
+    #[serde(deserialize_with = "leech_enabled_field")]
+    pub leech_enabled: bool,
+    #[serde(deserialize_with = "again_field")]
+    pub again: String,
+    #[serde(deserialize_with = "hard_field")]
+    pub hard: String,
+    #[serde(deserialize_with = "good_field")]
+    pub good: String,
+    #[serde(deserialize_with = "easy_field")]
+    pub easy: String,
+}
+
+impl Default for StudyConfig {
+    fn default() -> Self {
+        Self {
+            leech_enabled: true,
+            again: String::from("1"),
+            hard: String::from("2"),
+            good: String::from("3"),
+            easy: String::from("4"),
+        }
+    }
+}
+
+impl StudyConfig {
+    /// Key shown for one answer rating.
+    #[must_use]
+    pub fn answer_key(&self, rating: crate::Rating) -> &str {
+        match rating {
+            crate::Rating::Again => &self.again,
+            crate::Rating::Hard => &self.hard,
+            crate::Rating::Good => &self.good,
+            crate::Rating::Easy => &self.easy,
+        }
+    }
+
+    /// Sets the key shown for one answer rating.
+    pub fn set_answer_key(
+        &mut self,
+        rating: crate::Rating,
+        key: impl Into<String>,
+    ) {
+        match rating {
+            crate::Rating::Again => self.again = key.into(),
+            crate::Rating::Hard => self.hard = key.into(),
+            crate::Rating::Good => self.good = key.into(),
+            crate::Rating::Easy => self.easy = key.into(),
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -162,6 +218,7 @@ impl Default for Settings {
             last_optimized: 0,
             reviews_since: 0,
             sync: SyncSettings::default(),
+            study: StudyConfig::default(),
             ui_state: UiState::default(),
         }
     }
@@ -193,6 +250,7 @@ impl Settings {
                 retries: config.sync.retries,
                 backoff_ms: config.sync.backoff_ms,
             },
+            study: config.study.clone(),
             ui_state: UiState::default(),
         }
     }
@@ -205,6 +263,7 @@ pub struct Config {
     pub ui: UiConfig,
     pub scheduler: SchedulerConfig,
     pub sync: SyncConfig,
+    pub study: StudyConfig,
 }
 
 /// Raw sync settings. The host key is a path or environment value only.
@@ -323,6 +382,8 @@ const SYNC_KEYS: &[&str] = &[
     "backoff_ms",
 ];
 
+const STUDY_KEYS: &[&str] = &["leech_enabled", "again", "hard", "good", "easy"];
+
 /// Parses a config file, warning and falling back field by field.
 #[must_use]
 pub fn parse(input: &str) -> Config {
@@ -341,6 +402,7 @@ pub fn parse(input: &str) -> Config {
         ui: section(root, "ui", UI_KEYS),
         scheduler: section(root, "scheduler", SCHEDULER_KEYS),
         sync: section(root, "sync", SYNC_KEYS),
+        study: section(root, "study", STUDY_KEYS),
     }
 }
 
@@ -639,13 +701,81 @@ where
         }
     }
 }
+fn leech_enabled_field<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    bool::deserialize(deserializer).map_or_else(
+        |_| {
+            invalid("study.leech_enabled");
+            Ok(true)
+        },
+        Ok,
+    )
+}
+
+fn answer_key_field<'de, D>(
+    deserializer: D,
+    field: &str,
+    default: &str,
+) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    String::deserialize(deserializer).map_or_else(
+        |_| {
+            invalid(field);
+            Ok(default.to_owned())
+        },
+        |value| {
+            let key = value.trim();
+            if key.chars().count() <= 24 {
+                Ok(key.to_owned())
+            } else {
+                invalid(field);
+                Ok(default.to_owned())
+            }
+        },
+    )
+}
+
+fn again_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    answer_key_field(deserializer, "study.again", "1")
+}
+
+fn hard_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    answer_key_field(deserializer, "study.hard", "2")
+}
+
+fn good_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    answer_key_field(deserializer, "study.good", "3")
+}
+
+fn easy_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    answer_key_field(deserializer, "study.easy", "4")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use super::{
-        Config, DataPaths, Settings, ThemeChoice, UiState, UiView, parse,
+        Config, DataPaths, Settings, StudyConfig, ThemeChoice, UiState, UiView,
+        parse,
     };
+    use crate::Rating;
 
     #[test]
     fn defaults_are_stable() {
@@ -851,5 +981,76 @@ mod tests {
         assert_eq!(settings.fsrs_decay, 0.3);
         assert_eq!(settings.last_optimized, 12);
         assert_eq!(settings.reviews_since, 9);
+    }
+
+    #[test]
+    fn study_defaults_are_stable() {
+        let study = StudyConfig::default();
+        assert!(study.leech_enabled);
+        assert_eq!(study.again, "1");
+        assert_eq!(study.hard, "2");
+        assert_eq!(study.good, "3");
+        assert_eq!(study.easy, "4");
+        assert_eq!(parse("").study, study);
+        assert_eq!(Settings::default().study, study);
+    }
+
+    #[test]
+    fn study_section_is_parsed() {
+        let config = parse(
+            "[study]\nleech_enabled = false\nagain = ' a '\nhard = '2'\n\
+             good = '3'\neasy = '4'\n",
+        );
+        assert!(!config.study.leech_enabled);
+        assert_eq!(config.study.again, "a");
+        assert_eq!(config.study.hard, "2");
+        assert_eq!(config.study.good, "3");
+        assert_eq!(config.study.easy, "4");
+        let text = toml::to_string(&config).unwrap();
+        assert_eq!(parse(&text), config);
+    }
+
+    #[test]
+    fn study_invalid_values_and_unknown_keys_fall_back_by_field() {
+        let config = parse(
+            "[study]\nleech_enabled = 'yes'\nagain = 1\nhard = '   '\n\
+             good = 'abcdefghijklmnopqrstuvwxy'\neasy = '  4  '\n\
+             leech = true\n",
+        );
+        assert!(config.study.leech_enabled);
+        assert_eq!(config.study.again, "1");
+        assert_eq!(config.study.hard, "");
+        assert_eq!(config.study.good, "3");
+        assert_eq!(config.study.easy, "4");
+    }
+
+    #[test]
+    fn resolution_copies_study_settings() {
+        let mut config = Config::default();
+        config.study.leech_enabled = false;
+        config.study.again = String::from("a");
+        config.study.hard = String::from("b");
+        config.study.good = String::from("c");
+        config.study.easy = String::from("d");
+        let settings = Settings::resolve(&config, DataPaths::default());
+        assert_eq!(settings.study, config.study);
+    }
+
+    #[test]
+    fn answer_keys_are_mapped_and_set_for_every_rating() {
+        let mut study = StudyConfig::default();
+        assert_eq!(study.answer_key(Rating::Again), "1");
+        assert_eq!(study.answer_key(Rating::Hard), "2");
+        assert_eq!(study.answer_key(Rating::Good), "3");
+        assert_eq!(study.answer_key(Rating::Easy), "4");
+        for (rating, key) in [
+            (Rating::Again, "a"),
+            (Rating::Hard, "b"),
+            (Rating::Good, "c"),
+            (Rating::Easy, "d"),
+        ] {
+            study.set_answer_key(rating, key);
+            assert_eq!(study.answer_key(rating), key);
+        }
     }
 }

@@ -13,11 +13,14 @@ use std::time::UNIX_EPOCH;
 use chrono::TimeZone;
 use ranki_core::FsrsScheduler;
 use ranki_model::AddNoteOptions;
+use ranki_model::ApplyReviewOptions;
+use ranki_model::Card;
 use ranki_model::CardQueue;
 use ranki_model::CardType;
 use ranki_model::DeckStats;
 use ranki_model::DeckSteps;
 use ranki_model::DuplicateScope;
+use ranki_model::LeechAction;
 use ranki_model::NewNote;
 use ranki_model::Rating;
 use ranki_model::RevLog;
@@ -3669,4 +3672,348 @@ fn browse_is_due_uses_the_same_timing_as_find_cards() {
         .map(|card| card.card_id)
         .collect();
     assert_eq!(ids, [10, 11]);
+}
+
+fn mark_card_as_review(path: &Path, card_id: i64, lapses: u32) {
+    let conn = Connection::open(path).expect("write connection");
+    conn.execute(
+        "UPDATE cards SET type = 2, queue = 2, lapses = ?1 WHERE id = ?2",
+        rusqlite::params![lapses, card_id],
+    )
+    .expect("review card");
+}
+
+fn again_decision(card: &Card, log_id: i64) -> ReviewDecision {
+    let mut changed = card.clone();
+    changed.lapses = changed.lapses.saturating_add(1);
+    ReviewDecision {
+        card: changed,
+        expected_modified: card.modified,
+        expected_usn: card.usn,
+        revlog: RevLog {
+            id: log_id,
+            card_id: card.id,
+            usn: 0,
+            ease: 1,
+            interval: 1,
+            last_interval: card.interval.max(1),
+            factor: 2500,
+            time_ms: 100,
+            kind: RevLogKind::Review,
+        },
+    }
+}
+
+fn note_tags(store: &Collection, note_id: i64) -> Vec<String> {
+    store
+        .note(note_id)
+        .expect("note")
+        .expect("note exists")
+        .tags
+}
+
+#[test]
+fn review_leech_marks_the_note_without_changing_the_queue() {
+    let (_directory, path) = fixture();
+    let mut store = Collection::open(&path).expect("open");
+    let ids = store
+        .add_note(&note(&["leech me", "answer"], &[]))
+        .expect("add");
+    mark_card_as_review(&path, ids[0], 7);
+    let card = store.card(ids[0]).expect("card").expect("exists");
+    let conn = Connection::open(&path).expect("write connection");
+    conn.execute(
+        "UPDATE notes SET mod = 1 WHERE id = ?1",
+        rusqlite::params![card.note_id],
+    )
+    .expect("older note stamp");
+    drop(conn);
+    let before_note = store.note(card.note_id).expect("note").expect("exists");
+    let decision = again_decision(&card, 9_100);
+    assert_eq!(decision.card.lapses, 8);
+
+    store.apply_review(&decision).expect("apply");
+
+    assert_eq!(
+        store.card(ids[0]).expect("card").expect("exists").queue,
+        CardQueue::Review
+    );
+    assert_eq!(note_tags(&store, card.note_id), ["leech"]);
+    let marked_note = store.note(card.note_id).expect("note").expect("exists");
+    assert!(marked_note.modified > before_note.modified);
+    assert_eq!(marked_note.usn, -1);
+}
+
+#[test]
+fn review_leech_suspends_when_the_preset_action_says_so() {
+    let (_directory, path) = fixture();
+    let mut store = Collection::open(&path).expect("open");
+    let mut preset = store
+        .deck_presets()
+        .expect("presets")
+        .into_iter()
+        .find(|preset| preset.id == 1)
+        .expect("default preset");
+    preset.leech_action = LeechAction::Suspend;
+    store.write_preset(&preset).expect("write preset");
+    let ids = store
+        .add_note(&note(&["leech me", "answer"], &[]))
+        .expect("add");
+    mark_card_as_review(&path, ids[0], 7);
+    let card = store.card(ids[0]).expect("card").expect("exists");
+
+    store
+        .apply_review(&again_decision(&card, 9_200))
+        .expect("apply");
+
+    assert_eq!(
+        store.card(ids[0]).expect("card").expect("exists").queue,
+        CardQueue::Suspended
+    );
+    assert_eq!(note_tags(&store, card.note_id), ["leech"]);
+}
+
+#[test]
+fn review_below_the_leech_threshold_does_not_mark_the_note() {
+    let (_directory, path) = fixture();
+    let mut store = Collection::open(&path).expect("open");
+    let ids = store
+        .add_note(&note(&["not yet", "answer"], &[]))
+        .expect("add");
+    mark_card_as_review(&path, ids[0], 6);
+    let card = store.card(ids[0]).expect("card").expect("exists");
+    let decision = again_decision(&card, 9_300);
+    assert_eq!(decision.card.lapses, 7);
+
+    store.apply_review(&decision).expect("apply");
+
+    assert_eq!(note_tags(&store, card.note_id), [] as [String; 0]);
+}
+
+#[test]
+fn leech_threshold_repeats_at_half_thresholds() {
+    let (_directory, path) = fixture();
+    let mut store = Collection::open(&path).expect("open");
+    let mut preset = store
+        .deck_presets()
+        .expect("presets")
+        .into_iter()
+        .find(|preset| preset.id == 1)
+        .expect("default preset");
+    preset.leech_threshold = 3;
+    store.write_preset(&preset).expect("write preset");
+
+    for (index, (lapses, marked)) in
+        [(3, true), (4, false), (5, true), (7, true)]
+            .into_iter()
+            .enumerate()
+    {
+        let ids = store
+            .add_note(&note(&[&format!("lapse {lapses}"), "answer"], &[]))
+            .expect("add");
+        mark_card_as_review(&path, ids[0], lapses - 1);
+        let card = store.card(ids[0]).expect("card").expect("exists");
+        let decision =
+            again_decision(&card, 9_400 + i64::try_from(index).expect("id"));
+        assert_eq!(decision.card.lapses, lapses);
+
+        store.apply_review(&decision).expect("apply");
+
+        let tags = note_tags(&store, card.note_id);
+        assert_eq!(tags.iter().any(|tag| tag == "leech"), marked, "{lapses}");
+    }
+}
+
+#[test]
+fn repeated_leech_marking_does_not_rewrite_the_note() {
+    let (_directory, path) = fixture();
+    let mut store = Collection::open(&path).expect("open");
+    let ids = store
+        .add_note(&note(&["repeat leech", "answer"], &[]))
+        .expect("add");
+    mark_card_as_review(&path, ids[0], 7);
+    let card = store.card(ids[0]).expect("card").expect("exists");
+    store
+        .apply_review(&again_decision(&card, 9_800))
+        .expect("first mark");
+    let first = store.note(card.note_id).expect("note").expect("exists");
+
+    mark_card_as_review(&path, ids[0], 11);
+    let card = store.card(ids[0]).expect("card").expect("exists");
+    store
+        .apply_review(&again_decision(&card, 9_900))
+        .expect("repeat mark");
+    let second = store.note(card.note_id).expect("note").expect("exists");
+
+    assert_eq!(second.modified, first.modified);
+    assert_eq!(second.usn, first.usn);
+    assert_eq!(note_tags(&store, card.note_id), ["leech"]);
+}
+
+#[test]
+fn disabled_leech_option_skips_marking() {
+    let (_directory, path) = fixture();
+    let mut store = Collection::open(&path).expect("open");
+    let ids = store
+        .add_note(&note(&["no leech", "answer"], &[]))
+        .expect("add");
+    mark_card_as_review(&path, ids[0], 7);
+    let card = store.card(ids[0]).expect("card").expect("exists");
+
+    store
+        .apply_review_with_options(
+            &again_decision(&card, 9_500),
+            &ApplyReviewOptions {
+                leech_enabled: false,
+            },
+        )
+        .expect("apply");
+
+    assert_eq!(note_tags(&store, card.note_id), [] as [String; 0]);
+    assert_eq!(
+        store.card(ids[0]).expect("card").expect("exists").queue,
+        CardQueue::Review
+    );
+}
+
+#[test]
+fn relearning_again_does_not_mark_a_leech() {
+    let (_directory, path) = fixture();
+    let mut store = Collection::open(&path).expect("open");
+    let ids = store
+        .add_note(&note(&["relearn", "answer"], &[]))
+        .expect("add");
+    let conn = Connection::open(&path).expect("write connection");
+    conn.execute(
+        "UPDATE cards SET type = 3, queue = 3, lapses = 7 WHERE id = ?1",
+        rusqlite::params![ids[0]],
+    )
+    .expect("relearning card");
+    drop(conn);
+    let card = store.card(ids[0]).expect("card").expect("exists");
+
+    store
+        .apply_review(&again_decision(&card, 9_700))
+        .expect("apply");
+
+    assert_eq!(note_tags(&store, card.note_id), [] as [String; 0]);
+}
+
+#[test]
+fn undo_review_with_note_restores_prior_tags() {
+    let (_directory, path) = fixture();
+    let mut store = Collection::open(&path).expect("open");
+    let ids = store
+        .add_note(&note(&["undo leech", "answer"], &["keep"]))
+        .expect("add");
+    mark_card_as_review(&path, ids[0], 7);
+    let card = store.card(ids[0]).expect("card").expect("exists");
+    let before_note = store.note(card.note_id).expect("note").expect("exists");
+    let log_id = store
+        .apply_review(&again_decision(&card, 9_600))
+        .expect("apply");
+    assert_eq!(note_tags(&store, card.note_id), ["keep", "leech"]);
+
+    assert!(
+        store
+            .undo_review_with_note(&card, Some(&before_note), log_id)
+            .expect("undo")
+    );
+
+    assert_eq!(
+        store.note(card.note_id).expect("note").expect("exists"),
+        before_note
+    );
+}
+
+#[test]
+fn set_rollover_persists_in_legacy_conf_and_invalidates_timing_cache() {
+    let (_directory, path) = fixture();
+    let modified_before: i64;
+    {
+        let conn = Connection::open(&path).expect("write connection");
+        conn.execute(
+            "UPDATE col SET conf = ?1 WHERE id = 1",
+            rusqlite::params![
+                json!({
+                    "schedVer": 2,
+                    "creationOffset": 0,
+                    "rollover": 4,
+                    "futureKey": "kept"
+                })
+                .to_string()
+            ],
+        )
+        .expect("conf");
+        modified_before = conn
+            .query_row("SELECT mod FROM col WHERE id = 1", [], |row| row.get(0))
+            .expect("modification stamp");
+    }
+    let mut store = Collection::open(&path).expect("open");
+    let now = 1_700_000_000_i64;
+    let before = store.timing(now).expect("timing");
+
+    store.set_rollover(9).expect("set rollover");
+    let modified_after: i64 = {
+        let conn = read_only(&path);
+        conn.query_row("SELECT mod FROM col WHERE id = 1", [], |row| row.get(0))
+            .expect("modification stamp")
+    };
+    assert!(modified_after > modified_before);
+
+    assert_eq!(store.anki_config().expect("config").rollover, 9);
+    let after = store.timing(now).expect("refreshed timing");
+    let expected = ranki_model::Timing::new(
+        now,
+        store.collection_created().expect("created"),
+        None,
+        ranki_storage::local_minutes_west(now).expect("offset"),
+        Some(9),
+    );
+    assert_ne!(before, after);
+    assert_eq!(after.next_day_at, expected.next_day_at);
+    let conn = read_only(&path);
+    let raw: String = conn
+        .query_row("SELECT conf FROM col WHERE id = 1", [], |row| row.get(0))
+        .expect("conf");
+    let value: Value = serde_json::from_str(&raw).expect("conf JSON");
+    assert_eq!(value["rollover"], json!(9));
+    assert_eq!(value["futureKey"], json!("kept"));
+
+    store.set_rollover(99).expect("clamp");
+    assert_eq!(store.anki_config().expect("clamped").rollover, 23);
+}
+
+#[test]
+fn set_rollover_persists_in_schema18_config_table() {
+    let (_directory, path) = fixture();
+    write_schema18_config(
+        &path,
+        &[("rollover", json!(4)), ("futureKey", json!(1))],
+    );
+    let reopening = ReopeningCollection::new(&path);
+    assert_eq!(reopening.anki_config().expect("config").rollover, 4);
+
+    let mut store = Collection::open(&path).expect("open");
+    store.set_rollover(17).expect("set rollover");
+
+    assert_eq!(store.anki_config().expect("config").rollover, 17);
+    let conn = read_only(&path);
+    let raw: Vec<u8> = conn
+        .query_row("SELECT val FROM config WHERE key = 'rollover'", [], |row| {
+            row.get(0)
+        })
+        .expect("rollover value");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&raw).expect("JSON"),
+        json!(17)
+    );
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM config WHERE key = 'futureKey'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("other keys");
+    assert_eq!(count, 1);
 }

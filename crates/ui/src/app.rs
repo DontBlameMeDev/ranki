@@ -18,9 +18,10 @@ use gpui::{
 };
 use ranki_core::{FsrsScheduler, from_settings};
 use ranki_model::{
-    Card, CardQueue, CardType, Deck, DeckStats, DeckSteps, Id, NewNote, Note,
-    NoteModel, Rating, ReviewDecision, StockModelKind, Store, Timing, UiState,
-    UiView,
+    AnkiConfig, ApplyReviewOptions, Card, CardQueue, CardType, Deck,
+    DeckPreset, DeckStats, DeckSteps, Id, LeechAction, NewNote, Note,
+    NoteModel, Rating, ReviewDecision, StockModelKind, Store, StudyConfig,
+    Timing, UiState, UiView,
 };
 use ranki_sync::{MediaProgress, SyncOutcome};
 
@@ -540,6 +541,7 @@ pub struct UndoEntry {
     pub spent: Duration,
     /// Whether this grade left the card in the session for another step.
     pub requeued: bool,
+    pub note: Option<Note>,
 }
 
 /// Rendered halves of one card, prepared before a session transition.
@@ -600,6 +602,10 @@ pub struct ReviewState {
 pub struct Root {
     pub(crate) store: Box<dyn Store>,
     pub(crate) options: Options,
+    pub(crate) study_presets: Vec<DeckPreset>,
+    pub(crate) study_preset_id: Option<Id>,
+    pub(crate) rollover: u8,
+    pub(crate) answer_fields: [Entity<TextField>; 4],
     pub(crate) focus: FocusHandle,
     pub(crate) dialog_focus: FocusHandle,
     pub(crate) settings_focus: FocusHandle,
@@ -837,6 +843,190 @@ impl Root {
                 cx,
             );
         }
+    }
+
+    fn answer_key_edit_hook(
+        cx: &mut Context<Self>,
+        rating: Rating,
+    ) -> EditHook {
+        let weak = cx.entity().downgrade();
+        Arc::new(move |app| {
+            let weak = weak.clone();
+            app.defer(move |app| {
+                let _ = weak.update(app, |root, cx| {
+                    let index = usize::from(rating.code()) - 1;
+                    let key = root.answer_fields[index].read(cx).text();
+                    root.set_answer_key(rating, key, cx);
+                });
+            });
+        })
+    }
+
+    pub(crate) fn study_preset(&self) -> Option<&DeckPreset> {
+        self.study_presets
+            .iter()
+            .find(|preset| Some(preset.id) == self.study_preset_id)
+    }
+
+    pub(crate) fn answer_field(&self, rating: Rating) -> &Entity<TextField> {
+        &self.answer_fields[usize::from(rating.code()) - 1]
+    }
+
+    pub(crate) fn select_study_preset(
+        &mut self,
+        id: Id,
+        cx: &mut Context<Self>,
+    ) {
+        if self.study_presets.iter().any(|preset| preset.id == id) {
+            self.study_preset_id = Some(id);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_leech_enabled(
+        &mut self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.options.study.leech_enabled = enabled;
+        self.persist_state(cx);
+        cx.notify();
+    }
+
+    fn selected_study_preset(&self) -> Option<DeckPreset> {
+        self.study_preset().cloned()
+    }
+
+    fn write_study_preset(
+        &mut self,
+        preset: DeckPreset,
+        cx: &mut Context<Self>,
+    ) {
+        if self.study_preset() == Some(&preset) {
+            return;
+        }
+        match self.store.write_preset(&preset) {
+            Ok(()) => self.record_local_write(),
+            Err(error) => {
+                self.show_toast(
+                    ToastKind::Error,
+                    format!("Could not save study options: {error}"),
+                    cx,
+                );
+            }
+        }
+        self.reload_study_presets(cx);
+        cx.notify();
+    }
+
+    fn reload_study_presets(&mut self, cx: &mut Context<Self>) {
+        match self.store.deck_presets() {
+            Ok(presets) => self.study_presets = presets,
+            Err(error) => {
+                self.show_toast(
+                    ToastKind::Error,
+                    format!("Could not load study options: {error}"),
+                    cx,
+                );
+            }
+        }
+        if !self
+            .study_presets
+            .iter()
+            .any(|preset| Some(preset.id) == self.study_preset_id)
+        {
+            self.study_preset_id = self
+                .study_presets
+                .iter()
+                .find(|preset| preset.id == 1)
+                .or_else(|| self.study_presets.first())
+                .map(|preset| preset.id);
+        }
+    }
+
+    pub(crate) fn set_leech_threshold(
+        &mut self,
+        threshold: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut preset) = self.selected_study_preset() else {
+            return;
+        };
+        preset.leech_threshold = threshold.clamp(1, 9999);
+        self.write_study_preset(preset, cx);
+    }
+
+    pub(crate) fn set_leech_action(
+        &mut self,
+        action: LeechAction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut preset) = self.selected_study_preset() else {
+            return;
+        };
+        preset.leech_action = action;
+        self.write_study_preset(preset, cx);
+    }
+
+    pub(crate) fn set_easy_day(
+        &mut self,
+        index: usize,
+        value: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if index >= 7 {
+            return;
+        }
+        let Some(mut preset) = self.selected_study_preset() else {
+            return;
+        };
+        if preset.easy_days_percentages.len() < 7 {
+            preset.easy_days_percentages.resize(7, 1.0);
+        }
+        let value = (value.clamp(0.0, 1.0) * 2.0).round() / 2.0;
+        preset.easy_days_percentages[index] = value;
+        self.write_study_preset(preset, cx);
+    }
+
+    pub(crate) fn set_rollover(&mut self, hour: u8, cx: &mut Context<Self>) {
+        let hour = hour.min(23);
+        if hour == self.rollover {
+            return;
+        }
+        match self.store.set_rollover(hour) {
+            Ok(()) => {
+                self.rollover = hour;
+                self.record_local_write();
+                cx.notify();
+            }
+            Err(error) => {
+                self.show_toast(
+                    ToastKind::Error,
+                    format!("Could not save rollover hour: {error}"),
+                    cx,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn set_answer_key(
+        &mut self,
+        rating: Rating,
+        key: String,
+        cx: &mut Context<Self>,
+    ) {
+        let key = key.trim().chars().take(24).collect::<String>();
+        self.options.study.set_answer_key(rating, key.clone());
+        self.persist_state(cx);
+        cx.clear_key_bindings();
+        cx.bind_keys(key_bindings_for(&self.options.study));
+        let index = usize::from(rating.code()) - 1;
+        if let Some(field) = self.answer_fields.get_mut(index)
+            && field.read(cx).text() != key
+        {
+            field.update(cx, |field, cx| field.seed(key, cx));
+        }
+        cx.notify();
     }
 
     fn begin_scrollbar_drag(
@@ -1077,6 +1267,7 @@ impl Root {
         if let Some(theme) = saved.theme {
             options.theme = theme;
         }
+        let study = options.study.clone();
         let focus = cx.focus_handle();
         let dialog_focus = cx.focus_handle();
         let settings_focus = cx.focus_handle();
@@ -1092,6 +1283,18 @@ impl Root {
             field.set_edit_hook(hook.clone());
             field
         };
+        let answer_fields =
+            [Rating::Again, Rating::Hard, Rating::Good, Rating::Easy].map(
+                |rating| {
+                    let hook = Self::answer_key_edit_hook(cx, rating);
+                    cx.new(|cx| {
+                        let mut field = TextField::new(cx, "Key");
+                        field.seed(study.answer_key(rating).to_owned(), cx);
+                        field.set_edit_hook(hook);
+                        field
+                    })
+                },
+            );
         let deck_hook = Self::deck_search_edit_hook(cx);
         let deck_search = cx.new(|cx| {
             let mut field = make_field(cx, "Search decks");
@@ -1132,6 +1335,10 @@ impl Root {
             scheduler: from_settings(&options),
             store,
             options,
+            study_presets: Vec::new(),
+            study_preset_id: None,
+            rollover: AnkiConfig::default().rollover,
+            answer_fields,
             focus,
             dialog_focus,
             settings_focus,
@@ -2037,6 +2244,17 @@ impl Root {
                 self.show_toast(
                     ToastKind::Error,
                     format!("Could not load note types: {error}"),
+                    cx,
+                );
+            }
+        }
+        self.reload_study_presets(cx);
+        match self.store.anki_config() {
+            Ok(config) => self.rollover = config.rollover,
+            Err(error) => {
+                self.show_toast(
+                    ToastKind::Error,
+                    format!("Could not load rollover hour: {error}"),
                     cx,
                 );
             }
@@ -3364,7 +3582,12 @@ impl Root {
         if self.poll_external_change(cx) {
             return;
         }
-        let log_id = match self.store.apply_review(&decision) {
+        let log_id = match self.store.apply_review_with_options(
+            &decision,
+            &ApplyReviewOptions {
+                leech_enabled: self.options.study.leech_enabled,
+            },
+        ) {
             Ok(id) => id,
             Err(error) => {
                 self.show_toast(
@@ -3388,20 +3611,27 @@ impl Root {
             .review
             .studied
             .saturating_add(self.review.focused_elapsed);
-        let requeued = decision.card.queue == CardQueue::Learning;
+        let next_card = decision.card;
+        let stored = self.store.card(next_card.id).ok().flatten();
+        let requeued = stored
+            .as_ref()
+            .map_or(next_card.queue == CardQueue::Learning, |card| {
+                card.queue == CardQueue::Learning
+            });
         if !requeued {
             self.review.completed = self.review.completed.saturating_add(1);
         }
         self.review.last_grade = Some(UndoEntry {
             card,
+            note: self.review.note.clone(),
             revlog_id: log_id,
             rating,
             spent: self.review.focused_elapsed,
             requeued,
         });
         if requeued {
-            let _ = self.review.seen.remove(&decision.card.id);
-            self.requeue_learning(decision.card);
+            let _ = self.review.seen.remove(&next_card.id);
+            self.requeue_learning(next_card);
         }
         self.review.focused_elapsed = Duration::ZERO;
         self.review.current = None;
@@ -3459,7 +3689,11 @@ impl Root {
         if self.poll_external_change(cx) {
             return;
         }
-        match self.store.undo_review(&entry.card, entry.revlog_id) {
+        match self.store.undo_review_with_note(
+            &entry.card,
+            entry.note.as_ref(),
+            entry.revlog_id,
+        ) {
             Ok(false) => {
                 self.review.last_grade = None;
                 self.show_toast(
@@ -5410,8 +5644,94 @@ const END_SESSION_CONTEXT: &str = "ranki && !ranki_dialog";
 /// Browse navigation stays out of the search field and dialogs.
 const BROWSE_CONTEXT: &str =
     "ranki && ranki_browse && !ranki_input && !ranki_dialog";
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "settings_view calls this from a sibling module"
+)]
+#[must_use]
+pub(crate) fn gpu_keystroke(anki_key: &str) -> Option<String> {
+    let parts = anki_key.trim().split('+').collect::<Vec<_>>();
+    if parts.is_empty() || parts.iter().any(|part| part.trim().is_empty()) {
+        return None;
+    }
+    let mapped = parts
+        .iter()
+        .map(|part| {
+            let part = part.trim().to_ascii_lowercase();
+            match part.as_str() {
+                "ctrl" | "control" => "ctrl",
+                "shift" => "shift",
+                "alt" | "option" => "alt",
+                "cmd" | "command" | "meta" | "super" | "win" => "cmd",
+                "space" | "spacebar" => "space",
+                "return" | "enter" => "enter",
+                "esc" => "escape",
+                "del" => "delete",
+                "pageup" => "pageup",
+                "pagedown" => "pagedown",
+                _ => part.as_str(),
+            }
+            .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let stroke = mapped.join("-");
+    if stroke.is_empty() {
+        return None;
+    }
+    gpui::Keystroke::parse(&stroke).ok()?;
+    Some(stroke)
+}
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "settings_view calls this from a sibling module"
+)]
+pub(crate) fn display_answer_key(anki_key: &str) -> String {
+    let Some(stroke) = gpu_keystroke(anki_key) else {
+        return anki_key.to_owned();
+    };
+    stroke
+        .split('-')
+        .map(|part| match part {
+            "ctrl" => "Ctrl".to_owned(),
+            "shift" => "Shift".to_owned(),
+            "alt" => "Alt".to_owned(),
+            "cmd" => "Cmd".to_owned(),
+            "space" => "Space".to_owned(),
+            "enter" => "Enter".to_owned(),
+            "left" => "Left".to_owned(),
+            "right" => "Right".to_owned(),
+            "up" => "Up".to_owned(),
+            "down" => "Down".to_owned(),
+            "escape" => "Escape".to_owned(),
+            "tab" => "Tab".to_owned(),
+            "backspace" => "Backspace".to_owned(),
+            "delete" => "Delete".to_owned(),
+            "home" => "Home".to_owned(),
+            "end" => "End".to_owned(),
+            "pageup" => "Page Up".to_owned(),
+            "pagedown" => "Page Down".to_owned(),
+            key if key.chars().count() == 1 => key.to_uppercase(),
+            key => key.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "kept as the default-key wrapper for tests")
+)]
 #[must_use]
 pub fn key_bindings() -> Vec<KeyBinding> {
+    key_bindings_for(&StudyConfig::default())
+}
+
+#[must_use]
+pub fn key_bindings_for(study: &StudyConfig) -> Vec<KeyBinding> {
+    let again = gpu_keystroke(study.answer_key(Rating::Again));
+    let hard = gpu_keystroke(study.answer_key(Rating::Hard));
+    let good = gpu_keystroke(study.answer_key(Rating::Good));
+    let easy = gpu_keystroke(study.answer_key(Rating::Easy));
     let mut bindings = vec![
         KeyBinding::new("space", Reveal, Some(STUDY_CONTEXT)),
         KeyBinding::new(
@@ -5421,10 +5741,8 @@ pub fn key_bindings() -> Vec<KeyBinding> {
                 "ranki && ranki_review && !ranki_input && !ranki_dialog && !ranki_settings",
             ),
         ),
-        KeyBinding::new("1", GradeAgain, Some(STUDY_CONTEXT)),
-        KeyBinding::new("2", GradeHard, Some(STUDY_CONTEXT)),
-        KeyBinding::new("3", GradeGood, Some(STUDY_CONTEXT)),
-        KeyBinding::new("4", GradeEasy, Some(STUDY_CONTEXT)),
+    ];
+    bindings.extend([
         KeyBinding::new("r", Retry, Some(STUDY_CONTEXT)),
         KeyBinding::new("enter", Reveal, Some(STUDY_CONTEXT)),
         KeyBinding::new("f5", Reload, Some(RELOAD_CONTEXT)),
@@ -5480,8 +5798,20 @@ pub fn key_bindings() -> Vec<KeyBinding> {
             DismissTagSuggestions,
             Some("ranki_tag_input > ranki_input"),
         ),
-    ];
+    ]);
     bindings.extend(crate::text_field::key_bindings());
+    if let Some(key) = again {
+        bindings.push(KeyBinding::new(&key, GradeAgain, Some(STUDY_CONTEXT)));
+    }
+    if let Some(key) = hard {
+        bindings.push(KeyBinding::new(&key, GradeHard, Some(STUDY_CONTEXT)));
+    }
+    if let Some(key) = good {
+        bindings.push(KeyBinding::new(&key, GradeGood, Some(STUDY_CONTEXT)));
+    }
+    if let Some(key) = easy {
+        bindings.push(KeyBinding::new(&key, GradeEasy, Some(STUDY_CONTEXT)));
+    }
     bindings
 }
 

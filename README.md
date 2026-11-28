@@ -97,7 +97,15 @@ show_keyboard_hints = true
 reduce_motion = false # omitted: follow the desktop animation preference
 [scheduler]
 desired_retention = 0.9
+[study]
+leech_enabled = true
+again = "1"
+hard = "2"
+good = "3"
+easy = "4"
 ```
+
+Local study preferences live in `[study]`. An empty answer key disables that shortcut.
 
 The GUI keeps window state in `ui-state.toml` next to `config.toml`: the active
 screen, sidebar width, expanded decks, selected deck, search queries, and theme

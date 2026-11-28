@@ -8,10 +8,13 @@
 
 use crate::Collection;
 use ranki_model::AddNoteOptions;
+use ranki_model::AnkiConfig;
+use ranki_model::ApplyReviewOptions;
 use ranki_model::BrowseCard;
 use ranki_model::Card;
 use ranki_model::CardWithNote;
 use ranki_model::Deck;
+use ranki_model::DeckPreset;
 use ranki_model::DeckStats;
 use ranki_model::DeckSteps;
 use ranki_model::DeckTotals;
@@ -107,6 +110,8 @@ impl Store for ReopeningCollection {
         stats(deck_id: Option<Id>, now_secs: i64) -> Result<DeckStats, StoreError>;
         deck_stats(now_secs: i64) -> Result<DeckTotals, StoreError>;
         collection_created() -> Result<i64, StoreError>;
+        anki_config() -> Result<AnkiConfig, StoreError>;
+        deck_presets() -> Result<Vec<DeckPreset>, StoreError>;
         timing(now_secs: i64) -> Result<Timing, StoreError>;
         max_taken_secs(deck_id: Id) -> Result<u32, StoreError>;
         review_count_since(cutoff_ms: i64) -> Result<u32, StoreError>;
@@ -145,14 +150,20 @@ impl Store for ReopeningCollection {
         remove_deck(id: Id) -> Result<(), StoreError>;
         rename_deck(id: Id, name: &str) -> Result<Deck, StoreError>;
         ensure_model(kind: StockModelKind) -> Result<NoteModel, StoreError>;
+        set_rollover(hour: u8) -> Result<(), StoreError>;
+        write_preset(preset: &DeckPreset) -> Result<(), StoreError>;
         add_note(note: &NewNote) -> Result<Vec<Id>, StoreError>;
         add_note_with_options(note: &NewNote, options: &AddNoteOptions)
             -> Result<Vec<Id>, StoreError>;
         update_note(note: &Note, deck_id: Id) -> Result<(), StoreError>;
         remove_card(id: Id) -> Result<(), StoreError>;
         apply_review(decision: &ReviewDecision) -> Result<Id, StoreError>;
+        apply_review_with_options(decision: &ReviewDecision, options: &ApplyReviewOptions)
+            -> Result<Id, StoreError>;
         update_card(card: &Card, now_secs: i64) -> Result<(), StoreError>;
         undo_review(before: &Card, revlog_id: Id) -> Result<bool, StoreError>;
+        undo_review_with_note(before: &Card, before_note: Option<&Note>, revlog_id: Id)
+            -> Result<bool, StoreError>;
     }
 
     /// Reads the stamp with a fail-fast connection so the one-second UI poll
