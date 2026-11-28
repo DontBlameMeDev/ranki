@@ -199,6 +199,7 @@ impl Root {
                 .flex()
                 .items_end()
                 .gap(px(SPACE_SECTION))
+                .debug_selector(|| String::from("review-queues"))
                 .child(queue_count(
                     "New",
                     session.new_cards,
@@ -234,9 +235,10 @@ impl Root {
                 .items_center()
                 .px(px(SPACE_GUTTER))
                 .child(
-                    div().flex_1().min_w(px(0.)).justify_start().child(
+                    div().flex().flex_1().min_w(px(0.)).justify_start().child(
                         div()
                             .id("review-end")
+                            .debug_selector(|| String::from("review-end"))
                             .flex()
                             .items_center()
                             .gap(px(SPACE_GROUP))
@@ -297,6 +299,7 @@ impl Root {
                 )
                 .child(
                     div()
+                        .flex()
                         .flex_1()
                         .min_w(px(0.))
                         .justify_end()

@@ -2113,6 +2113,47 @@ fn space_ends_a_completed_session(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+fn review_topbar_hugs_the_edges(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.view = View::Review;
+        cx.notify();
+    });
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+
+    let gutter = px(crate::theme::SPACE_GUTTER);
+    let end = cx.debug_bounds("review-end").expect("end session bounds");
+    assert!(
+        end.size.width < px(300.),
+        "end session button stretched to {end:?}"
+    );
+    let queues = cx
+        .debug_bounds("review-queues")
+        .expect("queue count bounds");
+    assert_eq!(queues.right(), px(1280.) - gutter);
+    assert!(
+        queues.size.width < px(300.),
+        "queue counts stretched to {queues:?}"
+    );
+}
+
+#[gpui::test]
 fn space_ends_a_caught_up_session(cx: &mut gpui::TestAppContext) {
     cx.update(|app| app.bind_keys(super::key_bindings()));
     let (root, cx) = cx.add_window_view(|window, cx| {
