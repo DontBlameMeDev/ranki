@@ -66,6 +66,7 @@ pub fn run(
     store: Box<dyn Store>,
     options: Options,
     save_settings: SettingsSaver,
+    sync_at_startup: bool,
 ) {
     let media_dir = options.paths.media_dir.clone();
     Application::new()
@@ -100,8 +101,11 @@ pub fn run(
                         app::Root::observe_appearance(window, cx);
                         root
                     });
-                    root.update(cx, |_, cx| {
+                    root.update(cx, |root, cx| {
                         app::Root::start_external_change_poll(cx);
+                        if sync_at_startup {
+                            root.sync_at_startup(cx);
+                        }
                     });
                     root
                 },

@@ -29,7 +29,6 @@ use crate::{
     add_card_view::{ColorPicker, ColorTarget},
     browser_view::{BROWSE_DETAIL_MIN_WIDTH, BrowseState, browse_expand_paths},
     card_view::{self, MediaKind, MediaRef, RenderedCard},
-    components::warm_brand,
     occlusion::{
         self, MaskShape, NormalizedRect, OcclusionMask, image_occlusion_fields,
     },
@@ -1077,7 +1076,6 @@ impl Root {
         if let Some(theme) = saved.theme {
             options.theme = theme;
         }
-        warm_brand(cx);
         let focus = cx.focus_handle();
         let dialog_focus = cx.focus_handle();
         let settings_focus = cx.focus_handle();
@@ -1256,7 +1254,7 @@ impl Root {
             Some(ScrollAnchor::for_handle(root.review_stage_scroll.clone()));
         root.view = saved.view.into();
         root.previous_view = saved.previous_view.into();
-        root.reload(cx);
+        root.reload(cx, true);
         root.nav_width = theme::nav_width(
             saved
                 .nav_width
@@ -1974,7 +1972,7 @@ impl Root {
         self.add.deck_picker = false;
         self.add.color_picker = None;
         self.images.update(cx, |cache, _| cache.forget_failed());
-        self.reload(cx);
+        self.reload(cx, false);
         self.statistics_ready = false;
         self.browse_ready = false;
         self.persist_state(cx);
@@ -2000,7 +1998,7 @@ impl Root {
         }
         cx.notify();
     }
-    pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn reload(&mut self, cx: &mut Context<Self>, initial: bool) {
         self.heatmap_hover = None;
         let selected_id = self
             .selected
@@ -2057,10 +2055,19 @@ impl Root {
             self.add.model_index = preferred;
         }
         self.refresh_stats();
+        let background_summary =
+            initial && self.options.paths.collection.exists();
+        if !background_summary {
+            self.refresh_statistics(cx);
+        }
         self.collection_start = self.store.collection_created().unwrap_or(0);
         self.collection_modified =
             self.store.collection_modified().unwrap_or(0);
-        self.refresh_statistics(cx);
+        if background_summary {
+            self.schedule_statistics_refresh(cx);
+        } else {
+            self.refresh_statistics(cx);
+        }
         self.external_change = false;
         if let Some(id) = selected_id {
             self.selected = self.decks.iter().position(|deck| deck.id == id);
@@ -2349,7 +2356,7 @@ impl Root {
         match StockModelKind::of(&model) {
             Some(kind) => match self.store.ensure_model(kind) {
                 Ok(installed) => {
-                    self.reload(cx);
+                    self.reload(cx, false);
                     if let Some(found) =
                         model_index(&self.models, &installed.name)
                     {
@@ -3538,7 +3545,7 @@ impl Root {
                 match self.store.remove_deck(*id) {
                     Ok(()) => {
                         self.show_toast(ToastKind::Success, "Deck removed", cx);
-                        self.reload(cx);
+                        self.reload(cx, false);
                     }
                     Err(error) => {
                         self.confirmation = Some(confirmation.clone());
@@ -3616,7 +3623,7 @@ impl Root {
                 self.create_error = None;
                 self.create_modal = false;
                 self.clear_toast();
-                self.reload(cx);
+                self.reload(cx, false);
                 self.selected =
                     self.decks.iter().position(|item| item.id == deck.id);
                 self.add.deck_id = Some(deck.id);
@@ -3685,7 +3692,7 @@ impl Root {
                     self.rename_expanded_paths(old, &name);
                 }
                 self.clear_toast();
-                self.reload(cx);
+                self.reload(cx, false);
                 self.show_toast(ToastKind::Success, "Deck renamed", cx);
                 self.persist_state(cx);
                 window.focus(&self.focus);
