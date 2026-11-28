@@ -7855,3 +7855,113 @@ fn enter_in_deck_filter_chooses_the_first_match(cx: &mut gpui::TestAppContext) {
     assert_eq!(selected, Some(2), "the first visible deck is chosen");
     assert!(!picker, "choosing a deck closes the picker");
 }
+
+#[gpui::test]
+fn startup_reads_the_summary_off_the_ui_thread(cx: &mut gpui::TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let collection = directory.path().join("collection.anki2");
+    ranki_storage::Collection::create(&collection).unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let options = Options {
+        paths: ranki_model::DataPaths::new(directory.path()),
+        ..Default::default()
+    };
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(StatisticsStore {
+                    reads: Arc::clone(&reads),
+                    modified: Arc::new(AtomicI64::new(1)),
+                    fail: Arc::new(AtomicBool::new(false)),
+                }),
+                options,
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "startup must not read the review history on the UI thread"
+    );
+    cx.run_until_parked();
+    assert_eq!(reads.load(Ordering::Relaxed), 0);
+    assert!(cx.update(|_, app| root.read(app).toast.is_none()));
+}
+
+#[gpui::test]
+fn startup_sync_runs_after_the_window_opens(cx: &mut gpui::TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let collection = directory.path().join("collection.anki2");
+    ranki_storage::Collection::create(&collection).unwrap();
+    let paths = ranki_model::DataPaths::new(directory.path());
+    let state = ranki_sync::SyncState {
+        host_key: String::from("stored-hkey"),
+        ..ranki_sync::SyncState::default()
+    };
+    std::fs::write(&paths.sync_state, serde_json::to_string(&state).unwrap())
+        .unwrap();
+
+    let options = Options {
+        paths,
+        sync: ranki_model::SyncSettings {
+            enabled: true,
+            auto: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let deferred = Arc::new(Mutex::new(None::<ranki_sync::SyncOutcome>));
+    let syncs = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&syncs);
+    let media = Arc::new(AtomicUsize::new(0));
+    let refreshed = Arc::clone(&media);
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let mut root = super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options,
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        );
+        root.startup_sync_result = Some(Arc::clone(&deferred));
+        root.sync_run = Arc::new(move |_, _, _, _, _| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            Ok(ranki_sync::SyncOutcome::NoChanges)
+        });
+        root.media_run = Arc::new(move |_, _, _, _, _, _| {
+            refreshed.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        root
+    });
+    cx.update(|_, cx| {
+        root.update(cx, super::Root::sync_at_startup);
+    });
+    cx.run_until_parked();
+    assert_eq!(syncs.load(Ordering::Relaxed), 1);
+    assert_eq!(media.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        *deferred.lock().unwrap(),
+        Some(ranki_sync::SyncOutcome::NoChanges)
+    );
+    assert!(cx.update(|_, app| root.read(app).toast.is_none()));
+    cx.update(|_, cx| {
+        root.update(cx, |root, cx| {
+            root.sync.conflict = Some(String::from("earlier choice"));
+            root.sync_run = Arc::new(|_, _, _, _, _| {
+                Err(String::from("sync still failing"))
+            });
+            root.sync_now(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, app| root.read(app).sync.conflict.clone()),
+        Some(String::from("earlier choice"))
+    );
+}

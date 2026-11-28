@@ -44,10 +44,10 @@ use std::path::PathBuf;
 use std::process;
 use std::process::ExitCode;
 use std::str::FromStr;
-#[cfg(feature = "desktop")]
 use std::sync::Arc;
-#[cfg(feature = "desktop")]
 use std::sync::Mutex;
+#[cfg(feature = "desktop")]
+use std::thread;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use thiserror::Error;
@@ -459,6 +459,7 @@ fn run(cli: Cli) -> CliResult<()> {
 #[expect(
     clippy::too_many_lines,
     clippy::too_many_arguments,
+    clippy::excessive_nesting,
     reason = "CLI dispatch maps each subcommand once and takes injected test seams"
 )]
 fn run_with_sync(
@@ -491,15 +492,6 @@ fn run_with_sync(
     let auto_sync =
         auto_sync_enabled && automatic_sync_allowed(cli.command.as_ref());
 
-    let startup_sync = if auto_sync {
-        sync_once_and_warn(transport, &settings, auth.as_ref(), true)
-    } else {
-        None
-    };
-    if startup_sync.is_some() {
-        maybe_optimize(config, &settings);
-    }
-
     let scheduler = ranki_core::from_settings(&settings);
     let collection_path = settings.paths.collection.as_path();
     let media_dir = settings.paths.media_dir.as_path();
@@ -507,6 +499,24 @@ fn run_with_sync(
     let command = cli.command.unwrap_or(Command::Gui);
     #[cfg(not(feature = "desktop"))]
     let command = cli.command.unwrap_or(Command::Decks);
+    #[cfg(feature = "desktop")]
+    let defer_startup_sync = matches!(&command, Command::Gui)
+        && !cli.mobile
+        && auth.is_none()
+        && sync::has_stored_key(&settings);
+    #[cfg(not(feature = "desktop"))]
+    let defer_startup_sync = false;
+
+    let mut startup_sync = if should_startup_sync(auto_sync, defer_startup_sync)
+    {
+        sync_once_and_warn(transport, &settings, auth.as_ref(), true)
+    } else {
+        None
+    };
+    if startup_sync.is_some() {
+        maybe_optimize(config, &settings);
+    }
+    let startup_sync_result = Arc::new(Mutex::new(None::<SyncOutcome>));
     #[cfg(feature = "desktop")]
     let mut final_settings = settings.clone();
     #[cfg(not(feature = "desktop"))]
@@ -519,15 +529,23 @@ fn run_with_sync(
     let result = match command {
         Command::Mcp => mcp::serve(&settings.paths, scheduler),
         #[cfg(feature = "desktop")]
-        Command::Gui => match open_gui(&settings, config, cli.mobile) {
-            Ok(ui_settings) => {
-                if let Some(settings_from_ui) = ui_settings {
-                    final_settings = settings_from_ui;
+        Command::Gui => {
+            match open_gui(
+                &settings,
+                config,
+                cli.mobile,
+                defer_startup_sync,
+                &startup_sync_result,
+            ) {
+                Ok(ui_settings) => {
+                    if let Some(settings_from_ui) = ui_settings {
+                        final_settings = settings_from_ui;
+                    }
+                    Ok(())
                 }
-                Ok(())
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        },
+        }
         Command::Import {
             package,
             update_notes,
@@ -648,6 +666,9 @@ fn run_with_sync(
             run_store_command(&mut collection, command, &scheduler, media_dir)
         }
     };
+    if defer_startup_sync && let Ok(guard) = startup_sync_result.lock() {
+        startup_sync.clone_from(&guard);
+    }
     let (shutdown_auth, shutdown_sync) = if auto_sync
         && !restore_command
         && final_settings.sync.enabled
@@ -699,6 +720,14 @@ fn sync_once_and_warn(
             None
         }
     }
+}
+/// The window runs its own background sync when its credentials are in the state file.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "auto-sync and deferred startup are separate inputs"
+)]
+const fn should_startup_sync(auto_sync: bool, deferred: bool) -> bool {
+    auto_sync && !deferred
 }
 
 fn maybe_optimize(config: &mut config::Config, settings: &config::Settings) {
@@ -1041,10 +1070,17 @@ fn print_stats(
 
 #[cfg(feature = "desktop")]
 #[cfg(feature = "desktop")]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    reason = "GUI startup owns settings, config, layout, and sync scheduling inputs"
+)]
 fn open_gui(
     settings: &config::Settings,
     config: &config::Config,
     mobile: bool,
+    sync_at_startup: bool,
+    startup_sync_result: &Arc<Mutex<Option<SyncOutcome>>>,
 ) -> CliResult<Option<config::Settings>> {
     if mobile {
         #[cfg(feature = "mobile")]
@@ -1067,6 +1103,14 @@ fn open_gui(
     let mut options = settings.clone();
     options.ui_state = config::load_ui_state();
     let saved = Arc::new(Mutex::new(config.clone()));
+    let optimize_config = Arc::clone(&saved);
+    let optimize_settings = settings.clone();
+    thread::spawn(move || {
+        let Ok(mut guard) = optimize_config.lock() else {
+            return;
+        };
+        maybe_optimize(&mut guard, &optimize_settings);
+    });
     let latest = Arc::new(Mutex::new(None::<config::Settings>));
     let latest_for_saver = Arc::clone(&latest);
     let save_settings: ranki_ui::SettingsSaver = Arc::new(move |current| {
@@ -1094,7 +1138,13 @@ fn open_gui(
             .and(config_result)
             .map_err(|error| error.to_string())
     });
-    ranki_ui::run(Box::new(store), options, save_settings);
+    ranki_ui::run(
+        Box::new(store),
+        options,
+        save_settings,
+        sync_at_startup,
+        Arc::clone(startup_sync_result),
+    );
     let latest_guard = latest.lock().map_err(|_| {
         CliError::Message(String::from("settings lock poisoned"))
     })?;
@@ -1732,6 +1782,7 @@ mod tests {
     use super::now_secs;
     use super::parse_rating;
     use super::run_with_sync;
+    use super::should_startup_sync;
     use ranki_model::Rating;
 
     fn uploaded() -> MockResponse {
@@ -1752,6 +1803,13 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    #[test]
+    fn gui_startup_defers_auto_sync_to_the_window() {
+        assert!(should_startup_sync(true, false));
+        assert!(!should_startup_sync(true, true));
+        assert!(!should_startup_sync(false, false));
     }
 
     #[test]

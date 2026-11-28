@@ -14,7 +14,7 @@ use std::fs;
 use std::io::{Cursor, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1453,5 +1453,107 @@ fn media_downloads_run_in_parallel_batches() -> TestResult {
     let state = transport.lock()?;
     assert_eq!(state.downloaded.len(), expected);
     assert!(state.peak > 1, "peak concurrency was {}", state.peak);
+    Ok(())
+}
+
+struct EditingDownload {
+    inner: MockTransport,
+    collection: PathBuf,
+}
+
+impl SyncTransport for EditingDownload {
+    fn host_key(&mut self, body: &[u8]) -> crate::Result<SyncResponse> {
+        self.inner.host_key(body)
+    }
+
+    fn meta(&mut self, body: &[u8]) -> crate::Result<SyncResponse> {
+        self.inner.meta(body)
+    }
+
+    fn upload(&mut self, body: &[u8]) -> crate::Result<SyncResponse> {
+        self.inner.upload(body)
+    }
+
+    fn download(&mut self, body: &[u8]) -> crate::Result<SyncResponse> {
+        let response = self.inner.download(body)?;
+        let connection = Connection::open(&self.collection)?;
+        connection
+            .execute("UPDATE col SET mod = ?1 WHERE id = 1", params![777])?;
+        Ok(response)
+    }
+
+    fn media_begin(&mut self, body: &[u8]) -> crate::Result<SyncResponse> {
+        self.inner.media_begin(body)
+    }
+
+    fn media_changes(&mut self, body: &[u8]) -> crate::Result<SyncResponse> {
+        self.inner.media_changes(body)
+    }
+
+    fn media_download(&mut self, body: &[u8]) -> crate::Result<SyncResponse> {
+        self.inner.media_download(body)
+    }
+
+    fn set_endpoint(&mut self, endpoint: &str) -> crate::Result<()> {
+        self.inner.set_endpoint(endpoint)
+    }
+
+    fn set_host_key(&mut self, key: &str) {
+        self.inner.set_host_key(key);
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        self.inner.retry_policy()
+    }
+}
+
+#[test]
+fn download_does_not_replace_a_collection_edited_while_it_runs() -> TestResult {
+    let directory = TempDir::new()?;
+    let source = directory.path().join("source.anki2");
+    let collection = directory.path().join("collection.anki2");
+    let media = directory.path().join("media");
+    let state_path = directory.path().join("sync.json");
+    make_collection(&source, (900, 100, 1))?;
+    make_collection(&collection, (100, 100, 1))?;
+    let state = SyncState {
+        host_key: fixture_key(&directory),
+        last_mod: Some(100),
+        last_local_mod: Some(100),
+        last_scm: Some(100),
+        ..SyncState::default()
+    };
+    write_state(&state_path, &state)?;
+    let transport = MockTransport::new()
+        .with_response(
+            SyncMethod::Meta,
+            meta_response((900, 100, false, now_secs()?))?,
+        )
+        .with_response(
+            SyncMethod::Download,
+            MockResponse::ok_bytes(fs::read(&source)?)?,
+        );
+    let mut client = SyncClient::new(
+        EditingDownload {
+            inner: transport,
+            collection: collection.clone(),
+        },
+        &collection,
+        &media,
+        &state_path,
+    )?;
+
+    let result = client.sync(None);
+    assert!(
+        matches!(result, Err(SyncError::Conflict(_))),
+        "unexpected result: {result:?}"
+    );
+    let connection = Connection::open(&collection)?;
+    let mod_time: i64 = connection.query_row(
+        "SELECT mod FROM col WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(mod_time, 777, "the local edit must survive the download");
     Ok(())
 }

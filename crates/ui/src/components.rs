@@ -1,16 +1,11 @@
 //! Shared GPUI elements for the three views.
 
-use std::sync::{Arc, OnceLock};
-
 use gpui::{
-    App, ClickEvent, Div, FocusHandle, Image, ImageFormat, ImageSource, Img,
-    InteractiveElement, IntoElement, MouseDownEvent, ParentElement,
-    RenderImage, Rgba, SharedString, Stateful, StatefulInteractiveElement,
-    Styled, Svg, Window, div, img, px, svg,
+    App, ClickEvent, Div, FocusHandle, ImageSource, Img, InteractiveElement,
+    IntoElement, MouseDownEvent, ParentElement, Resource, Rgba, SharedString,
+    Stateful, StatefulInteractiveElement, Styled, Svg, Window, div, img, px,
+    svg,
 };
-use image::{Frame, ImageBuffer};
-
-use crate::assets::RAI;
 
 use crate::theme::{
     BUTTON_HEIGHT, BUTTON_PADDING_X, BUTTON_RADIUS, BUTTON_TEXT_SIZE, Palette,
@@ -403,60 +398,14 @@ pub fn removable_chip(
         )
 }
 
-static WORDMARK: OnceLock<Arc<RenderImage>> = OnceLock::new();
-
-fn wordmark(cx: &App) -> Option<Arc<RenderImage>> {
-    if let Some(image) = WORDMARK.get() {
-        return Some(image.clone());
-    }
-    let svg = Image::from_bytes(ImageFormat::Svg, RAI.as_bytes().to_vec());
-    let decoded = svg.to_image_data(cx.svg_renderer()).ok()?;
-    let size = decoded.size(0);
-    let mut bytes = decoded.as_bytes(0)?.to_vec();
-    for [r, g, b, a] in bytes.as_chunks_mut::<4>().0 {
-        std::mem::swap(r, b);
-        let alpha = u16::from(*a);
-        if alpha == 0 {
-            continue;
-        }
-        let rounding = alpha.checked_div(2).unwrap_or(0);
-        let unpremultiply = |channel: &mut u8| {
-            let value = u16::from(*channel)
-                .saturating_mul(255)
-                .saturating_add(rounding);
-            if let Some(scaled) =
-                value.checked_div(alpha).and_then(|v| u8::try_from(v).ok())
-            {
-                *channel = scaled;
-            }
-        };
-        unpremultiply(r);
-        unpremultiply(g);
-        unpremultiply(b);
-    }
-    let width = u32::try_from(size.width.0).ok()?;
-    let height = u32::try_from(size.height.0).ok()?;
-    let buffer = ImageBuffer::from_raw(width, height, bytes)?;
-    let image = Arc::new(RenderImage::new(vec![Frame::new(buffer)]));
-    let _ = WORDMARK.set(image.clone());
-    Some(image)
-}
-
-/// Decode the brand wordmark before the first frame draws it.
-pub fn warm_brand(cx: &App) {
-    let _ = wordmark(cx);
-}
-
 /// Brand wordmark served by the embedded asset source.
 #[must_use]
 pub fn brand() -> Img {
-    img(ImageSource::Custom(Arc::new(move |_, cx| {
-        wordmark(cx).map(Ok)
-    })))
-    .w(px(48.))
-    .h(px(48.))
-    .flex_none()
-    .mb(px(4.))
+    img(ImageSource::Resource(Resource::Embedded("rai.svg".into())))
+        .w(px(48.))
+        .h(px(48.))
+        .flex_none()
+        .mb(px(4.))
 }
 
 #[must_use]

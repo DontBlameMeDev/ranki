@@ -387,6 +387,22 @@ impl Root {
     }
 
     pub(crate) fn sync_now(&mut self, cx: &mut Context<Self>) {
+        self.start_sync(false, cx);
+    }
+
+    pub(crate) fn sync_at_startup(&mut self, cx: &mut Context<Self>) {
+        if !should_auto_sync(
+            self.options.sync.enabled,
+            self.options.sync.auto,
+            self.sync.signed_in,
+            self.sync.busy(),
+            self.sync.conflict.is_some(),
+        ) {
+            return;
+        }
+        self.start_sync(true, cx);
+    }
+    fn start_sync(&mut self, quiet: bool, cx: &mut Context<Self>) {
         if self.sync.busy() || !self.sync.signed_in {
             return;
         }
@@ -403,7 +419,7 @@ impl Root {
         let task = cx.background_executor().spawn(async move {
             runner(&collection, &media_dir, &sync_state, retries, backoff_ms)
         });
-        Self::spawn_sync_task(task, false, reason, false, cx);
+        Self::spawn_sync_task(task, false, reason, quiet, cx);
     }
 
     pub(crate) fn resolve_sync_conflict(
@@ -488,6 +504,12 @@ impl Root {
         cx: &mut Context<Self>,
     ) {
         self.sync.running = None;
+        if let Some(slot) = self.startup_sync_result.take()
+            && let Ok(outcome) = &result
+            && let Ok(mut guard) = slot.lock()
+        {
+            *guard = Some(outcome.clone());
+        }
         self.sync.conflict = None;
         self.sync.error = match &result {
             Err(error) => Some(sync_error(error)),
@@ -603,7 +625,7 @@ impl Root {
         let review_active = self.view == View::Review;
         self.store =
             Box::new(ReopeningCollection::new(&self.options.paths.collection));
-        self.reload(cx);
+        self.reload(cx, false);
         if review_active {
             self.end_session(cx);
             self.show_toast(
