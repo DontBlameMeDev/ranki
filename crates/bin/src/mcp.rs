@@ -1265,14 +1265,9 @@ impl RankiMcp {
                 input.model_name.as_deref(),
             )?;
         }
-        match resolve_deck_id(
-            &store,
-            input.deck_id,
-            input.deck_name.as_deref(),
-        )? {
-            Some(deck_id) => store.update_note(&note, deck_id)?,
-            None => store.update_note_checked(&note, None, None)?,
-        }
+        let deck_id =
+            resolve_deck_id(&store, input.deck_id, input.deck_name.as_deref())?;
+        store.update_note_checked(&note, deck_id, input.expected_modified)?;
         let updated = store.note(input.id)?.ok_or_else(|| {
             ToolError::from(ranki_model::StoreError::NotFound(format!(
                 "note {}",

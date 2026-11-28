@@ -1,5 +1,6 @@
 //! AnkiConnect-compatible JSON-RPC server.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
@@ -8,10 +9,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc;
 use std::thread;
 use unicode_normalization::UnicodeNormalization;
 
@@ -151,11 +153,7 @@ pub fn serve(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "worker setup shares the server's explicit inputs"
-)]
-#[expect(
-    clippy::excessive_nesting,
-    reason = "each worker owns a long-lived receive loop"
+    reason = "the HTTP server shares the collection, media, and scheduler inputs"
 )]
 fn serve_incoming(
     server: &Server,
@@ -168,40 +166,101 @@ fn serve_incoming(
             .map_err(|()| {
                 CliError::Message(String::from("invalid HTTP header"))
             })?;
-    let mut senders = Vec::with_capacity(WORKER_COUNT);
-    for _ in 0..WORKER_COUNT {
-        let (sender, receiver) = mpsc::channel();
-        senders.push(sender);
-        let worker_store = Arc::clone(store);
-        let worker_media_dir = media_dir.to_path_buf();
-        let worker_scheduler = scheduler.clone();
-        let worker_header = header.clone();
-        drop(thread::spawn(move || {
-            for request in receiver {
-                respond(
-                    &worker_store,
-                    &worker_media_dir,
-                    request,
-                    &worker_scheduler,
-                    &worker_header,
-                );
-            }
-        }));
+    let queue = Arc::new(TaskQueue::default());
+    thread::scope(|scope| {
+        for _ in 0..WORKER_COUNT {
+            let worker_store = Arc::clone(store);
+            let worker_media_dir = media_dir.to_path_buf();
+            let worker_scheduler = scheduler.clone();
+            let worker_header = header.clone();
+            let worker_queue = Arc::clone(&queue);
+            let worker = Worker {
+                queue: worker_queue,
+                store: worker_store,
+                media_dir: worker_media_dir,
+                scheduler: worker_scheduler,
+                header: worker_header,
+            };
+            scope.spawn(move || worker.run());
+        }
+        for request in server.incoming_requests() {
+            queue.push(request);
+        }
+        queue.close();
+    });
+    Ok(())
+}
+
+#[derive(Default)]
+struct TaskQueue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct QueueState {
+    tasks: VecDeque<Request>,
+    closed: bool,
+}
+
+struct Worker {
+    queue: Arc<TaskQueue>,
+    store: Arc<Mutex<Collection>>,
+    media_dir: PathBuf,
+    scheduler: FsrsScheduler,
+    header: Header,
+}
+
+impl Worker {
+    fn run(self) {
+        while let Some(request) = self.queue.pop() {
+            respond(
+                &self.store,
+                &self.media_dir,
+                request,
+                &self.scheduler,
+                &self.header,
+            );
+        }
+    }
+}
+
+impl TaskQueue {
+    fn push(&self, request: Request) {
+        let mut state =
+            self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.tasks.push_back(request);
+        drop(state);
+        self.ready.notify_one();
     }
 
-    let mut next = 0usize;
-    for request in server.incoming_requests() {
-        let sender = senders.get(next).ok_or_else(|| {
-            CliError::Message(String::from("connect worker unavailable"))
-        })?;
-        if sender.send(request).is_err() {
-            return Err(CliError::Message(String::from(
-                "connect worker stopped",
-            )));
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "the queue wait loop keeps its lock guard in one place"
+    )]
+    fn pop(&self) -> Option<Request> {
+        let mut state =
+            self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            match state.tasks.pop_front() {
+                Some(request) => return Some(request),
+                None if state.closed => return None,
+                None => {}
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
         }
-        next = next.saturating_add(1) % WORKER_COUNT;
     }
-    Ok(())
+
+    fn close(&self) {
+        let mut state =
+            self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.closed = true;
+        drop(state);
+        self.ready.notify_all();
+    }
 }
 
 #[expect(
@@ -2021,18 +2080,22 @@ mod tests {
                 "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             );
-            let mut client = TcpStream::connect(addr).unwrap();
-            client
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            client.write_all(request.as_bytes()).unwrap();
+            for _ in 0..6 {
+                let mut client = TcpStream::connect(addr).unwrap();
+                client
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                client.write_all(request.as_bytes()).unwrap();
 
-            let mut received = Vec::new();
-            let mut buffer = [0u8; 256];
-            while !String::from_utf8_lossy(&received).contains("\"result\":6") {
-                let count = client.read(&mut buffer).unwrap();
-                assert!(count > 0, "connection closed before a response");
-                received.extend_from_slice(&buffer[..count]);
+                let mut received = Vec::new();
+                let mut buffer = [0u8; 256];
+                while !String::from_utf8_lossy(&received)
+                    .contains("\"result\":6")
+                {
+                    let count = client.read(&mut buffer).unwrap();
+                    assert!(count > 0, "connection closed before a response");
+                    received.extend_from_slice(&buffer[..count]);
+                }
             }
 
             drop(stalled);

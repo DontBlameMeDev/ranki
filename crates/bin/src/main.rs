@@ -904,13 +904,11 @@ fn print_note_edit(
     } else if !tags.is_empty() {
         note.tags = tags;
     }
-    match deck {
-        Some(selected) => {
-            let deck_id = resolve_deck(collection, selected)?;
-            collection.update_note(&note, deck_id)?;
-        }
-        None => collection.update_note_checked(&note, None, None)?,
-    }
+    let deck_id = deck
+        .as_ref()
+        .map(|selected| resolve_deck(collection, selected))
+        .transpose()?;
+    collection.update_note_checked(&note, deck_id, expected_modified)?;
     let modified = collection
         .note(note_id)?
         .map(|saved| saved.modified)
