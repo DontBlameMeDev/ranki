@@ -555,6 +555,7 @@ fn colpkg_import_replaces_collection_and_restores_conflicting_media() {
     let db_text = String::from_utf8_lossy(&db_bytes);
     assert!(db_text.contains("CREATE TABLE media"));
     assert!(db_text.contains("pic-"), "{db_text}");
+}
 
 #[test]
 fn invalid_import_update_policy_is_rejected_before_sync() {

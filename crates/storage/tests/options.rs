@@ -742,6 +742,7 @@ fn schema11_combines_days_across_all_four_counters() {
     assert_eq!(deck.common.review_studied, 0);
     assert_eq!(deck.common.learning_studied, 3);
     assert_eq!(deck.common.milliseconds_studied, 9);
+}
 
 #[test]
 fn field_44_wait_for_audio_round_trips_both_values() {

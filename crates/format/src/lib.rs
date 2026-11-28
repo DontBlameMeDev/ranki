@@ -93,9 +93,6 @@ impl FromStr for UpdateCondition {
         }
     }
 }
-        }
-    }
-}
 
 /// Result of replacing a collection from a `.colpkg` backup.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,7 +227,8 @@ pub fn import_apkg_with_options(
         .execute("ATTACH DATABASE ? AS incoming", params![incoming])
         .map_err(error::db_error("cannot open package collection"))?;
 
-    let result = merge::merge_collection(&mut connection, &[], media_count, options);
+    let result =
+        merge::merge_collection(&mut connection, &[], media_count, options);
     let detach = connection
         .execute_batch("DETACH DATABASE incoming")
         .map_err(error::db_error("cannot close package collection"));

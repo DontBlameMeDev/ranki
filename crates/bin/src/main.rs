@@ -16,7 +16,6 @@ use ranki_format::ExportOptions;
 use ranki_format::UpdateCondition;
 use ranki_format::export_apkg_with_options;
 use ranki_format::export_colpkg_with_options;
-use ranki_format::import_apkg;
 use ranki_format::restore_colpkg;
 use ranki_model::Id;
 use ranki_model::NewNote;
@@ -516,8 +515,7 @@ fn run_with_sync(
     let warn_shutdown_sync = !matches!(&command, Command::Gui);
     #[cfg(not(feature = "desktop"))]
     let warn_shutdown_sync = true;
-    let restore_command =
-        matches!(&command, Command::Import { package, .. } if is_colpkg(package));
+    let restore_command = matches!(&command, Command::Import { package, .. } if is_colpkg(package));
     let result = match command {
         Command::Mcp => mcp::serve(&settings.paths, scheduler),
         #[cfg(feature = "desktop")]
