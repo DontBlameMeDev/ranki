@@ -20,14 +20,16 @@ use image::{GenericImageView, Limits};
 use ranki_model::{Note, NoteModel, cloze_markers};
 
 #[expect(
+    clippy::fn_params_excessive_bools,
     clippy::too_many_arguments,
-    reason = "one flag selects full card text or list preview text"
+    reason = "flags select full card text, list previews, and the answer side"
 )]
 fn render_sides(
     model: &NoteModel,
     note: &Note,
     ordinal: u16,
     keep_images: bool,
+    include_front: bool,
 ) -> (String, String) {
     let Some(template) = model.template_for(ordinal) else {
         let fallback = String::from("This note has no template.");
@@ -43,7 +45,11 @@ fn render_sides(
     let question_markup =
         render_template(&template.question_format, fields, question_env);
     let answer_env = RenderEnv {
-        front_side: &question_markup,
+        front_side: if include_front {
+            question_markup.as_str()
+        } else {
+            ""
+        },
         hide_occlusion,
     };
     let answer_markup =
@@ -69,7 +75,17 @@ fn render_sides(
 /// Renders the question and answer text for one card ordinal, including images.
 #[must_use]
 pub fn sides(model: &NoteModel, note: &Note, ordinal: u16) -> (String, String) {
-    render_sides(model, note, ordinal, true)
+    render_sides(model, note, ordinal, true, true)
+}
+
+/// Renders the answer side without repeating the question above it.
+#[must_use]
+pub fn sides_answer(
+    model: &NoteModel,
+    note: &Note,
+    ordinal: u16,
+) -> (String, String) {
+    render_sides(model, note, ordinal, true, false)
 }
 
 /// Renders card text for list previews, without image markup.
@@ -79,7 +95,7 @@ pub fn sides_text(
     note: &Note,
     ordinal: u16,
 ) -> (String, String) {
-    render_sides(model, note, ordinal, false)
+    render_sides(model, note, ordinal, false, true)
 }
 
 /// Draws card text and any local images referenced by it.
@@ -812,4 +828,39 @@ fn load_image(
         rgba.as_raw(),
     );
     Some(ctx.load_texture(name, color, TextureOptions::LINEAR))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sides, sides_answer};
+    use ranki_model::{Note, NoteModel, StockModelKind};
+
+    fn basic() -> (NoteModel, Note) {
+        let mut model = StockModelKind::Basic.definition();
+        model.id = 1;
+        let note = Note {
+            id: 1,
+            guid: String::from("abc"),
+            model_id: 1,
+            modified: 0,
+            usn: 0,
+            tags: Vec::new(),
+            fields: vec![String::from("Question?"), String::from("Answer!")],
+            sort_field: String::new(),
+            checksum: 0,
+            flags: 0,
+            data: String::new(),
+        };
+        (model, note)
+    }
+
+    #[test]
+    fn answer_only_leaves_out_the_repeated_front() {
+        let (model, note) = basic();
+        let (_, full) = sides(&model, &note, 0);
+        let (_, answer) = sides_answer(&model, &note, 0);
+        assert!(full.contains("Question?"));
+        assert!(!answer.contains("Question?"));
+        assert!(answer.contains("Answer!"));
+    }
 }

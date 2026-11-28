@@ -168,6 +168,7 @@ pub struct BrowseState {
     pub draft: String,
     pub rows: Vec<BrowseRow>,
     pub total: usize,
+    pub page_limit: usize,
 }
 
 /// Review totals and the due forecast shown on the statistics screen.
@@ -242,11 +243,25 @@ pub enum ToastKind {
 }
 
 /// A short status message shown above the bottom tabs.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Toast {
     pub kind: ToastKind,
     pub text: String,
+    pub created: Instant,
 }
+
+impl Default for Toast {
+    fn default() -> Self {
+        Self {
+            kind: ToastKind::default(),
+            text: String::new(),
+            created: Instant::now(),
+        }
+    }
+}
+
+/// How long a toast stays on screen.
+const TOAST_TTL: Duration = Duration::from_secs(4);
 
 /// Everything the mobile UI needs, including the reopening store.
 #[derive(Debug)]
@@ -344,6 +359,7 @@ impl AppState {
                 draft: browse_query,
                 rows: Vec::new(),
                 total: 0,
+                page_limit: BROWSE_ROW_LIMIT,
             },
             sync: SyncUiState {
                 username: sync_username,
@@ -1169,11 +1185,26 @@ impl AppState {
         self.sync_job = Some(SyncJob { kind, results });
     }
 
+    /// Expires the current toast and returns the remaining display time.
+    pub fn poll_toast(&mut self, now: Instant) -> Option<Duration> {
+        let toast = self.toast.as_ref()?;
+        let remaining = toast
+            .created
+            .checked_add(TOAST_TTL)
+            .and_then(|deadline| deadline.checked_duration_since(now));
+        if remaining.is_some_and(|wait| !wait.is_zero()) {
+            return remaining;
+        }
+        self.toast = None;
+        None
+    }
+
     /// Shows a success toast.
     pub fn say(&mut self, text: impl Into<String>) {
         self.toast = Some(Toast {
             kind: ToastKind::Success,
             text: text.into(),
+            created: Instant::now(),
         });
     }
 
@@ -1190,6 +1221,7 @@ impl AppState {
         self.toast = Some(Toast {
             kind: ToastKind::Error,
             text: text.into(),
+            created: Instant::now(),
         });
     }
 
@@ -1364,6 +1396,13 @@ impl AppState {
         self.update_preview();
     }
 
+    /// Shows another page of browse results.
+    pub fn load_more(&mut self) {
+        self.browse.page_limit =
+            self.browse.page_limit.saturating_add(BROWSE_ROW_LIMIT);
+        self.refresh_browse();
+    }
+
     fn refresh_browse(&mut self) {
         let ids = match self.store.find_cards(&self.browse.query) {
             Ok(ids) => ids,
@@ -1377,8 +1416,9 @@ impl AppState {
         self.browse.total = ids.len();
         let decks = self.decks.clone();
         let models = self.add.models.clone();
-        let mut rows = Vec::with_capacity(ids.len().min(BROWSE_ROW_LIMIT));
-        let visible = ids.len().min(BROWSE_ROW_LIMIT);
+        let limit = self.browse.page_limit.max(1);
+        let mut rows = Vec::with_capacity(ids.len().min(limit));
+        let visible = ids.len().min(limit);
         let visible_ids = ids.get(..visible).unwrap_or(&ids);
         let loaded = match self.store.cards_with_notes(visible_ids) {
             Ok(loaded) => loaded,
@@ -1809,5 +1849,27 @@ mod tests {
         assert!(!state.sync.busy);
         assert_eq!(state.sync.status, "Already up to date");
         assert!(state.sync_job.is_none());
+    }
+
+    #[test]
+    fn toasts_expire_after_their_lifetime() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = DataPaths::new(directory.path());
+        let _collection = Collection::create(&paths.collection).unwrap();
+        let settings = Settings {
+            paths,
+            ..Settings::default()
+        };
+        let mut state = AppState::new(
+            ReopeningCollection::new(&settings.paths.collection),
+            settings,
+        )
+        .unwrap();
+        state.say("Saved");
+        let start = state.toast.as_ref().unwrap().created;
+        assert!(state.poll_toast(start).is_some());
+        assert!(state.toast.is_some());
+        assert!(state.poll_toast(start + TOAST_TTL).is_none());
+        assert!(state.toast.is_none());
     }
 }
