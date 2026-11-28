@@ -44,9 +44,7 @@ use std::path::PathBuf;
 use std::process;
 use std::process::ExitCode;
 use std::str::FromStr;
-#[cfg(feature = "desktop")]
 use std::sync::Arc;
-#[cfg(feature = "desktop")]
 use std::sync::Mutex;
 #[cfg(feature = "desktop")]
 use std::thread;
@@ -504,11 +502,13 @@ fn run_with_sync(
     #[cfg(feature = "desktop")]
     let defer_startup_sync = matches!(&command, Command::Gui)
         && !cli.mobile
+        && auth.is_none()
         && sync::has_stored_key(&settings);
     #[cfg(not(feature = "desktop"))]
     let defer_startup_sync = false;
 
-    let startup_sync = if should_startup_sync(auto_sync, defer_startup_sync) {
+    let mut startup_sync = if should_startup_sync(auto_sync, defer_startup_sync)
+    {
         sync_once_and_warn(transport, &settings, auth.as_ref(), true)
     } else {
         None
@@ -516,6 +516,7 @@ fn run_with_sync(
     if startup_sync.is_some() {
         maybe_optimize(config, &settings);
     }
+    let startup_sync_result = Arc::new(Mutex::new(None::<SyncOutcome>));
     #[cfg(feature = "desktop")]
     let mut final_settings = settings.clone();
     #[cfg(not(feature = "desktop"))]
@@ -529,7 +530,13 @@ fn run_with_sync(
         Command::Mcp => mcp::serve(&settings.paths, scheduler),
         #[cfg(feature = "desktop")]
         Command::Gui => {
-            match open_gui(&settings, config, cli.mobile, defer_startup_sync) {
+            match open_gui(
+                &settings,
+                config,
+                cli.mobile,
+                defer_startup_sync,
+                &startup_sync_result,
+            ) {
                 Ok(ui_settings) => {
                     if let Some(settings_from_ui) = ui_settings {
                         final_settings = settings_from_ui;
@@ -659,6 +666,9 @@ fn run_with_sync(
             run_store_command(&mut collection, command, &scheduler, media_dir)
         }
     };
+    if defer_startup_sync && let Ok(guard) = startup_sync_result.lock() {
+        startup_sync.clone_from(&guard);
+    }
     let (shutdown_auth, shutdown_sync) = if auto_sync
         && !restore_command
         && final_settings.sync.enabled
@@ -1070,6 +1080,7 @@ fn open_gui(
     config: &config::Config,
     mobile: bool,
     sync_at_startup: bool,
+    startup_sync_result: &Arc<Mutex<Option<SyncOutcome>>>,
 ) -> CliResult<Option<config::Settings>> {
     if mobile {
         #[cfg(feature = "mobile")]
@@ -1127,7 +1138,13 @@ fn open_gui(
             .and(config_result)
             .map_err(|error| error.to_string())
     });
-    ranki_ui::run(Box::new(store), options, save_settings, sync_at_startup);
+    ranki_ui::run(
+        Box::new(store),
+        options,
+        save_settings,
+        sync_at_startup,
+        Arc::clone(startup_sync_result),
+    );
     let latest_guard = latest.lock().map_err(|_| {
         CliError::Message(String::from("settings lock poisoned"))
     })?;

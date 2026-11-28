@@ -504,6 +504,12 @@ impl Root {
         cx: &mut Context<Self>,
     ) {
         self.sync.running = None;
+        if let Some(slot) = self.startup_sync_result.take()
+            && let Ok(outcome) = &result
+            && let Ok(mut guard) = slot.lock()
+        {
+            *guard = Some(outcome.clone());
+        }
         self.sync.conflict = None;
         self.sync.error = match &result {
             Err(error) => Some(sync_error(error)),
@@ -619,7 +625,7 @@ impl Root {
         let review_active = self.view == View::Review;
         self.store =
             Box::new(ReopeningCollection::new(&self.options.paths.collection));
-        self.reload(cx);
+        self.reload(cx, false);
         if review_active {
             self.end_session(cx);
             self.show_toast(

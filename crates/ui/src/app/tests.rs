@@ -7872,6 +7872,7 @@ fn startup_reads_the_summary_off_the_ui_thread(cx: &mut gpui::TestAppContext) {
                 store: Box::new(StatisticsStore {
                     reads: Arc::clone(&reads),
                     modified: Arc::new(AtomicI64::new(1)),
+                    fail: Arc::new(AtomicBool::new(false)),
                 }),
                 options,
                 save_settings: Arc::new(|_| Ok(())),
@@ -7912,6 +7913,7 @@ fn startup_sync_runs_after_the_window_opens(cx: &mut gpui::TestAppContext) {
         },
         ..Default::default()
     };
+    let deferred = Arc::new(Mutex::new(None::<ranki_sync::SyncOutcome>));
     let syncs = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&syncs);
     let media = Arc::new(AtomicUsize::new(0));
@@ -7926,6 +7928,7 @@ fn startup_sync_runs_after_the_window_opens(cx: &mut gpui::TestAppContext) {
             window,
             cx,
         );
+        root.startup_sync_result = Some(Arc::clone(&deferred));
         root.sync_run = Arc::new(move |_, _, _, _, _| {
             counted.fetch_add(1, Ordering::Relaxed);
             Ok(ranki_sync::SyncOutcome::NoChanges)
@@ -7942,6 +7945,10 @@ fn startup_sync_runs_after_the_window_opens(cx: &mut gpui::TestAppContext) {
     cx.run_until_parked();
     assert_eq!(syncs.load(Ordering::Relaxed), 1);
     assert_eq!(media.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        *deferred.lock().unwrap(),
+        Some(ranki_sync::SyncOutcome::NoChanges)
+    );
     assert!(cx.update(|_, app| root.read(app).toast.is_none()));
     cx.update(|_, cx| {
         root.update(cx, |root, cx| {

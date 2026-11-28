@@ -49,7 +49,8 @@ use gpui::{
     px, size,
 };
 use ranki_model::Store;
-use std::sync::Arc;
+use ranki_sync::SyncOutcome;
+use std::sync::{Arc, Mutex};
 
 pub use bench::{BenchApp, BenchKey};
 pub use ranki_model::{Settings, ThemeChoice};
@@ -67,6 +68,7 @@ pub fn run(
     options: Options,
     save_settings: SettingsSaver,
     sync_at_startup: bool,
+    startup_sync_result: Arc<Mutex<Option<SyncOutcome>>>,
 ) {
     let media_dir = options.paths.media_dir.clone();
     Application::new()
@@ -104,6 +106,8 @@ pub fn run(
                     root.update(cx, |root, cx| {
                         app::Root::start_external_change_poll(cx);
                         if sync_at_startup {
+                            root.startup_sync_result =
+                                Some(Arc::clone(&startup_sync_result));
                             root.sync_at_startup(cx);
                         }
                     });

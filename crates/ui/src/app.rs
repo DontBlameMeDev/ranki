@@ -6,7 +6,7 @@ use std::{
     env,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -22,7 +22,7 @@ use ranki_model::{
     NoteModel, Rating, ReviewDecision, StockModelKind, Store, Timing, UiState,
     UiView,
 };
-use ranki_sync::MediaProgress;
+use ranki_sync::{MediaProgress, SyncOutcome};
 
 use crate::{
     Options, SettingsSaver, ThemeChoice,
@@ -671,6 +671,7 @@ pub struct Root {
     pub(crate) scrollbar_layouts: BTreeMap<&'static str, (Bounds<Pixels>, f32)>,
     pub(crate) browse_smooth: SmoothScroll,
     pub(crate) sync: SyncUiState,
+    pub(crate) startup_sync_result: Option<Arc<Mutex<Option<SyncOutcome>>>>,
     pub(crate) sync_run: Arc<crate::sync_view::SyncRun>,
     pub(crate) media_run: Arc<crate::sync_view::MediaRun>,
     pub(crate) save_settings: SettingsSaver,
@@ -1228,6 +1229,7 @@ impl Root {
             scrollbar_drag: None,
             scrollbar_layouts: BTreeMap::new(),
             browse_smooth: SmoothScroll::with_handle(browse_scroll),
+            startup_sync_result: None,
             sync: SyncUiState {
                 username: sync_username,
                 password: sync_password,

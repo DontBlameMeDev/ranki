@@ -134,6 +134,7 @@ pub struct SyncClient<T: SyncTransport> {
     media_dir: PathBuf,
     state_path: PathBuf,
     media_progress: Option<MediaProgressFn>,
+    expected_local_mod: Option<i64>,
 }
 
 impl<T: SyncTransport> SyncClient<T> {
@@ -164,6 +165,7 @@ impl<T: SyncTransport> SyncClient<T> {
             media_dir: media_dir.to_path_buf(),
             state_path: state_path.to_path_buf(),
             media_progress: None,
+            expected_local_mod: None,
         })
     }
 
@@ -295,6 +297,7 @@ impl<T: SyncTransport> SyncClient<T> {
     /// invalid, or the atomic replacement fails.
     pub fn full_download(&mut self) -> Result<()> {
         self.require_host_key()?;
+        let expected_local_mod = self.expected_local_mod.take();
         let body = wire::frame(b"{}")?;
         let response = self.send(SyncMethod::Download, &body)?;
         let bytes = wire::decode(&response)?;
@@ -303,6 +306,13 @@ impl<T: SyncTransport> SyncClient<T> {
                 >= MAX_COLLECTION_BYTES
         {
             return Err(SyncError::TooLarge);
+        }
+        if let Some(expected) = expected_local_mod
+            && read_local_info(&self.collection)?.mod_time != expected
+        {
+            return Err(SyncError::Conflict(String::from(
+                "local collection changed during download",
+            )));
         }
         let parent = self.collection.parent().unwrap_or_else(|| Path::new("."));
         if !parent.as_os_str().is_empty() {
@@ -632,6 +642,7 @@ impl<T: SyncTransport> SyncClient<T> {
     fn decide_and_sync(&mut self) -> Result<SyncOutcome> {
         let status = self.status()?;
         let local = read_local_info(&self.collection)?;
+        self.expected_local_mod = Some(local.mod_time);
         let last_mod = self.state.last_mod;
         let last_scm = self.state.last_scm;
 
