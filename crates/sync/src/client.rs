@@ -330,12 +330,14 @@ impl<T: SyncTransport> SyncClient<T> {
     /// Refreshes local media from `AnkiWeb`.
     ///
     /// Callers run this after the collection sync, so a large media library
-    /// never holds up the collection itself. The full manifest is fetched
-    /// whenever media changes or the local folder is empty, so files from
-    /// another account or a removed local copy are restored. Files already
-    /// present with the server's hash are left untouched. Batches, which
-    /// `AnkiWeb` caps at 25 files, download in parallel when the transport can
-    /// clone itself.
+    /// never holds up the collection itself. Only changes newer than the last
+    /// checkpoint are fetched, unless the media folder is empty and needs a
+    /// refill. Each completed group of changes advances the checkpoint, so a
+    /// refresh that is closed part way through resumes from there.
+    ///
+    /// Files already present with the server's hash are left untouched.
+    /// Batches, which `AnkiWeb` caps at 25 files, download in parallel when the
+    /// transport can clone itself.
     ///
     /// # Errors
     ///
@@ -347,11 +349,9 @@ impl<T: SyncTransport> SyncClient<T> {
         if server_usn <= 0 {
             return Ok(());
         }
+        let empty = self.media_dir_is_empty();
         let matching = server_usn == self.state.last_media_usn;
-        if matching
-            && !self.state.media_refill_needed
-            && !self.media_dir_is_empty()
-        {
+        if matching && !self.state.media_refill_needed && !empty {
             return Ok(());
         }
         if matching && !self.state.media_refill_needed {
@@ -360,29 +360,60 @@ impl<T: SyncTransport> SyncClient<T> {
         }
         fs::create_dir_all(&self.media_dir)?;
 
-        let missing = self.missing_media(server_usn)?;
-        let plan = DownloadPlan::new(&missing)?;
+        let start_usn = if empty
+            || self.state.media_refill_needed
+            || self.state.media_scan_usn > server_usn
+        {
+            0
+        } else {
+            self.state.media_scan_usn
+        };
+        if start_usn == server_usn {
+            self.state.last_media_usn = server_usn;
+            self.state.media_scan_usn = server_usn;
+            self.state.media_refill_needed = false;
+            self.state.save(&self.state_path)?;
+            return Ok(());
+        }
+        if start_usn == 0 {
+            self.state.media_scan_usn = 0;
+            self.state.media_refill_needed = true;
+            self.state.save(&self.state_path)?;
+        }
+
+        let missing = self.missing_media(start_usn, server_usn)?;
+        let mut plan = DownloadPlan::new(&missing)?;
         self.report_media(MediaProgress {
             done: 0,
             total: plan.total,
         });
+        let mut next_group = 0_usize;
+        advance_media_checkpoint(self, &plan.groups, &mut next_group)?;
         let workers = (0..MEDIA_DOWNLOAD_WORKERS)
             .filter_map(|_| self.transport.media_download_worker())
             .collect::<Vec<_>>();
         if workers.len() > 1 && plan.bodies.len() > 1 {
-            self.download_media_parallel(&plan, workers)?;
+            self.download_media_parallel(&mut plan, workers, &mut next_group)?;
         } else {
-            self.download_media_sequential(&plan)?;
+            self.download_media_sequential(&mut plan, &mut next_group)?;
         }
         self.state.last_media_usn = server_usn;
+        self.state.media_scan_usn = server_usn;
         self.state.media_refill_needed = false;
         self.state.save(&self.state_path)?;
         Ok(())
     }
 
-    fn download_media_sequential(&mut self, plan: &DownloadPlan) -> Result<()> {
+    fn download_media_sequential(
+        &mut self,
+        plan: &mut DownloadPlan,
+        next_group: &mut usize,
+    ) -> Result<()> {
         let mut done = 0_usize;
-        for body in &plan.bodies {
+        let bodies = &plan.bodies;
+        let batch_groups = &plan.batch_groups;
+        let groups = &mut plan.groups;
+        for (index, body) in bodies.iter().enumerate() {
             let response = self.send(SyncMethod::MediaDownload, body)?;
             let written = self.extract(&response)?;
             done = done.saturating_add(written);
@@ -390,18 +421,26 @@ impl<T: SyncTransport> SyncClient<T> {
                 done,
                 total: plan.total,
             });
+            finish_media_batch(
+                self,
+                groups,
+                batch_group(batch_groups, index)?,
+                next_group,
+            )?;
         }
         Ok(())
     }
 
     #[expect(
         clippy::excessive_nesting,
+        clippy::too_many_arguments,
         reason = "worker setup and result handling stay next to the scope"
     )]
     fn download_media_parallel(
         &mut self,
-        plan: &DownloadPlan,
+        plan: &mut DownloadPlan,
         workers: Vec<Box<dyn SyncTransport>>,
+        next_group: &mut usize,
     ) -> Result<()> {
         let shared = DownloadShared {
             bodies: &plan.bodies,
@@ -409,6 +448,9 @@ impl<T: SyncTransport> SyncClient<T> {
             failed: AtomicBool::new(false),
             endpoint: self.state.endpoint.clone(),
         };
+        let batch_groups = &plan.batch_groups;
+        let groups = &mut plan.groups;
+        let total = plan.total;
         let mut done = 0_usize;
         let mut redirected = None;
         thread::scope(|scope| -> Result<()> {
@@ -422,13 +464,16 @@ impl<T: SyncTransport> SyncClient<T> {
             }
             drop(sender);
             for result in receiver {
-                let (response, endpoint) = result?;
+                let (index, response, endpoint) = result?;
                 let written = self.extract(&response)?;
                 done = done.saturating_add(written);
-                self.report_media(MediaProgress {
-                    done,
-                    total: plan.total,
-                });
+                self.report_media(MediaProgress { done, total });
+                finish_media_batch(
+                    self,
+                    groups,
+                    batch_group(batch_groups, index)?,
+                    next_group,
+                )?;
                 if redirected.is_none() && endpoint != self.state.endpoint {
                     redirected = Some(endpoint);
                 }
@@ -441,6 +486,14 @@ impl<T: SyncTransport> SyncClient<T> {
             self.state.save(&self.state_path)?;
         }
         Ok(())
+    }
+
+    fn checkpoint_media(&mut self, usn: i32) -> Result<()> {
+        if usn <= self.state.media_scan_usn {
+            return Ok(());
+        }
+        self.state.media_scan_usn = usn;
+        self.state.save(&self.state_path)
     }
 
     fn extract(&self, response: &SyncResponse) -> Result<usize> {
@@ -456,14 +509,19 @@ impl<T: SyncTransport> SyncClient<T> {
         media::parse_begin(&wire::decode(&response)?)
     }
 
-    /// Collects the names that are missing locally or differ from the server.
+    /// Collects groups of names that are missing locally or differ from the
+    /// server, paired with the highest USN in each manifest batch.
     #[expect(
         clippy::excessive_nesting,
         reason = "the manifest walk keeps its cursor and errors local"
     )]
-    fn missing_media(&mut self, server_usn: i32) -> Result<Vec<String>> {
-        let mut missing = Vec::new();
-        let mut last_usn = 0_i32;
+    fn missing_media(
+        &mut self,
+        start_usn: i32,
+        server_usn: i32,
+    ) -> Result<Vec<MediaChangesGroup>> {
+        let mut groups = Vec::new();
+        let mut last_usn = start_usn;
         while last_usn < server_usn {
             let batch = self.media_changes(last_usn)?;
             if batch.is_empty() {
@@ -480,9 +538,13 @@ impl<T: SyncTransport> SyncClient<T> {
                 ));
             }
             last_usn = highest;
-            missing.extend(self.missing_names(&batch)?);
+            let names = self.missing_names(&batch)?;
+            groups.push(MediaChangesGroup {
+                end_usn: highest,
+                names,
+            });
         }
-        Ok(missing)
+        Ok(groups)
     }
 
     fn media_changes(
@@ -867,25 +929,65 @@ fn attempt_transport<T: SyncTransport + ?Sized>(
     }
 }
 
+/// One manifest batch of files to download, tagged with its last USN.
+struct MediaChangesGroup {
+    end_usn: i32,
+    names: Vec<String>,
+}
+
+/// Download state for one manifest batch.
+struct MediaGroup {
+    end_usn: i32,
+    remaining: usize,
+    done: bool,
+}
+
 /// Media batches and their framed requests for one refresh.
 struct DownloadPlan {
     bodies: Vec<Vec<u8>>,
+    batch_groups: Vec<usize>,
+    groups: Vec<MediaGroup>,
     total: usize,
 }
 
 impl DownloadPlan {
-    fn new(missing: &[String]) -> Result<Self> {
-        let total = missing.len();
-        let bodies = missing
-            .chunks(media::DOWNLOAD_BATCH)
-            .map(|files| {
-                wire::frame_json(&media::DownloadRequest {
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "each manifest group builds its own framed batches"
+    )]
+    fn new(missing: &[MediaChangesGroup]) -> Result<Self> {
+        let mut bodies = Vec::new();
+        let mut batch_groups = Vec::new();
+        let mut groups = Vec::new();
+        let mut total = 0_usize;
+        for (index, group) in missing.iter().enumerate() {
+            let count = group.names.len().div_ceil(media::DOWNLOAD_BATCH);
+            for files in group.names.chunks(media::DOWNLOAD_BATCH) {
+                bodies.push(wire::frame_json(&media::DownloadRequest {
                     files: files.to_vec(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self { bodies, total })
+                })?);
+                batch_groups.push(index);
+            }
+            total = total.saturating_add(group.names.len());
+            groups.push(MediaGroup {
+                end_usn: group.end_usn,
+                remaining: count,
+                done: count == 0,
+            });
+        }
+        Ok(Self {
+            bodies,
+            batch_groups,
+            groups,
+            total,
+        })
     }
+}
+
+fn batch_group(groups: &[usize], index: usize) -> Result<usize> {
+    groups.get(index).copied().ok_or_else(|| {
+        SyncError::Decode("media batch has no manifest group".to_owned())
+    })
 }
 
 /// State shared by the media download workers.
@@ -896,7 +998,7 @@ struct DownloadShared<'a> {
     endpoint: String,
 }
 
-type DownloadResult = Result<(SyncResponse, String)>;
+type DownloadResult = Result<(usize, SyncResponse, String)>;
 
 fn download_worker(
     mut transport: Box<dyn SyncTransport>,
@@ -915,7 +1017,9 @@ fn download_worker(
         };
         let sent = match send_transport(&mut *transport, &mut endpoint, request)
         {
-            Ok((response, _)) => sender.send(Ok((response, endpoint.clone()))),
+            Ok((response, _)) => {
+                sender.send(Ok((index, response, endpoint.clone())))
+            }
             Err(error) => {
                 shared.failed.store(true, Ordering::Relaxed);
                 sender.send(Err(error))
@@ -925,6 +1029,43 @@ fn download_worker(
             break;
         }
     }
+}
+
+fn advance_media_checkpoint<T: SyncTransport>(
+    client: &mut SyncClient<T>,
+    groups: &[MediaGroup],
+    next_group: &mut usize,
+) -> Result<()> {
+    while let Some(group) = groups.get(*next_group) {
+        if !group.done {
+            break;
+        }
+        client.checkpoint_media(group.end_usn)?;
+        *next_group = next_group.saturating_add(1);
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "checkpoint state travels with the media refresh"
+)]
+fn finish_media_batch<T: SyncTransport>(
+    client: &mut SyncClient<T>,
+    groups: &mut [MediaGroup],
+    group_index: usize,
+    next_group: &mut usize,
+) -> Result<()> {
+    let Some(group) = groups.get_mut(group_index) else {
+        return Err(SyncError::Decode(
+            "media batch has no manifest group".to_owned(),
+        ));
+    };
+    group.remaining = group.remaining.saturating_sub(1);
+    if group.remaining == 0 {
+        group.done = true;
+    }
+    advance_media_checkpoint(client, groups, next_group)
 }
 
 fn conflict(reason: &str) -> SyncOutcome {

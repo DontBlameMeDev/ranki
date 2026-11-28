@@ -4,7 +4,9 @@
 //! and a conservative automatic [`SyncClient::sync`]. It refuses one-way
 //! changes when both sides changed or when the local collection may be newer.
 //! [`SyncClient::sync_media`] refreshes local media on its own, so a large
-//! media library never holds up the collection. Local media is never deleted.
+//! media library never holds up the collection. Media refreshes checkpoint their
+//! manifest cursor, so a later run resumes after the last completed group. Local
+//! media is never deleted.
 //!
 //! HTTP lives behind the object-safe [`SyncTransport`] trait. [`HttpTransport`]
 //! uses a blocking client, sends the `anki-sync` header fields `v`, `k`, `c`,
