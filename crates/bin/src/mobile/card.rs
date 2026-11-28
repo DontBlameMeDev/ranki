@@ -855,6 +855,29 @@ mod tests {
     }
 
     #[test]
+    fn cloze_answers_keep_revealed_text_through_the_front_side() {
+        let mut model = StockModelKind::Cloze.definition();
+        model.id = 1;
+        let template = model.templates.first_mut().expect("template");
+        template.answer_format = String::from("{{FrontSide}}");
+        let note = Note {
+            id: 1,
+            guid: String::from("abc"),
+            model_id: 1,
+            modified: 0,
+            usn: 0,
+            tags: Vec::new(),
+            fields: vec![String::from("Capital: {{c1::Paris}}"), String::new()],
+            sort_field: String::new(),
+            checksum: 0,
+            flags: 0,
+            data: String::new(),
+        };
+        let (_, answer) = sides_answer(&model, &note, 0);
+        assert!(answer.contains("Paris"));
+    }
+
+    #[test]
     fn answer_only_leaves_out_the_repeated_front() {
         let (model, note) = basic();
         let (_, full) = sides(&model, &note, 0);
