@@ -1,28 +1,29 @@
 use gpui::AppContext as _;
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicI64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ranki_model::Store as _;
 use ranki_model::{
     Card, CardQueue, CardTemplate, CardType, Deck, DeckStats, Id, NewNote,
-    Note, NoteKind, NoteModel, ReviewDecision, StoreError,
+    Note, NoteKind, NoteModel, ReviewDecision, StockModelKind, StoreError,
 };
 
 use crate::Options;
 
 use super::{
     DeckRow, EmptyKind, MaskShape, MouseButton, NormalizedRect, OcclusionDrag,
-    OcclusionMask, OcclusionState, Phase, UiAction, View, build_deck_rows,
-    collect_tags, compute_visible_deck_rows, deck_meta, due_total,
-    duration_label, empty_copy, empty_kind, filter_decks, focused_delta,
-    forecast_bar_height, forecast_total, model_index, models_with_stock,
-    next_due_deck, next_view, prepare_deck_rows, queue_counts, refreshed_card,
-    session_progress, suggest_tags, sum_leaf_counts, validate_draft,
-    validate_occlusion,
+    OcclusionMask, OcclusionState, Phase, ToastKind, UiAction, View,
+    build_deck_rows, collect_tags, compute_visible_deck_rows, deck_meta,
+    due_total, duration_label, empty_copy, empty_kind, filter_decks,
+    focused_delta, forecast_bar_height, forecast_total, model_index,
+    models_with_stock, next_due_deck, next_view, prepare_deck_rows,
+    queue_counts, refreshed_card, session_progress, suggest_tags,
+    sum_leaf_counts, validate_draft, validate_occlusion,
 };
 use gpui::{SharedString, point, px, size};
 
@@ -114,86 +115,6 @@ impl ranki_model::Store for ModalStore {
     }
 }
 
-#[derive(Default)]
-struct StatisticsStore {
-    reads: Arc<AtomicUsize>,
-    modified: Arc<AtomicI64>,
-}
-
-impl ranki_model::Store for StatisticsStore {
-    fn decks(&self) -> Result<Vec<Deck>, StoreError> {
-        ModalStore.decks()
-    }
-
-    fn create_deck(&mut self, name: &str) -> Result<Deck, StoreError> {
-        ModalStore.create_deck(name)
-    }
-
-    fn models(&self) -> Result<Vec<NoteModel>, StoreError> {
-        ModalStore.models()
-    }
-
-    fn find_cards(&self, query: &str) -> Result<Vec<Id>, StoreError> {
-        ModalStore.find_cards(query)
-    }
-
-    fn browse_cards(
-        &self,
-        query: &str,
-    ) -> Result<Vec<ranki_model::BrowseCard>, StoreError> {
-        ModalStore.browse_cards(query)
-    }
-
-    fn due_cards(
-        &self,
-        deck_id: Option<Id>,
-        limit: usize,
-        now: i64,
-    ) -> Result<Vec<Card>, StoreError> {
-        ModalStore.due_cards(deck_id, limit, now)
-    }
-
-    fn card(&self, id: Id) -> Result<Option<Card>, StoreError> {
-        ModalStore.card(id)
-    }
-
-    fn note(&self, id: Id) -> Result<Option<Note>, StoreError> {
-        ModalStore.note(id)
-    }
-
-    fn add_note(&mut self, note: &NewNote) -> Result<Vec<Id>, StoreError> {
-        ModalStore.add_note(note)
-    }
-
-    fn apply_review(
-        &mut self,
-        decision: &ReviewDecision,
-    ) -> Result<Id, StoreError> {
-        ModalStore.apply_review(decision)
-    }
-
-    fn stats(
-        &self,
-        deck_id: Option<Id>,
-        now: i64,
-    ) -> Result<ranki_model::DeckStats, StoreError> {
-        ModalStore.stats(deck_id, now)
-    }
-
-    fn review_history(&self) -> Result<Vec<ranki_model::RevLog>, StoreError> {
-        self.reads.fetch_add(1, Ordering::Relaxed);
-        Ok(Vec::new())
-    }
-
-    fn collection_modified(&self) -> Result<i64, StoreError> {
-        Ok(self.modified.load(Ordering::Relaxed))
-    }
-
-    fn collection_created(&self) -> Result<i64, StoreError> {
-        Ok(0)
-    }
-}
-
 struct BrowseStore {
     decks: Vec<Deck>,
     models: Vec<NoteModel>,
@@ -201,7 +122,10 @@ struct BrowseStore {
     notes: HashMap<Id, Note>,
     ids: Vec<Id>,
     card_reads: Arc<AtomicUsize>,
+    find_reads: Arc<AtomicUsize>,
+    history_reads: Arc<AtomicUsize>,
     fail_reads: bool,
+    fail_browse: bool,
 }
 
 impl BrowseStore {
@@ -264,6 +188,9 @@ impl BrowseStore {
             notes: HashMap::new(),
             ids: Vec::new(),
             card_reads: Arc::new(AtomicUsize::new(0)),
+            find_reads: Arc::new(AtomicUsize::new(0)),
+            history_reads: Arc::new(AtomicUsize::new(0)),
+            fail_browse: false,
             fail_reads: false,
         };
         for _ in 0..count {
@@ -304,10 +231,20 @@ impl ranki_model::Store for BrowseStore {
 
     fn browse_cards(
         &self,
-        _: &str,
+        query: &str,
     ) -> Result<Vec<ranki_model::BrowseCard>, StoreError> {
-        Ok(self
-            .ids
+        self.find_reads.fetch_add(1, Ordering::Relaxed);
+        if self.fail_browse {
+            return Err(StoreError::Backend(String::from(
+                "search index is offline",
+            )));
+        }
+        let ids = match query {
+            "none" => &[][..],
+            "one" => &self.ids[..self.ids.len().min(1)],
+            _ => &self.ids[..],
+        };
+        Ok(ids
             .iter()
             .filter_map(|id| self.cards.get(id))
             .map(|card| ranki_model::BrowseCard {
@@ -472,6 +409,9 @@ fn browse_loads_cards_past_the_first_page(cx: &mut gpui::TestAppContext) {
         notes: HashMap::new(),
         ids: Vec::new(),
         card_reads: Arc::new(AtomicUsize::new(0)),
+        find_reads: Arc::new(AtomicUsize::new(0)),
+        history_reads: Arc::new(AtomicUsize::new(0)),
+        fail_browse: false,
         fail_reads: false,
     };
     for (deck_id, count) in [(10, 201), (11, 1)] {
@@ -523,6 +463,9 @@ fn browse_reads_only_the_cards_it_shows(cx: &mut gpui::TestAppContext) {
         notes: HashMap::new(),
         ids: Vec::new(),
         card_reads: Arc::clone(&reads),
+        find_reads: Arc::new(AtomicUsize::new(0)),
+        history_reads: Arc::new(AtomicUsize::new(0)),
+        fail_browse: false,
         fail_reads: false,
     };
     for _ in 0..2_000 {
@@ -712,6 +655,7 @@ fn opening_statistics_uses_the_cached_summary(cx: &mut gpui::TestAppContext) {
                 store: Box::new(StatisticsStore {
                     reads: Arc::clone(&reads),
                     modified: Arc::clone(&modified),
+                    fail: Arc::new(AtomicBool::new(false)),
                 }),
                 options,
                 save_settings: Arc::new(|_| Ok(())),
@@ -722,7 +666,7 @@ fn opening_statistics_uses_the_cached_summary(cx: &mut gpui::TestAppContext) {
     });
     cx.run_until_parked();
     let before = reads.load(Ordering::Relaxed);
-    assert!(before > 0, "startup should build the summary");
+    assert!(before > 0, "startup builds the cached summary");
 
     cx.update(|window, cx| {
         root.update(cx, |root, cx| {
@@ -3055,7 +2999,9 @@ fn saving_an_occlusion_note_clears_the_chosen_image(
         cx.read_entity(&root, |root, _| root.add.occlusion.image.is_some())
     );
 
-    cx.update_entity(&root, super::Root::save_note);
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| root.save_note(window, cx));
+    });
 
     let state = cx.read_entity(&root, |root, _| {
         (
@@ -3737,81 +3683,6 @@ fn space_reveals_after_study_all_from_focused_search(
 }
 
 #[gpui::test]
-fn revealing_a_long_answer_scrolls_the_stage_to_the_bottom(
-    cx: &mut gpui::TestAppContext,
-) {
-    let (root, cx) = cx.add_window_view(|window, cx| {
-        super::Root::new(
-            super::Launch {
-                store: Box::new(ModalStore),
-                options: Options::default(),
-                save_settings: Arc::new(|_| Ok(())),
-            },
-            window,
-            cx,
-        )
-    });
-    cx.simulate_resize(size(px(1280.), px(800.)));
-    cx.update_entity(&root, |root, cx| {
-        root.view = View::Review;
-        root.review.current = Some(Card {
-            id: 1,
-            note_id: 1,
-            deck_id: 1,
-            ordinal: 0,
-            modified: 0,
-            usn: 0,
-            card_type: CardType::New,
-            queue: CardQueue::New,
-            due: 0,
-            interval: 0,
-            factor: 0,
-            reps: 0,
-            lapses: 0,
-            left: 0,
-            original_due: 0,
-            original_deck_id: 0,
-            flags: 0,
-            data: String::new(),
-        });
-        root.review.question = Some(crate::card_view::RenderedCard {
-            text: "Question?".into(),
-            ..Default::default()
-        });
-        root.review.answer = Some(crate::card_view::RenderedCard {
-            text: "Answer line\n".repeat(60),
-            ..Default::default()
-        });
-        root.review.phase = Phase::Question;
-        cx.notify();
-    });
-    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
-        root.clone()
-    });
-    cx.update(|window, cx| {
-        let _ = window.draw(cx);
-    });
-    let before = cx.read_entity(&root, |root, _| {
-        f32::from(root.review_stage_scroll.offset().y)
-    });
-    assert_eq!(before, 0.0, "the question starts at the top");
-
-    cx.update_entity(&root, super::Root::reveal);
-    cx.update(|window, cx| {
-        let _ = window.draw(cx);
-    });
-    let (offset, max) = cx.read_entity(&root, |root, _| {
-        let handle = &root.review_stage_scroll;
-        (
-            f32::from(handle.offset().y),
-            f32::from(handle.max_offset().height),
-        )
-    });
-    assert!(max > 0.0, "the long answer must overflow the stage");
-    assert_eq!(offset, -max, "revealing must show the end of the answer");
-}
-
-#[gpui::test]
 fn pending_reveal_scroll_does_not_survive_a_reset(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -4235,9 +4106,11 @@ fn clicking_the_rename_field_keeps_the_decks_view(
         )
     });
     cx.simulate_resize(gpui::size(gpui::px(1280.), gpui::px(800.)));
-    cx.update_entity(&root, |root, cx| {
-        let deck = root.decks[0].clone();
-        root.start_rename(&deck, cx);
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            let deck = root.decks[0].clone();
+            root.start_rename(&deck, window, cx);
+        });
     });
     cx.draw(
         point(px(0.), px(0.)),
@@ -4541,6 +4414,9 @@ fn editing_a_browse_card_saves_the_add_card_view(
         notes: HashMap::new(),
         ids: Vec::new(),
         card_reads: Arc::new(AtomicUsize::new(0)),
+        find_reads: Arc::new(AtomicUsize::new(0)),
+        history_reads: Arc::new(AtomicUsize::new(0)),
+        fail_browse: false,
         fail_reads: false,
     };
     let _ = store.push_card(10);
@@ -4583,6 +4459,9 @@ fn editing_a_card_reports_a_store_read_failure(cx: &mut gpui::TestAppContext) {
         notes: HashMap::new(),
         ids: Vec::new(),
         card_reads: Arc::new(AtomicUsize::new(0)),
+        find_reads: Arc::new(AtomicUsize::new(0)),
+        history_reads: Arc::new(AtomicUsize::new(0)),
+        fail_browse: false,
         fail_reads: true,
     };
     let _ = store.push_card(10);
@@ -4781,4 +4660,3200 @@ fn import_picker_filters_to_anki_packages() {
     assert_eq!(filter.label(), "Anki packages");
     assert_eq!(filter.pattern_filters(), super::ANKI_PACKAGE_GLOBS);
     assert_eq!(filter.mimetype_filters(), [] as [&str; 0]);
+}
+fn open_browse_store(
+    cx: &mut gpui::TestAppContext,
+    store: BrowseStore,
+) -> (gpui::Entity<super::Root>, &mut gpui::VisualTestContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.update_entity(&root, |root, cx| {
+        root.view = View::Browse;
+        root.refresh_browse(cx);
+        cx.notify();
+    });
+    (root, cx)
+}
+
+#[gpui::test]
+fn empty_browse_shows_cards_and_leaf_chevrons(cx: &mut gpui::TestAppContext) {
+    let mut store = BrowseStore::with_cards(3);
+    store.decks[0].name = String::from("Languages::French");
+    let (root, cx) = open_browse_store(cx, store);
+    cx.update_entity(&root, |root, _| {
+        assert_eq!(root.browse.selected, Some(1));
+        assert!(root.browse.expanded.contains("Languages::French"));
+        let cards = root
+            .browse
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry, crate::browser_view::BrowseEntry::Card { .. })
+            })
+            .count();
+        assert_eq!(cards, 3);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(
+        cx.debug_bounds("browse-row-1").is_some(),
+        "cards must show on the first empty query"
+    );
+    assert!(
+        cx.debug_bounds("browse-chevron-Languages::French")
+            .is_some(),
+        "a leaf deck with cards must be collapsible"
+    );
+    assert!(cx.debug_bounds("browse-detail").is_some());
+}
+
+#[gpui::test]
+fn clear_search_stays_visible_when_browse_fails(cx: &mut gpui::TestAppContext) {
+    let mut store = BrowseStore::with_cards(1);
+    store.fail_browse = true;
+    let (root, cx) = open_browse_store(cx, store);
+    cx.update_entity(&root, |root, cx| {
+        root.browse.search.update(cx, |field, cx| {
+            field.seed("missing", cx);
+        });
+        root.refresh_browse(cx);
+        assert!(
+            root.browse
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("search index is offline"))
+        );
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(
+        cx.debug_bounds("secondary-Clear search").is_some(),
+        "an error must not hide the way out of a failed query"
+    );
+    assert!(cx.debug_bounds("browse-empty-add").is_none());
+}
+
+#[gpui::test]
+fn changing_a_browse_card_resets_the_preview_scroll(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (root, cx) = open_browse_store(cx, BrowseStore::with_cards(3));
+    cx.update_entity(&root, |root, cx| {
+        root.browse_detail_scroll
+            .set_offset(point(px(0.), px(-400.)));
+        assert_eq!(root.browse_detail_scroll.offset().y, px(-400.));
+        root.select_browse_row(2, cx);
+        assert_eq!(root.browse_detail_scroll.offset().y, px(0.));
+        assert_eq!(root.browse.selected, Some(2));
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.browse.search.update(cx, |field, cx| {
+            field.seed("one", cx);
+        });
+        root.browse.selected = Some(2);
+        root.browse_detail_scroll
+            .set_offset(point(px(0.), px(-400.)));
+        root.refresh_browse(cx);
+        assert_eq!(root.browse.selected, Some(1));
+        assert_eq!(root.browse_detail_scroll.offset().y, px(0.));
+    });
+}
+
+#[gpui::test]
+fn browse_queries_reset_scroll_but_refreshes_keep_collapsed_groups(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut store = BrowseStore::with_cards(60);
+    store.decks.push(Deck {
+        id: 11,
+        name: String::from("Other"),
+        description: String::new(),
+    });
+    for _ in 0..60 {
+        let _ = store.push_card(11);
+    }
+    let (root, cx) = open_browse_store(cx, store);
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.toggle_browse_group(String::from("Default"), cx);
+        root.browse_smooth.wheel(500.0);
+        root.browse_smooth.settle();
+        assert!((root.browse_smooth.offset() - 500.0).abs() < 0.01);
+        root.refresh_browse(cx);
+        assert!(!root.browse.expanded.contains("Default"));
+        assert!(root.browse.expanded.contains("Other"));
+        assert!((root.browse_smooth.offset() - 500.0).abs() < 0.01);
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.browse.search.update(cx, |field, cx| {
+            field.seed("one", cx);
+        });
+        root.refresh_browse(cx);
+        assert_eq!(root.browse_smooth.offset(), 0.0);
+        assert_eq!(root.browse.expanded.len(), 1);
+        assert!(root.browse.expanded.contains("Default"));
+    });
+}
+
+#[gpui::test]
+fn refreshing_browse_clears_a_stale_card_menu(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = open_browse_store(cx, BrowseStore::with_cards(1));
+    cx.update_entity(&root, |root, cx| {
+        root.card_menu = Some(super::CardMenu {
+            id: 1,
+            anchor: point(px(100.), px(100.)),
+        });
+        root.card_menu_dismissed_press = Some(gpui::MouseDownEvent {
+            position: point(px(100.), px(100.)),
+            button: gpui::MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+            first_mouse: true,
+        });
+        root.refresh_browse(cx);
+        assert!(root.card_menu.is_none());
+        assert!(root.card_menu_dismissed_press.is_none());
+    });
+}
+
+#[gpui::test]
+fn card_menu_clicks_keep_the_row_selection(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = open_browse_store(cx, BrowseStore::with_cards(2));
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let row = cx.debug_bounds("browse-row-1").expect("first card row");
+    let anchor = point(row.center().x + px(80.) - px(15.), row.top() - px(19.));
+    cx.update_entity(&root, |root, cx| {
+        root.browse.selected = Some(2);
+        root.card_menu = Some(super::CardMenu { id: 1, anchor });
+        cx.notify();
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let menu = cx
+        .debug_bounds("card-actions-menu")
+        .expect("card actions menu");
+    let click = point(menu.left() + px(20.), menu.top() + px(20.));
+    assert!(
+        menu.intersects(&row),
+        "the menu must cover the row to test the click"
+    );
+    cx.simulate_click(click, gpui::Modifiers::none());
+    assert_eq!(
+        cx.read_entity(&root, |root, _| root.browse.selected),
+        Some(2)
+    );
+}
+
+#[gpui::test]
+fn failed_browse_rows_show_an_error_placeholder(cx: &mut gpui::TestAppContext) {
+    let mut store = BrowseStore::with_cards(2);
+    store.fail_reads = true;
+    let (root, cx) = open_browse_store(cx, store);
+    cx.update_entity(&root, |root, cx| {
+        root.refresh_browse(cx);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert_eq!(
+        cx.read_entity(&root, |root, _| root.browse.error.clone())
+            .as_deref(),
+        Some("Could not load some cards")
+    );
+    assert!(cx.debug_bounds("browse-failed-row-0").is_some());
+}
+
+#[gpui::test]
+fn browse_debounce_shows_a_pending_indicator(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = open_browse_store(cx, BrowseStore::with_cards(1));
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(cx.debug_bounds("browse-search-pending").is_none());
+    cx.update_entity(&root, |root, cx| {
+        root.schedule_browse_refresh(cx);
+        assert!(root.browse.loading);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(cx.debug_bounds("browse-search-pending").is_some());
+    cx.update_entity(&root, |root, cx| {
+        root.refresh_browse(cx);
+        assert!(!root.browse.loading);
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(!cx.read_entity(&root, |root, _| root.browse.loading));
+}
+
+#[gpui::test]
+fn typing_in_browse_does_not_save_on_every_keystroke(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (save_settings, latest) = recording_saver();
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(BrowseStore::with_cards(1)),
+                options: Options::default(),
+                save_settings,
+            },
+            window,
+            cx,
+        )
+    });
+    latest.lock().expect("settings lock").take();
+    cx.update_entity(&root, |root, cx| {
+        root.browse.search.update(cx, |field, cx| {
+            field.set_text("x", cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(latest.lock().expect("settings lock").is_none());
+}
+
+#[gpui::test]
+fn up_and_down_move_browse_selection(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = open_browse_store(cx, BrowseStore::with_cards(80));
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert_eq!(
+        cx.read_entity(&root, |root, _| root.browse.selected),
+        Some(1)
+    );
+    for action in [UiAction::BrowseDown, UiAction::BrowseDown] {
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.dispatch(action, window, cx);
+            });
+        });
+    }
+    assert_eq!(
+        cx.read_entity(&root, |root, _| root.browse.selected),
+        Some(3)
+    );
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.dispatch(UiAction::BrowseUp, window, cx);
+        });
+    });
+    assert_eq!(
+        cx.read_entity(&root, |root, _| root.browse.selected),
+        Some(2)
+    );
+
+    for _ in 0..30 {
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.dispatch(UiAction::BrowseDown, window, cx);
+            });
+        });
+    }
+    cx.update_entity(&root, |root, _| root.browse_smooth.settle());
+    assert!(
+        cx.read_entity(&root, |root, _| root.browse_smooth.offset()) > 0.0,
+        "the selected card must be scrolled into view"
+    );
+}
+
+#[test]
+fn browse_arrow_keys_stay_out_of_inputs_and_dialogs() {
+    let mut keymap = gpui::Keymap::default();
+    keymap.add_bindings(super::key_bindings());
+    let browse =
+        [gpui::KeyContext::parse("ranki ranki_browse")
+            .expect("browse context")];
+    let typing = [
+        gpui::KeyContext::parse("ranki ranki_browse").expect("browse context"),
+        gpui::KeyContext::parse("ranki_input").expect("input context"),
+    ];
+    let dialog = [
+        gpui::KeyContext::parse("ranki ranki_browse").expect("browse context"),
+        gpui::KeyContext::parse("ranki_dialog").expect("dialog context"),
+    ];
+    for key in ["up", "down"] {
+        let stroke = gpui::Keystroke::parse(key).expect("keystroke");
+        let (in_browse, _) =
+            keymap.bindings_for_input(std::slice::from_ref(&stroke), &browse);
+        assert_eq!(in_browse.len(), 1, "{key}");
+        let (in_input, _) =
+            keymap.bindings_for_input(std::slice::from_ref(&stroke), &typing);
+        assert!(in_input.is_empty(), "{key}");
+        let (in_dialog, _) =
+            keymap.bindings_for_input(std::slice::from_ref(&stroke), &dialog);
+        assert!(in_dialog.is_empty(), "{key}");
+    }
+}
+
+#[gpui::test]
+fn narrow_browse_keeps_a_bounded_preview(cx: &mut gpui::TestAppContext) {
+    let (_root, cx) = open_browse_store(cx, BrowseStore::with_cards(1));
+    cx.simulate_resize(size(px(640.), px(800.)));
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let detail = cx.debug_bounds("browse-detail").expect("stacked preview");
+    assert!(detail.size.width > px(300.));
+    assert!(detail.size.height <= px(221.));
+    assert!(detail.size.height >= px(100.));
+}
+
+#[gpui::test]
+fn short_browse_windows_keep_three_rows_visible(cx: &mut gpui::TestAppContext) {
+    let (_root, cx) = open_browse_store(cx, BrowseStore::with_cards(6));
+    cx.simulate_resize(size(px(720.), px(540.)));
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let table = cx.debug_bounds("browse-table").expect("browse table");
+    let detail = cx.debug_bounds("browse-detail").expect("stacked preview");
+    assert!(table.size.height >= px(140.));
+    assert!(detail.size.height <= px(220.));
+    for key in ["browse-row-1", "browse-row-2", "browse-row-3"] {
+        let row = cx.debug_bounds(key).unwrap_or_else(|| panic!("{key}"));
+        assert!(
+            row.bottom() <= table.bottom() + px(2.),
+            "{key} must stay inside the table: row {row:?}, table {table:?}"
+        );
+    }
+}
+
+#[gpui::test]
+fn long_browse_metadata_stays_inside_the_preview(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (root, cx) = open_browse_store(cx, BrowseStore::with_cards(1));
+    cx.update_entity(&root, |root, cx| {
+        let mut row = browser_test_row(String::from("Question"));
+        row.deck = SharedString::from("Study::Languages::".repeat(20));
+        let _ = root.browse.rows.insert(1, row);
+        cx.notify();
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let detail = cx.debug_bounds("browse-detail").expect("side preview");
+    let meta = cx.debug_bounds("browse-meta-Deck").expect("deck metadata");
+    assert!(detail.size.width <= px(321.));
+    assert!(meta.size.width <= detail.size.width);
+    assert!(meta.size.height <= px(30.));
+}
+
+fn collection_options(dir: &std::path::Path, review: bool) -> Options {
+    Options {
+        paths: ranki_model::DataPaths::new(dir),
+        ui_state: ranki_model::UiState {
+            view: if review {
+                ranki_model::UiView::Review
+            } else {
+                ranki_model::UiView::Decks
+            },
+            ..ranki_model::UiState::default()
+        },
+        ..Options::default()
+    }
+}
+
+#[gpui::test]
+fn escape_in_reload_dialog_keeps_a_live_session(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("collection.anki2");
+    let mut store =
+        ranki_storage::Collection::create(&path).expect("collection");
+    let _ = store
+        .add_note(&NewNote {
+            model_id: 1,
+            deck_id: 1,
+            fields: vec![String::from("Question?"), String::from("Answer!")],
+            tags: Vec::new(),
+        })
+        .expect("note");
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options: collection_options(dir.path(), true),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    assert_eq!(cx.update(|_, cx| root.read(cx).view), View::Review);
+    assert!(cx.update(|_, cx| root.read(cx).review.current.is_some()));
+
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.dispatch(UiAction::Reload, window, cx);
+        });
+    });
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    assert!(cx.update(|_, cx| {
+        matches!(
+            root.read(cx).confirmation,
+            Some(super::Confirmation::Reload)
+        )
+    }));
+
+    cx.simulate_keystrokes("escape");
+    let (view, confirmation, current) = cx.read_entity(&root, |root, _| {
+        (
+            root.view,
+            root.confirmation.clone(),
+            root.review.current.is_some(),
+        )
+    });
+    assert_eq!(view, View::Review, "cancel must not end the live session");
+    assert!(confirmation.is_none());
+    assert!(current, "the card must stay on the review stage");
+
+    cx.simulate_keystrokes("escape");
+    assert_eq!(
+        cx.update(|_, cx| root.read(cx).view),
+        View::Decks,
+        "escape ends the session once the dialog is gone"
+    );
+}
+
+#[gpui::test]
+fn first_grade_after_loading_is_not_debounced(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("collection.anki2");
+    let mut store =
+        ranki_storage::Collection::create(&path).expect("collection");
+    for front in ["First?", "Second?"] {
+        let _ = store
+            .add_note(&NewNote {
+                model_id: 1,
+                deck_id: 1,
+                fields: vec![front.to_owned(), String::from("Answer!")],
+                tags: Vec::new(),
+            })
+            .expect("note");
+    }
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options: collection_options(dir.path(), true),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| root.read(cx).review.current.is_some()));
+    assert!(
+        cx.update(|_, cx| root.read(cx).review.last_grade_at.is_none()),
+        "loading a card must not arm the repeat guard"
+    );
+
+    let grade = |cx: &mut gpui::VisualTestContext| {
+        cx.update_entity(&root, |root, cx| {
+            root.review.phase = Phase::Answer;
+            root.grade(ranki_model::Rating::Again, cx);
+        });
+        cx.read_entity(&root, |root, _| root.review.answered)
+    };
+    assert_eq!(grade(cx), 1, "the first grade must land immediately");
+    assert_eq!(grade(cx), 1, "an immediate repeat must still be dropped");
+    cx.update_entity(&root, |root, _| root.review.last_grade_at = None);
+    assert_eq!(grade(cx), 2);
+}
+
+#[test]
+fn reload_and_escape_bindings_respect_modal_contexts() {
+    let mut keymap = gpui::Keymap::default();
+    keymap.add_bindings(super::key_bindings());
+    let plain = [gpui::KeyContext::parse("ranki").expect("ranki context")];
+    let dialog = [
+        gpui::KeyContext::parse("ranki").expect("ranki context"),
+        gpui::KeyContext::parse("ranki_dialog").expect("dialog context"),
+    ];
+    let typing = [
+        gpui::KeyContext::parse("ranki").expect("ranki context"),
+        gpui::KeyContext::parse("ranki_input").expect("input context"),
+    ];
+    let bindings = |key: &str, contexts: &[gpui::KeyContext]| {
+        let stroke = gpui::Keystroke::parse(key).expect("keystroke");
+        keymap
+            .bindings_for_input(std::slice::from_ref(&stroke), contexts)
+            .0
+            .len()
+    };
+    assert_eq!(bindings("f5", &plain), 1);
+    assert_eq!(bindings("f5", &dialog), 0);
+    assert_eq!(bindings("f5", &typing), 0);
+    assert_eq!(bindings("escape", &plain), 1);
+    let dialog_bindings = keymap.bindings_for_input(
+        std::slice::from_ref(
+            &gpui::Keystroke::parse("escape").expect("keystroke"),
+        ),
+        &dialog,
+    );
+    assert!(
+        !dialog_bindings
+            .0
+            .iter()
+            .any(|binding| { binding.action().name().contains("EndSession") }),
+        "escape in a dialog must only cancel"
+    );
+}
+
+#[gpui::test]
+fn request_reload_preserves_a_destructive_confirmation(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update_entity(&root, |root, _| {
+        root.review.answered = 2;
+        root.confirmation = Some(super::Confirmation::RemoveDeck {
+            id: 7,
+            name: String::from("Important"),
+        });
+    });
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| root.request_reload(window, cx));
+    });
+    let confirmation =
+        cx.read_entity(&root, |root, _| root.confirmation.clone());
+    assert_eq!(
+        confirmation,
+        Some(super::Confirmation::RemoveDeck {
+            id: 7,
+            name: String::from("Important"),
+        })
+    );
+}
+
+#[gpui::test]
+fn failed_removals_keep_their_confirmation(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    let deck = super::Confirmation::RemoveDeck {
+        id: 42,
+        name: String::from("Default"),
+    };
+    cx.update_entity(&root, |root, _| root.confirmation = Some(deck.clone()));
+    cx.update_entity(&root, super::Root::confirm);
+    assert_eq!(
+        cx.read_entity(&root, |root, _| root.confirmation.clone()),
+        Some(deck)
+    );
+
+    let card = super::Confirmation::RemoveCard {
+        id: 9,
+        front: String::from("Question?"),
+    };
+    cx.update_entity(&root, |root, _| root.confirmation = Some(card.clone()));
+    cx.update_entity(&root, super::Root::confirm);
+    assert_eq!(
+        cx.read_entity(&root, |root, _| root.confirmation.clone()),
+        Some(card)
+    );
+}
+
+#[gpui::test]
+fn external_change_aborts_grade_undo_and_save_note(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (store, stamp, writes) = ExternalChangeStore::new();
+    let card = store.card.clone();
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| root.study_all(window, cx));
+    });
+    assert!(cx.update(|_, cx| root.read(cx).review.current.is_some()));
+
+    stamp.store(2, Ordering::Relaxed);
+    cx.update_entity(&root, |root, _| {
+        root.last_change_check = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("time");
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.review.phase = Phase::Answer;
+        root.grade(ranki_model::Rating::Again, cx);
+    });
+    assert_eq!(writes.load(Ordering::Relaxed), 0, "grade must not write");
+    assert!(cx.update(|_, cx| root.read(cx).external_change));
+    let toast = cx.update(|_, cx| {
+        root.read(cx).toast.as_ref().map(|toast| toast.text.clone())
+    });
+    assert!(
+        toast.as_ref().is_some_and(|text| text.contains("Reload")),
+        "{toast:?}"
+    );
+
+    stamp.store(1, Ordering::Relaxed);
+    cx.update_entity(&root, |root, _| {
+        root.external_change = false;
+        root.review.last_grade = Some(super::UndoEntry {
+            card: card.clone(),
+            revlog_id: 1,
+            rating: ranki_model::Rating::Again,
+            spent: Duration::ZERO,
+            requeued: false,
+        });
+        root.last_change_check = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("time");
+    });
+    stamp.store(2, Ordering::Relaxed);
+    cx.update_entity(&root, super::Root::undo_grade);
+    assert_eq!(writes.load(Ordering::Relaxed), 0, "undo must not write");
+
+    stamp.store(1, Ordering::Relaxed);
+    cx.update_entity(&root, |root, _| {
+        root.external_change = false;
+        root.view = View::AddCard;
+        root.add.deck_id = Some(1);
+        root.last_change_check = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("time");
+    });
+    stamp.store(2, Ordering::Relaxed);
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            let fields = root.add.fields.clone();
+            for field in fields {
+                field.update(cx, |field, cx| {
+                    field.insert_text("Question", cx);
+                });
+            }
+            root.save_note(window, cx);
+        });
+    });
+    assert_eq!(writes.load(Ordering::Relaxed), 0, "note must not write");
+}
+
+#[gpui::test]
+fn focused_again_button_handles_enter_and_space_once(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("collection.anki2");
+    let mut store =
+        ranki_storage::Collection::create(&path).expect("collection");
+    for front in ["First?", "Second?"] {
+        let _ = store
+            .add_note(&NewNote {
+                model_id: 1,
+                deck_id: 1,
+                fields: vec![front.to_owned(), String::from("Answer!")],
+                tags: Vec::new(),
+            })
+            .expect("note");
+    }
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options: collection_options(dir.path(), true),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    assert_eq!(
+        cx.update(|_, cx| root.read(cx).review.phase),
+        Phase::Answer,
+        "Enter reveals the question before grading"
+    );
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("tab");
+    assert!(
+        !cx.update(|window, cx| root.read(cx).focus.is_focused(window)),
+        "the rating button must own the focus"
+    );
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("enter");
+    cx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("enter").expect("keystroke"),
+    });
+    let (answered, rating, phase) = cx.read_entity(&root, |root, _| {
+        (
+            root.review.answered,
+            root.review.last_grade.as_ref().map(|entry| entry.rating),
+            root.review.phase,
+        )
+    });
+    assert_eq!(answered, 1);
+    assert_eq!(rating, Some(ranki_model::Rating::Again));
+    assert_eq!(phase, Phase::Question, "Enter must not reveal twice");
+
+    cx.update_entity(&root, |root, _| {
+        root.review.last_grade_at = None;
+        root.review.phase = Phase::Answer;
+    });
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let again_focus = cx.update(|_, cx| {
+        root.read(cx)
+            .review_button_focus
+            .borrow()
+            .get(2)
+            .cloned()
+            .expect("Again focus handle")
+    });
+    cx.update(|window, _| window.focus(&again_focus));
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("space");
+    cx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("space").expect("keystroke"),
+    });
+    let (answered, rating, phase) = cx.read_entity(&root, |root, _| {
+        (
+            root.review.answered,
+            root.review.last_grade.as_ref().map(|entry| entry.rating),
+            root.review.phase,
+        )
+    });
+    assert_eq!(answered, 2);
+    assert_eq!(rating, Some(ranki_model::Rating::Again));
+    assert_eq!(phase, Phase::Question, "Space must not reveal twice");
+}
+
+#[gpui::test]
+fn browse_and_statistics_wait_for_their_view(cx: &mut gpui::TestAppContext) {
+    let store = BrowseStore::with_cards(2);
+    let finds = Arc::clone(&store.find_reads);
+    let history = Arc::clone(&store.history_reads);
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    assert_eq!(finds.load(Ordering::Relaxed), 0, "Browse was not shown");
+    assert_eq!(
+        history.load(Ordering::Relaxed),
+        0,
+        "Statistics was not shown"
+    );
+
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.dispatch(UiAction::OpenBrowse, window, cx);
+        });
+    });
+    assert_eq!(finds.load(Ordering::Relaxed), 1);
+    assert_eq!(cx.update(|_, cx| root.read(cx).browse.hits.len()), 2);
+
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.dispatch(UiAction::OpenStatistics, window, cx);
+        });
+    });
+    assert_eq!(
+        cx.read_entity(&root, |root, _| (root.view, root.statistics_ready)),
+        (View::Statistics, true)
+    );
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn a_saved_browse_or_statistics_view_still_loads_on_start(
+    cx: &mut gpui::TestAppContext,
+) {
+    let store = BrowseStore::with_cards(2);
+    let finds = Arc::clone(&store.find_reads);
+    let mut options = Options::default();
+    options.ui_state.view = ranki_model::UiView::Browse;
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options,
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    assert!(finds.load(Ordering::Relaxed) > 0);
+    assert_eq!(cx.update(|_, cx| root.read(cx).browse.hits.len()), 2);
+
+    let store = BrowseStore::with_cards(1);
+    let mut options = Options::default();
+    options.ui_state.view = ranki_model::UiView::Statistics;
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options,
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    assert_eq!(cx.update(|_, cx| root.read(cx).view), View::Statistics);
+    assert!(cx.update(|_, cx| root.read(cx).statistics_ready));
+}
+
+#[gpui::test]
+fn import_guard_blocks_duplicates_and_reload(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.view = View::Review;
+        root.review.answered = 1;
+        root.import_running = true;
+        root.import_path(PathBuf::from("deck.apkg"), cx);
+    });
+    let toast = cx.update(|_, cx| {
+        root.read(cx).toast.as_ref().map(|toast| toast.text.clone())
+    });
+    assert!(
+        toast
+            .as_ref()
+            .is_some_and(|text| text.contains("already running")),
+        "{toast:?}"
+    );
+    assert!(cx.update(|_, cx| root.read(cx).import_running));
+
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.dispatch(UiAction::Reload, window, cx);
+            root.reload_collection(cx);
+        });
+    });
+    let (view, confirmation) =
+        cx.read_entity(&root, |root, _| (root.view, root.confirmation.clone()));
+    assert_eq!(view, View::Review, "reload must wait for the import");
+    assert!(confirmation.is_none());
+    let toast = cx.update(|_, cx| {
+        root.read(cx).toast.as_ref().map(|toast| toast.text.clone())
+    });
+    assert!(
+        toast
+            .as_ref()
+            .is_some_and(|text| text.contains("Wait for it to finish")),
+        "{toast:?}"
+    );
+}
+
+#[gpui::test]
+fn reduce_motion_setting_is_saved_and_applies(cx: &mut gpui::TestAppContext) {
+    let (saver, latest) = recording_saver();
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: saver,
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.view = View::Settings;
+            root.dispatch(UiAction::SetReduceMotion(Some(true)), window, cx);
+        });
+    });
+    assert_eq!(cx.update(|_, cx| root.read(cx).motion_ms(240)), 0);
+    let recorded = latest
+        .lock()
+        .expect("settings lock")
+        .clone()
+        .expect("recorded settings");
+    assert_eq!(recorded.reduce_motion, Some(true));
+
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.dispatch(UiAction::SetReduceMotion(Some(false)), window, cx);
+        });
+    });
+    assert_eq!(cx.update(|_, cx| root.read(cx).motion_ms(240)), 240);
+    let recorded = latest
+        .lock()
+        .expect("settings lock")
+        .clone()
+        .expect("recorded settings");
+    assert_eq!(recorded.reduce_motion, Some(false));
+
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.dispatch(UiAction::SetReduceMotion(None), window, cx);
+        });
+    });
+    let recorded = latest
+        .lock()
+        .expect("settings lock")
+        .clone()
+        .expect("recorded settings");
+    assert_eq!(recorded.reduce_motion, None, "System must stay explicit");
+
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    assert!(cx.debug_bounds("motion-Some(true)").is_some());
+    assert!(cx.debug_bounds("motion-None").is_some());
+}
+
+fn test_card(id: Id, queue: CardQueue) -> Card {
+    Card {
+        id,
+        note_id: id,
+        deck_id: 1,
+        ordinal: 0,
+        modified: 0,
+        usn: 0,
+        card_type: CardType::New,
+        queue,
+        due: 0,
+        interval: 0,
+        factor: 0,
+        reps: 0,
+        lapses: 0,
+        left: 0,
+        original_due: 0,
+        original_deck_id: 0,
+        flags: 0,
+        data: String::new(),
+    }
+}
+
+#[gpui::test]
+fn statistics_failure_keeps_the_last_good_summary(
+    cx: &mut gpui::TestAppContext,
+) {
+    let fail = Arc::new(AtomicBool::new(true));
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(StatisticsStore {
+                    reads: Arc::new(AtomicUsize::new(0)),
+                    modified: Arc::new(AtomicI64::new(7)),
+                    fail: Arc::clone(&fail),
+                }),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.statistics.total_reviews = 9;
+        root.refresh_statistics(cx);
+    });
+    assert_eq!(
+        cx.read_entity(&root, |root, _| root.statistics.total_reviews),
+        9,
+        "a failed build must keep the cached summary"
+    );
+    assert_eq!(
+        cx.read_entity(&root, |root, _| root.statistics_error.clone()),
+        Some(String::from("invalid data: offline"))
+    );
+
+    fail.store(false, Ordering::Relaxed);
+    cx.update_entity(&root, super::Root::refresh_statistics);
+    let (total, error) = cx.read_entity(&root, |root, _| {
+        (root.statistics.total_reviews, root.statistics_error.clone())
+    });
+    assert_eq!(total, 0);
+    assert_eq!(error, None);
+}
+
+#[gpui::test]
+fn statistics_retry_stays_on_statistics(cx: &mut gpui::TestAppContext) {
+    let mut options = Options::default();
+    options.paths.collection =
+        std::path::PathBuf::from("no-such-collection.anki2");
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(StatisticsStore {
+                    reads: Arc::new(AtomicUsize::new(0)),
+                    modified: Arc::new(AtomicI64::new(7)),
+                    fail: Arc::new(AtomicBool::new(false)),
+                }),
+                options,
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update_entity(&root, |root, _| {
+        root.statistics.total_reviews = 4;
+        root.statistics_modified = 0;
+        root.statistics_next_day_at = 0;
+    });
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.dispatch(UiAction::OpenStatistics, window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let (view, total, error) = cx.read_entity(&root, |root, _| {
+        (
+            root.view,
+            root.statistics.total_reviews,
+            root.statistics_error.clone(),
+        )
+    });
+    assert_eq!(view, View::Statistics);
+    assert_eq!(total, 4, "a background failure must keep the cache");
+    assert!(error.is_some());
+
+    let before = cx.read_entity(&root, |root, _| root.statistics_generation);
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.dispatch(UiAction::RetryStatistics, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let (view, generation, error) = cx.read_entity(&root, |root, _| {
+        (
+            root.view,
+            root.statistics_generation,
+            root.statistics_error.clone(),
+        )
+    });
+    assert_eq!(view, View::Statistics, "retry must not navigate to Decks");
+    assert_eq!(generation, before.wrapping_add(1));
+    assert!(error.is_some());
+}
+
+#[gpui::test]
+fn auto_sync_toggle_persists_and_rolls_back(cx: &mut gpui::TestAppContext) {
+    let fail = Arc::new(AtomicBool::new(false));
+    let recorded = Arc::new(Mutex::new(None));
+    let for_saver = Arc::clone(&recorded);
+    let saver_fail = Arc::clone(&fail);
+    let saver: crate::SettingsSaver = Arc::new(move |settings| {
+        *for_saver.lock().expect("settings lock") = Some(settings.clone());
+        if saver_fail.load(Ordering::Relaxed) {
+            Err(String::from("disk full"))
+        } else {
+            Ok(())
+        }
+    });
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: saver,
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.sync.signed_in = true;
+        root.options.sync.auto = false;
+        root.toggle_auto_sync(cx);
+    });
+    assert!(cx.read_entity(&root, |root, _| root.options.sync.auto));
+    assert!(
+        recorded
+            .lock()
+            .expect("settings lock")
+            .as_ref()
+            .is_some_and(|settings| settings.sync.auto)
+    );
+    assert!(
+        cx.read_entity(&root, |root, _| root.toast.is_none()),
+        "unexpected toast: {:?}",
+        cx.read_entity(&root, |root, _| root.toast.clone())
+    );
+
+    fail.store(true, Ordering::Relaxed);
+    cx.update_entity(&root, super::Root::toggle_auto_sync);
+    assert!(
+        cx.read_entity(&root, |root, _| root.options.sync.auto),
+        "a failed save must restore the previous value"
+    );
+    assert_eq!(
+        cx.read_entity(&root, |root, _| root.toast.clone())
+            .map(|toast| toast.text),
+        Some(String::from("Could not save sync setting: disk full"))
+    );
+}
+
+#[gpui::test]
+fn remote_download_keeps_the_view_and_drafts_but_ends_review(
+    cx: &mut gpui::TestAppContext,
+) {
+    let Ok(directory) = tempfile::tempdir() else {
+        return;
+    };
+    let collection = directory.path().join("collection.anki2");
+    if ranki_storage::Collection::create(&collection).is_err() {
+        return;
+    }
+    let mut options = Options::default();
+    options.paths.collection = collection.clone();
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ranki_storage::ReopeningCollection::new(
+                    &collection,
+                )),
+                options,
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+
+    cx.update_entity(&root, |root, cx| {
+        root.view = View::Settings;
+        root.previous_view = View::Browse;
+        if let Some(field) = root.add.fields.first().cloned() {
+            field.update(cx, |field, cx| {
+                field.seed(String::from("kept draft"), cx);
+            });
+        }
+        root.browse.search.update(cx, |field, cx| {
+            field.seed(String::from("kept query"), cx);
+        });
+        root.reopen_collection(cx);
+    });
+    let (view, previous, query) = cx.read_entity(&root, |root, cx| {
+        (
+            root.view,
+            root.previous_view,
+            root.browse.search.read(cx).text(),
+        )
+    });
+    assert_eq!(view, View::Settings);
+    assert_eq!(previous, View::Browse);
+    assert_eq!(query, "kept query");
+    let draft = cx.read_entity(&root, |root, cx| {
+        root.add
+            .fields
+            .first()
+            .map(|field| field.read(cx).text())
+            .unwrap_or_default()
+    });
+    assert_eq!(draft, "kept draft");
+
+    cx.update_entity(&root, |root, cx| {
+        root.view = View::Review;
+        root.review.answered = 3;
+        root.reopen_collection(cx);
+    });
+    let (view, current, queued, toast) = cx.read_entity(&root, |root, _| {
+        (
+            root.view,
+            root.review.current.is_some(),
+            !root.review.queue.is_empty(),
+            root.toast.clone().map(|toast| toast.text),
+        )
+    });
+    assert_eq!(view, View::Decks);
+    assert!(!current && !queued, "stale review cards must be cleared");
+    assert!(toast.is_some_and(|text| text.contains("study session ended")));
+}
+
+#[gpui::test]
+fn changing_the_theme_keeps_the_current_focus(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    let focus = cx.read_entity(&root, |root, cx| {
+        root.sync.username.read(cx).focus_handle().clone()
+    });
+    cx.update(|window, _| window.focus(&focus));
+    assert!(cx.update(|window, _| focus.is_focused(window)));
+
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.dispatch(
+                UiAction::SetTheme(ranki_model::ThemeChoice::Dark),
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_entity(&root, |root, _| root.options.theme),
+        ranki_model::ThemeChoice::Dark
+    );
+    assert!(
+        cx.update(|window, _| focus.is_focused(window)),
+        "theme changes must not move focus to the settings panel"
+    );
+}
+
+#[gpui::test]
+fn revealing_a_long_answer_anchors_the_stage_to_the_answer_top(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.update_entity(&root, |root, cx| {
+        root.view = View::Review;
+        root.review.current = Some(Card {
+            id: 1,
+            note_id: 1,
+            deck_id: 1,
+            ordinal: 0,
+            modified: 0,
+            usn: 0,
+            card_type: CardType::New,
+            queue: CardQueue::New,
+            due: 0,
+            interval: 0,
+            factor: 0,
+            reps: 0,
+            lapses: 0,
+            left: 0,
+            original_due: 0,
+            original_deck_id: 0,
+            flags: 0,
+            data: String::new(),
+        });
+        root.review.question = Some(crate::card_view::RenderedCard {
+            text: "Question?".into(),
+            ..Default::default()
+        });
+        root.review.answer = Some(crate::card_view::RenderedCard {
+            text: "Answer line\n".repeat(60),
+            ..Default::default()
+        });
+        root.review.phase = Phase::Question;
+        cx.notify();
+    });
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let before = cx.read_entity(&root, |root, _| {
+        f32::from(root.review_stage_scroll.offset().y)
+    });
+    assert_eq!(before, 0.0, "the question starts at the top");
+
+    cx.update_entity(&root, super::Root::reveal);
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        let _ = window.draw(cx);
+    });
+    let (offset, max, expected) = cx.read_entity(&root, |root, _| {
+        let handle = &root.review_stage_scroll;
+        let origin = root
+            .review_answer_origin
+            .get()
+            .expect("the answer was prepainted");
+        (
+            f32::from(handle.offset().y),
+            f32::from(handle.max_offset().height),
+            f32::from(handle.bounds().origin.y - origin.y),
+        )
+    });
+    assert!(max > 0.0, "the long answer must overflow the stage");
+    assert_eq!(
+        offset, expected,
+        "revealing must stop with the answer group at the viewport top"
+    );
+    assert!(offset > -max, "the answer top is not the answer bottom");
+}
+
+#[gpui::test]
+fn escape_closes_help_before_ending_review(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.view = View::Review;
+        root.review.current = Some(test_card(1, CardQueue::New));
+        root.help_open = true;
+        cx.notify();
+    });
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+
+    cx.simulate_keystrokes("escape");
+    assert!(!cx.read_entity(&root, |root, _| root.help_open));
+    assert_eq!(cx.read_entity(&root, |root, _| root.view), View::Review);
+    cx.run_until_parked();
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+
+    cx.simulate_keystrokes("escape");
+    assert_eq!(cx.read_entity(&root, |root, _| root.view), View::Decks);
+}
+
+#[gpui::test]
+fn load_failures_after_grading_keep_the_summary(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.view = View::Review;
+        root.review.current = None;
+        root.review.answered = 2;
+        root.review.load_errors = 3;
+        cx.notify();
+    });
+    assert!(cx.read_entity(&root, |root, _| root.session_complete()));
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+
+    cx.update(|_, cx| cx.bind_keys(super::key_bindings()));
+    cx.simulate_keystrokes("space");
+    assert_eq!(
+        cx.read_entity(&root, |root, _| root.view),
+        View::Decks,
+        "Space follows the summary's Back to decks action"
+    );
+
+    cx.update_entity(&root, |root, _| {
+        root.view = View::Review;
+        root.review.answered = 0;
+    });
+    assert!(!cx.read_entity(&root, |root, _| root.session_complete()));
+    assert_eq!(cx.read_entity(&root, |root, _| root.review.load_errors), 3);
+}
+
+#[gpui::test]
+fn unschedulable_answers_return_to_the_question(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.view = View::Review;
+        root.review.current = Some(test_card(1, CardQueue::Suspended));
+        root.review.phase = Phase::Answer;
+        root.review.last_grade_at = None;
+        root.grade(ranki_model::Rating::Good, cx);
+    });
+    let (phase, toast, sequence) = cx.read_entity(&root, |root, _| {
+        (
+            root.review.phase,
+            root.toast.as_ref().map(|toast| toast.text.clone()),
+            root.toast.as_ref().map(|toast| toast.seq),
+        )
+    });
+    assert_eq!(
+        phase,
+        Phase::Question,
+        "a rejected grade leaves no rating row"
+    );
+    assert_eq!(
+        toast.as_deref(),
+        Some("This card is no longer due. Refresh the collection.")
+    );
+
+    cx.update_entity(&root, |root, cx| {
+        root.review.last_grade_at = None;
+        root.grade(ranki_model::Rating::Good, cx);
+    });
+    assert_eq!(
+        cx.read_entity(&root, |root, _| root.toast.as_ref().map(|t| t.seq)),
+        sequence,
+        "a second grade must reveal, not repeat the error toast"
+    );
+}
+
+#[gpui::test]
+fn undo_after_a_session_sync_repeats_the_sync(cx: &mut gpui::TestAppContext) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let collection = dir.path().join("collection.anki2");
+    let mut store =
+        ranki_storage::Collection::create(&collection).expect("collection");
+    let _ = store
+        .add_note(&NewNote {
+            model_id: 1,
+            deck_id: 1,
+            fields: vec![String::from("Question?"), String::from("Answer!")],
+            tags: Vec::new(),
+        })
+        .expect("note");
+    let options = Options {
+        paths: ranki_model::DataPaths::new(dir.path()),
+        sync: ranki_model::SyncSettings {
+            enabled: true,
+            ..Default::default()
+        },
+        ..Options::default()
+    };
+    let syncs = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&syncs);
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let mut root = super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options,
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        );
+        root.sync.signed_in = true;
+        root.sync_run = Arc::new(move |_, _, _, _, _| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            Ok(ranki_sync::SyncOutcome::Uploaded)
+        });
+        root
+    });
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| root.study_all(window, cx));
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.review.phase = Phase::Answer;
+        root.review.last_grade_at = None;
+        root.grade(ranki_model::Rating::Easy, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(syncs.load(Ordering::Relaxed), 1);
+    let (dirty, sequence) = cx.read_entity(&root, |root, _| {
+        (root.review.session_dirty, root.review.animation_seq)
+    });
+    assert!(dirty, "a graded session needs a repeat sync after undo");
+
+    cx.update_entity(&root, super::Root::undo_grade);
+    cx.run_until_parked();
+    assert_eq!(
+        syncs.load(Ordering::Relaxed),
+        2,
+        "undo must push the corrected log again"
+    );
+    let (dirty, after) = cx.read_entity(&root, |root, _| {
+        (root.review.session_dirty, root.review.animation_seq)
+    });
+    assert!(!dirty);
+    assert!(after > sequence, "undo must restart the review animations");
+}
+
+#[gpui::test]
+fn summary_keys_start_study_and_leave_the_session(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let dir = tempfile::tempdir().expect("temp dir");
+    let collection = dir.path().join("collection.anki2");
+    let mut store =
+        ranki_storage::Collection::create(&collection).expect("collection");
+    let _ = store
+        .add_note(&NewNote {
+            model_id: 1,
+            deck_id: 1,
+            fields: vec![String::from("Question?"), String::from("Answer!")],
+            tags: Vec::new(),
+        })
+        .expect("note");
+    let options = Options {
+        paths: ranki_model::DataPaths::new(dir.path()),
+        ..Options::default()
+    };
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options,
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| root.study_all(window, cx));
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.review.phase = Phase::Answer;
+        root.review.last_grade_at = None;
+        root.grade(ranki_model::Rating::Easy, cx);
+    });
+    cx.run_until_parked();
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+
+    cx.simulate_keystrokes("s");
+    let (view, answered) =
+        cx.read_entity(&root, |root, _| (root.view, root.review.answered));
+    assert_eq!(view, View::Review);
+    assert_eq!(answered, 0, "S restarts the study session");
+
+    cx.simulate_keystrokes("escape");
+    assert_eq!(cx.read_entity(&root, |root, _| root.view), View::Decks);
+}
+
+#[gpui::test]
+fn inline_rename_focuses_and_selects_the_field(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            let deck = root.decks[0].clone();
+            root.start_rename(&deck, window, cx);
+        });
+    });
+    let focus = cx.read_entity(&root, |root, cx| {
+        root.rename_field.read(cx).focus_handle().clone()
+    });
+    assert!(cx.update(|window, _| focus.is_focused(window)));
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.simulate_keystrokes("study");
+    assert_eq!(
+        cx.read_entity(&root, |root, cx| root.rename_field.read(cx).text()),
+        "study",
+        "typing must replace the selected deck name"
+    );
+}
+
+#[gpui::test]
+fn enter_applies_inline_rename_and_reports_it(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("collection.anki2");
+    let mut store =
+        ranki_storage::Collection::create(&path).expect("collection");
+    let _ = store.create_deck("Topic::Child").expect("deck");
+    let options = Options {
+        paths: ranki_model::DataPaths::new(dir.path()),
+        ..Options::default()
+    };
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options,
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let parent = cx.read_entity(&root, |root, _| {
+        root.decks
+            .iter()
+            .find(|deck| deck.name == "Topic")
+            .cloned()
+            .expect("parent deck")
+    });
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.start_rename(&parent, window, cx);
+        });
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.simulate_keystrokes("study");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let state = cx.update(|window, app| {
+        let root = root.read(app);
+        (
+            root.decks
+                .iter()
+                .map(|deck| deck.name.clone())
+                .collect::<Vec<_>>(),
+            root.deck_edit.is_some(),
+            root.toast.clone(),
+            root.focus.is_focused(window),
+        )
+    });
+    assert!(state.0.contains(&String::from("study")));
+    assert!(state.0.contains(&String::from("study::Child")));
+    assert!(!state.1, "applying a rename leaves edit mode");
+    assert!(matches!(
+        state.2.as_ref().map(|toast| toast.kind),
+        Some(super::ToastKind::Success)
+    ));
+    assert_eq!(
+        state.2.as_ref().map(|toast| toast.text.as_str()),
+        Some("Deck renamed")
+    );
+    assert!(state.3, "renaming returns focus to the app");
+}
+
+#[gpui::test]
+fn escape_and_cancel_leave_inline_rename(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            let deck = root.decks[0].clone();
+            root.start_rename(&deck, window, cx);
+        });
+    });
+    cx.simulate_keystrokes("escape");
+    assert!(cx.read_entity(&root, |root, _| root.deck_edit.is_none()));
+    let focus = cx.read_entity(&root, |root, _| root.focus.clone());
+    assert!(cx.update(|window, _| focus.is_focused(window)));
+
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            let deck = root.decks[0].clone();
+            root.start_rename(&deck, window, cx);
+        });
+    });
+    cx.dispatch_action(super::CancelDialog);
+    assert!(cx.read_entity(&root, |root, _| root.deck_edit.is_none()));
+    assert!(cx.update(|window, _| focus.is_focused(window)));
+}
+
+#[gpui::test]
+fn inline_rename_does_not_leak_into_review_or_confirmations(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("collection.anki2");
+    let mut store =
+        ranki_storage::Collection::create(&path).expect("collection");
+    store
+        .add_note(&NewNote {
+            model_id: 1,
+            deck_id: 1,
+            fields: vec![String::from("Question?"), String::from("Answer!")],
+            tags: Vec::new(),
+        })
+        .expect("note");
+    let options = Options {
+        paths: ranki_model::DataPaths::new(dir.path()),
+        ..Options::default()
+    };
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options,
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let deck = cx.read_entity(&root, |root, _| root.decks[0].clone());
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.start_rename(&deck, window, cx);
+            root.rename_field.update(cx, |field, cx| {
+                field.set_text("Changed", cx);
+            });
+            root.study_deck(0, window, cx);
+        });
+    });
+    assert!(cx.read_entity(&root, |root, _| root.deck_edit.is_none()));
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let state = cx.read_entity(&root, |root, _| {
+        (root.view, root.review.phase, root.decks[0].name.clone())
+    });
+    assert_eq!(state.0, View::Review);
+    assert_eq!(state.1, super::Phase::Answer);
+    assert_eq!(state.2, "Default", "Enter must reveal, not rename");
+
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.end_session(cx);
+            root.deck_edit = Some(super::DeckEdit { id: deck.id });
+            root.confirmation = Some(super::Confirmation::Reload);
+            root.dispatch(super::UiAction::Confirm, window, cx);
+        });
+    });
+    let state = cx.read_entity(&root, |root, _| {
+        (root.deck_edit.is_some(), root.confirmation.is_some())
+    });
+    assert!(!state.0, "confirmation clears stale rename state");
+    assert!(!state.1, "confirmation is handled before rename state");
+}
+
+#[gpui::test]
+fn deck_remove_confirmation_focuses_dialog_and_enter_confirms(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("collection.anki2");
+    let mut store =
+        ranki_storage::Collection::create(&path).expect("collection");
+    let topic = store.create_deck("Topic").expect("deck");
+    let options = Options {
+        paths: ranki_model::DataPaths::new(dir.path()),
+        ..Options::default()
+    };
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options,
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.deck_menu = Some(super::DeckMenu {
+            id: topic.id,
+            anchor: point(px(100.), px(100.)),
+        });
+        cx.notify();
+    });
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let remove = cx
+        .debug_bounds("decks-remove")
+        .expect("deck remove menu item");
+    cx.simulate_click(remove.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let dialog = cx.read_entity(&root, |root, _| root.dialog_focus.clone());
+    assert!(cx.update(|window, _| dialog.is_focused(window)));
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let state = cx.update(|_, app| {
+        let root = root.read(app);
+        (
+            root.confirmation.is_none(),
+            root.decks
+                .iter()
+                .map(|deck| deck.name.clone())
+                .collect::<Vec<_>>(),
+            root.toast.clone(),
+        )
+    });
+    assert!(state.0, "Enter confirms the deck removal");
+    assert_eq!(state.1, [String::from("Default")]);
+    assert_eq!(
+        state.2.as_ref().map(|toast| toast.text.as_str()),
+        Some("Deck removed")
+    );
+}
+
+#[test]
+fn deck_shortcuts_are_bound_only_outside_inputs_and_dialogs() {
+    let mut keymap = gpui::Keymap::default();
+    keymap.add_bindings(super::key_bindings());
+    let contexts = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| gpui::KeyContext::parse(name).expect("context"))
+            .collect::<Vec<_>>()
+    };
+    let decks = contexts(&["ranki", "ranki_decks"]);
+    let typing = contexts(&["ranki", "ranki_decks", "ranki_input"]);
+    let dialog = contexts(&["ranki", "ranki_decks", "ranki_dialog"]);
+    let elsewhere = contexts(&["ranki"]);
+    for key in ["/", "c"] {
+        let stroke = gpui::Keystroke::parse(key).expect("keystroke");
+        assert_eq!(
+            keymap
+                .bindings_for_input(std::slice::from_ref(&stroke), &decks)
+                .0
+                .len(),
+            1,
+            "{key} must be bound on the decks screen"
+        );
+        assert!(
+            keymap
+                .bindings_for_input(std::slice::from_ref(&stroke), &typing)
+                .0
+                .is_empty(),
+            "{key} must stay out of text fields"
+        );
+        assert!(
+            keymap
+                .bindings_for_input(std::slice::from_ref(&stroke), &dialog)
+                .0
+                .is_empty(),
+            "{key} must stay out of dialogs"
+        );
+        assert!(
+            keymap
+                .bindings_for_input(std::slice::from_ref(&stroke), &elsewhere)
+                .0
+                .is_empty(),
+            "{key} must stay out of other views"
+        );
+    }
+}
+
+#[gpui::test]
+fn slash_focuses_deck_search_and_clear_search_keeps_it(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let root_focus = cx.read_entity(&root, |root, _| root.focus.clone());
+    cx.update(|window, _| window.focus(&root_focus));
+    cx.simulate_keystrokes("/");
+    cx.run_until_parked();
+    let search = cx.read_entity(&root, |root, cx| {
+        root.deck_search.read(cx).focus_handle().clone()
+    });
+    assert!(cx.update(|window, _| search.is_focused(window)));
+    assert_eq!(
+        cx.read_entity(&root, |root, cx| root.deck_search.read(cx).text()),
+        ""
+    );
+
+    cx.update_entity(&root, |root, cx| {
+        root.deck_search
+            .update(cx, |field, cx| field.set_text("nothing", cx));
+    });
+    cx.dispatch_action(super::ClearSearch);
+    cx.run_until_parked();
+    let (text, focused) = cx.update(|window, app| {
+        let root = root.read(app);
+        (root.deck_search.read(app).text(), search.is_focused(window))
+    });
+    assert_eq!(text, "");
+    assert!(focused, "clearing the search keeps the field focused");
+
+    cx.update(|window, _| window.focus(&root_focus));
+    cx.simulate_keystrokes("c");
+    cx.run_until_parked();
+    assert!(cx.update(|_, app| root.read(app).create_modal));
+}
+
+#[gpui::test]
+fn creating_a_deck_selects_it_for_add_card(cx: &mut gpui::TestAppContext) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("collection.anki2");
+    let mut store =
+        ranki_storage::Collection::create(&path).expect("collection");
+    let _ = store.create_deck("Topic").expect("deck");
+    let options = Options {
+        paths: ranki_model::DataPaths::new(dir.path()),
+        ..Options::default()
+    };
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options,
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.selected = Some(0);
+            root.add.deck_id = Some(root.decks[0].id);
+            root.create_field.update(cx, |field, cx| {
+                field.set_text("Fresh", cx);
+            });
+            root.create_deck(window, cx);
+        });
+    });
+    let state = cx.update(|_, app| {
+        let root = root.read(app);
+        (
+            root.selected
+                .and_then(|index| root.decks.get(index))
+                .map(|deck| deck.name.clone()),
+            root.add
+                .deck_id
+                .and_then(|id| root.decks.iter().find(|deck| deck.id == id))
+                .map(|deck| deck.name.clone()),
+            root.toast.clone(),
+        )
+    });
+    assert_eq!(state.0.as_deref(), Some("Fresh"));
+    assert_eq!(state.1.as_deref(), Some("Fresh"));
+    assert_eq!(
+        state.2.as_ref().map(|toast| toast.text.as_str()),
+        Some("Deck created")
+    );
+}
+
+#[gpui::test]
+fn renaming_a_parent_rewrites_and_saves_expanded_paths(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (saver, latest) = recording_saver();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("collection.anki2");
+    let mut store =
+        ranki_storage::Collection::create(&path).expect("collection");
+    for name in [
+        "Topic",
+        "Topic::Child",
+        "Topic::Child::Grand",
+        "Other::Leaf",
+    ] {
+        let _ = store.create_deck(name).expect("deck");
+    }
+    let options = Options {
+        paths: ranki_model::DataPaths::new(dir.path()),
+        ..Options::default()
+    };
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options,
+                save_settings: saver,
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.expanded = ["Topic", "Topic::Child", "Other"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let parent = root
+                .decks
+                .iter()
+                .find(|deck| deck.name == "Topic")
+                .cloned()
+                .expect("parent deck");
+            root.start_rename(&parent, window, cx);
+            root.rename_field.update(cx, |field, cx| {
+                field.set_text("Study", cx);
+            });
+            root.apply_rename(window, cx);
+        });
+    });
+    let mut expanded = cx.read_entity(&root, |root, _| {
+        root.expanded.iter().cloned().collect::<Vec<_>>()
+    });
+    expanded.sort();
+    assert_eq!(expanded, ["Other", "Study", "Study::Child"]);
+
+    let mut saved_expanded = latest
+        .lock()
+        .expect("settings lock")
+        .clone()
+        .expect("recorded settings")
+        .ui_state
+        .expanded_decks;
+    saved_expanded.sort();
+    assert_eq!(saved_expanded, ["Other", "Study", "Study::Child"]);
+    let names = cx.read_entity(&root, |root, _| {
+        root.decks
+            .iter()
+            .map(|deck| deck.name.clone())
+            .collect::<Vec<_>>()
+    });
+    assert!(names.contains(&String::from("Study::Child::Grand")));
+}
+
+#[gpui::test]
+fn toggling_a_chevron_closes_the_deck_menu(cx: &mut gpui::TestAppContext) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("collection.anki2");
+    let mut store =
+        ranki_storage::Collection::create(&path).expect("collection");
+    let topic = store.create_deck("Topic::Child").expect("deck");
+    let options = Options {
+        paths: ranki_model::DataPaths::new(dir.path()),
+        ..Options::default()
+    };
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options,
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.deck_menu = Some(super::DeckMenu {
+            id: topic.id,
+            anchor: point(px(100.), px(100.)),
+        });
+        cx.notify();
+    });
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let chevron = cx
+        .debug_bounds("decks-chevron-Topic")
+        .expect("chevron bounds");
+    cx.simulate_click(chevron.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let state = cx.read_entity(&root, |root, _| {
+        (root.deck_menu.is_none(), root.expanded.contains("Topic"))
+    });
+    assert!(state.0, "toggling a row closes its stale menu");
+    assert!(state.1);
+}
+
+#[gpui::test]
+fn scrolling_decks_closes_the_deck_menu(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.deck_menu = Some(super::DeckMenu {
+            id: 1,
+            anchor: point(px(100.), px(100.)),
+        });
+        cx.notify();
+    });
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: point(px(1100.), px(600.)),
+        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-20.))),
+        modifiers: gpui::Modifiers::none(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    cx.run_until_parked();
+    assert!(cx.read_entity(&root, |root, _| root.deck_menu.is_none()));
+}
+
+#[gpui::test]
+fn clicking_a_virtual_parent_toggles_expansion(cx: &mut gpui::TestAppContext) {
+    let store = BrowseStore {
+        decks: vec![Deck {
+            id: 1,
+            name: String::from("Topic::Child"),
+            description: String::new(),
+        }],
+        models: ranki_model::stock_models(),
+        cards: HashMap::new(),
+        notes: HashMap::new(),
+        ids: Vec::new(),
+        card_reads: Arc::new(AtomicUsize::new(0)),
+        find_reads: Arc::new(AtomicUsize::new(0)),
+        history_reads: Arc::new(AtomicUsize::new(0)),
+        fail_reads: false,
+        fail_browse: false,
+    };
+    let options = Options::default();
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(store),
+                options,
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let row = cx
+        .debug_bounds("deck-row-Topic")
+        .expect("virtual parent row");
+    cx.simulate_click(row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let state = cx.read_entity(&root, |root, _| {
+        (root.view, root.expanded.contains("Topic"))
+    });
+    assert_eq!(state.0, View::Decks);
+    assert!(state.1, "a virtual parent row expands its children");
+}
+
+#[test]
+fn deck_summary_labels_the_collection_wide_counts() {
+    assert_eq!(super::DECK_SUMMARY_LABEL, "Due today (all decks)");
+}
+
+#[derive(Clone)]
+struct EditorStore {
+    decks: Vec<Deck>,
+    models: Vec<NoteModel>,
+    adds: Arc<AtomicUsize>,
+    duplicate: bool,
+    card_count: usize,
+}
+
+impl ranki_model::Store for EditorStore {
+    fn decks(&self) -> Result<Vec<Deck>, StoreError> {
+        Ok(self.decks.clone())
+    }
+
+    fn create_deck(&mut self, name: &str) -> Result<Deck, StoreError> {
+        ModalStore.create_deck(name)
+    }
+
+    fn models(&self) -> Result<Vec<NoteModel>, StoreError> {
+        Ok(self.models.clone())
+    }
+
+    fn ensure_model(
+        &mut self,
+        kind: StockModelKind,
+    ) -> Result<NoteModel, StoreError> {
+        if let Some(model) = self
+            .models
+            .iter()
+            .find(|model| StockModelKind::of(model) == Some(kind))
+        {
+            return Ok(model.clone());
+        }
+        let mut model = kind.definition();
+        model.id = i64::try_from(self.models.len() + 1).expect("model id");
+        self.models.push(model.clone());
+        Ok(model)
+    }
+
+    fn tags(&self) -> Result<Vec<String>, StoreError> {
+        ModalStore.tags()
+    }
+
+    fn find_cards(&self, query: &str) -> Result<Vec<Id>, StoreError> {
+        ModalStore.find_cards(query)
+    }
+
+    fn browse_cards(
+        &self,
+        query: &str,
+    ) -> Result<Vec<ranki_model::BrowseCard>, StoreError> {
+        ModalStore.browse_cards(query)
+    }
+
+    fn due_cards(
+        &self,
+        deck: Option<Id>,
+        limit: usize,
+        now: i64,
+    ) -> Result<Vec<Card>, StoreError> {
+        ModalStore.due_cards(deck, limit, now)
+    }
+
+    fn card(&self, id: Id) -> Result<Option<Card>, StoreError> {
+        ModalStore.card(id)
+    }
+
+    fn note(&self, id: Id) -> Result<Option<Note>, StoreError> {
+        ModalStore.note(id)
+    }
+
+    fn add_note(&mut self, _: &NewNote) -> Result<Vec<Id>, StoreError> {
+        let _ = self.adds.fetch_add(1, Ordering::Relaxed);
+        if self.duplicate {
+            return Err(StoreError::InvalidData(String::from("duplicate")));
+        }
+        Ok((1..=i64::try_from(self.card_count).expect("count")).collect())
+    }
+
+    fn apply_review(
+        &mut self,
+        decision: &ReviewDecision,
+    ) -> Result<Id, StoreError> {
+        ModalStore.apply_review(decision)
+    }
+
+    fn stats(
+        &self,
+        deck: Option<Id>,
+        now: i64,
+    ) -> Result<ranki_model::DeckStats, StoreError> {
+        ModalStore.stats(deck, now)
+    }
+
+    fn collection_modified(&self) -> Result<i64, StoreError> {
+        ModalStore.collection_modified()
+    }
+
+    fn collection_created(&self) -> Result<i64, StoreError> {
+        ModalStore.collection_created()
+    }
+}
+
+#[derive(Default)]
+struct StatisticsStore {
+    reads: Arc<AtomicUsize>,
+    modified: Arc<AtomicI64>,
+    fail: Arc<AtomicBool>,
+}
+
+impl ranki_model::Store for StatisticsStore {
+    fn decks(&self) -> Result<Vec<Deck>, StoreError> {
+        ModalStore.decks()
+    }
+
+    fn create_deck(&mut self, name: &str) -> Result<Deck, StoreError> {
+        ModalStore.create_deck(name)
+    }
+
+    fn models(&self) -> Result<Vec<NoteModel>, StoreError> {
+        ModalStore.models()
+    }
+
+    fn find_cards(&self, query: &str) -> Result<Vec<Id>, StoreError> {
+        ModalStore.find_cards(query)
+    }
+
+    fn browse_cards(
+        &self,
+        query: &str,
+    ) -> Result<Vec<ranki_model::BrowseCard>, StoreError> {
+        ModalStore.browse_cards(query)
+    }
+
+    fn due_cards(
+        &self,
+        deck_id: Option<Id>,
+        limit: usize,
+        now: i64,
+    ) -> Result<Vec<Card>, StoreError> {
+        ModalStore.due_cards(deck_id, limit, now)
+    }
+
+    fn card(&self, id: Id) -> Result<Option<Card>, StoreError> {
+        ModalStore.card(id)
+    }
+
+    fn note(&self, id: Id) -> Result<Option<Note>, StoreError> {
+        ModalStore.note(id)
+    }
+
+    fn add_note(&mut self, note: &NewNote) -> Result<Vec<Id>, StoreError> {
+        ModalStore.add_note(note)
+    }
+
+    fn apply_review(
+        &mut self,
+        decision: &ReviewDecision,
+    ) -> Result<Id, StoreError> {
+        ModalStore.apply_review(decision)
+    }
+
+    fn stats(
+        &self,
+        deck_id: Option<Id>,
+        now: i64,
+    ) -> Result<ranki_model::DeckStats, StoreError> {
+        ModalStore.stats(deck_id, now)
+    }
+
+    fn review_history(&self) -> Result<Vec<ranki_model::RevLog>, StoreError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        if self.fail.load(Ordering::Relaxed) {
+            return Err(StoreError::InvalidData(String::from("offline")));
+        }
+        Ok(Vec::new())
+    }
+
+    fn collection_modified(&self) -> Result<i64, StoreError> {
+        Ok(self.modified.load(Ordering::Relaxed))
+    }
+
+    fn collection_created(&self) -> Result<i64, StoreError> {
+        Ok(0)
+    }
+}
+
+struct ExternalChangeStore {
+    decks: Vec<Deck>,
+    models: Vec<NoteModel>,
+    card: Card,
+    note: Note,
+    stamp: Arc<AtomicI64>,
+    writes: Arc<AtomicUsize>,
+}
+
+impl ranki_model::Store for ExternalChangeStore {
+    fn decks(&self) -> Result<Vec<Deck>, StoreError> {
+        Ok(self.decks.clone())
+    }
+
+    fn create_deck(&mut self, _: &str) -> Result<Deck, StoreError> {
+        Err(StoreError::Unsupported(String::from("no writes in stub")))
+    }
+
+    fn models(&self) -> Result<Vec<NoteModel>, StoreError> {
+        Ok(self.models.clone())
+    }
+
+    fn find_cards(&self, _: &str) -> Result<Vec<Id>, StoreError> {
+        Ok(vec![self.card.id])
+    }
+
+    fn browse_cards(
+        &self,
+        _: &str,
+    ) -> Result<Vec<ranki_model::BrowseCard>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    fn due_cards(
+        &self,
+        _: Option<Id>,
+        _: usize,
+        _: i64,
+    ) -> Result<Vec<Card>, StoreError> {
+        Ok(vec![self.card.clone()])
+    }
+
+    fn card(&self, id: Id) -> Result<Option<Card>, StoreError> {
+        Ok((id == self.card.id).then(|| self.card.clone()))
+    }
+
+    fn note(&self, id: Id) -> Result<Option<Note>, StoreError> {
+        Ok((id == self.note.id).then(|| self.note.clone()))
+    }
+
+    fn add_note(&mut self, _: &NewNote) -> Result<Vec<Id>, StoreError> {
+        let _ = self.writes.fetch_add(1, Ordering::Relaxed);
+        Ok(vec![1])
+    }
+
+    fn update_note(&mut self, _: &Note, _: Id) -> Result<(), StoreError> {
+        let _ = self.writes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn apply_review(&mut self, _: &ReviewDecision) -> Result<Id, StoreError> {
+        let _ = self.writes.fetch_add(1, Ordering::Relaxed);
+        Ok(1)
+    }
+
+    fn undo_review(&mut self, _: &Card, _: Id) -> Result<bool, StoreError> {
+        let _ = self.writes.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    fn stats(
+        &self,
+        _: Option<Id>,
+        _: i64,
+    ) -> Result<ranki_model::DeckStats, StoreError> {
+        Ok(ranki_model::DeckStats::default())
+    }
+
+    fn collection_modified(&self) -> Result<i64, StoreError> {
+        Ok(self.stamp.load(Ordering::Relaxed))
+    }
+
+    fn collection_created(&self) -> Result<i64, StoreError> {
+        Ok(0)
+    }
+}
+
+impl EditorStore {
+    fn new() -> Self {
+        Self {
+            decks: vec![Deck {
+                id: 1,
+                name: String::from("Default"),
+                description: String::new(),
+            }],
+            models: vec![{
+                let mut model = StockModelKind::Basic.definition();
+                model.id = 1;
+                model
+            }],
+            adds: Arc::new(AtomicUsize::new(0)),
+            duplicate: false,
+            card_count: 1,
+        }
+    }
+
+    fn with_decks(names: &[&str]) -> Self {
+        Self {
+            decks: names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| Deck {
+                    id: i64::try_from(index + 1).expect("deck id"),
+                    name: (*name).to_owned(),
+                    description: String::new(),
+                })
+                .collect(),
+            ..Self::new()
+        }
+    }
+}
+
+impl ExternalChangeStore {
+    fn new() -> (Self, Arc<AtomicI64>, Arc<AtomicUsize>) {
+        let models = ranki_model::stock_models()
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut model)| {
+                model.id = i64::try_from(index + 1).expect("model id");
+                model
+            })
+            .collect::<Vec<_>>();
+        let card = Card {
+            id: 1,
+            note_id: 1,
+            deck_id: 1,
+            ordinal: 0,
+            modified: 0,
+            usn: 0,
+            card_type: CardType::New,
+            queue: CardQueue::New,
+            due: 0,
+            interval: 0,
+            factor: 0,
+            reps: 0,
+            lapses: 0,
+            left: 0,
+            original_due: 0,
+            original_deck_id: 0,
+            flags: 0,
+            data: String::new(),
+        };
+        let note = Note {
+            id: 1,
+            guid: String::new(),
+            model_id: 1,
+            modified: 0,
+            usn: 0,
+            tags: Vec::new(),
+            fields: vec![String::from("Question?"), String::from("Answer!")],
+            sort_field: String::new(),
+            checksum: 0,
+            flags: 0,
+            data: String::new(),
+        };
+        let stamp = Arc::new(AtomicI64::new(1));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let store = Self {
+            decks: vec![Deck {
+                id: 1,
+                name: String::from("Default"),
+                description: String::new(),
+            }],
+            models,
+            card,
+            note,
+            stamp: Arc::clone(&stamp),
+            writes: Arc::clone(&writes),
+        };
+        (store, stamp, writes)
+    }
+}
+
+fn editor_launch(store: EditorStore) -> super::Launch {
+    super::Launch {
+        store: Box::new(store),
+        options: Options::default(),
+        save_settings: Arc::new(|_| Ok(())),
+    }
+}
+
+fn draw_editor(
+    cx: &mut gpui::VisualTestContext,
+    root: &gpui::Entity<super::Root>,
+) {
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+}
+
+fn open_editor(
+    cx: &mut gpui::VisualTestContext,
+    root: &gpui::Entity<super::Root>,
+) {
+    cx.update_entity(root, |root, cx| {
+        root.view = View::AddCard;
+        cx.notify();
+    });
+    draw_editor(cx, root);
+}
+
+fn field_focus(
+    cx: &mut gpui::VisualTestContext,
+    root: &gpui::Entity<super::Root>,
+    index: usize,
+) -> gpui::FocusHandle {
+    cx.read_entity(root, |root, cx| {
+        root.add.fields[index].read(cx).focus_handle().clone()
+    })
+}
+
+#[gpui::test]
+fn successful_add_clears_tag_chips(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(editor_launch(EditorStore::new()), window, cx)
+    });
+    open_editor(cx, &root);
+    cx.update_entity(&root, |root, cx| {
+        root.seed_fields("Paris", cx);
+        root.add.tag_chips.push(String::from("leak"));
+        cx.notify();
+    });
+    draw_editor(cx, &root);
+
+    cx.dispatch_action(super::SaveNote);
+    cx.run_until_parked();
+
+    let (toast, chips) = cx.read_entity(&root, |root, _| {
+        (
+            root.toast
+                .as_ref()
+                .map(|toast| (toast.kind, toast.text.clone())),
+            root.add.tag_chips.clone(),
+        )
+    });
+    assert_eq!(
+        toast,
+        Some((ToastKind::Success, String::from("Added 1 card")))
+    );
+    assert!(chips.is_empty(), "tags do not leak into the next note");
+}
+
+#[gpui::test]
+fn add_toast_agrees_with_the_card_count(cx: &mut gpui::TestAppContext) {
+    let mut store = EditorStore::new();
+    store.card_count = 2;
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(editor_launch(store), window, cx)
+    });
+    open_editor(cx, &root);
+    cx.update_entity(&root, |root, cx| {
+        root.seed_fields("Paris", cx);
+        cx.notify();
+    });
+    cx.dispatch_action(super::SaveNote);
+    cx.run_until_parked();
+
+    let toast = cx.read_entity(&root, |root, _| {
+        root.toast.as_ref().map(|toast| toast.text.clone())
+    });
+    assert_eq!(toast.as_deref(), Some("Added 2 cards"));
+}
+
+#[gpui::test]
+fn failed_save_shows_inline_error_that_clears_on_edit(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    open_editor(cx, &root);
+    cx.update_entity(&root, |root, _| {
+        root.add_scroll.set_offset(point(px(0.), px(400.)));
+    });
+    cx.dispatch_action(super::SaveNote);
+    cx.run_until_parked();
+    draw_editor(cx, &root);
+
+    assert!(
+        cx.read_entity(&root, |root, _| root
+            .add
+            .errors
+            .contains_key("field:0"))
+    );
+    assert!(
+        cx.debug_bounds("add-field-error-0").is_some(),
+        "the first empty field explains the error"
+    );
+    let (offset, focused) = cx.update(|window, cx| {
+        let root = root.read(cx);
+        (
+            root.add_scroll.offset().y,
+            root.add.fields[0]
+                .read(cx)
+                .focus_handle()
+                .is_focused(window),
+        )
+    });
+    assert_eq!(offset, px(0.), "the form scrolls back to the invalid field");
+    assert!(focused, "the invalid field takes focus");
+
+    let handle = field_focus(cx, &root, 0);
+    cx.update(|window, _| window.focus(&handle));
+    cx.simulate_keystrokes("x");
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&root, |root, _| root.add.errors.is_empty()),
+        "editing clears the validation error"
+    );
+    cx.update_entity(&root, |root, cx| {
+        root.add.deck_id = None;
+        root.add_scroll.set_offset(point(px(0.), px(400.)));
+        cx.notify();
+    });
+    cx.dispatch_action(super::SaveNote);
+    cx.run_until_parked();
+    let (picker, offset, filter_focused) = cx.update(|window, cx| {
+        let root = root.read(cx);
+        (
+            root.add.deck_picker,
+            root.add_scroll.offset().y,
+            root.add
+                .deck_filter
+                .read(cx)
+                .focus_handle()
+                .is_focused(window),
+        )
+    });
+    assert!(picker, "the deck picker opens on a deck error");
+    assert_eq!(offset, px(0.), "the form scrolls to the deck control");
+    assert!(filter_focused, "the deck filter takes focus");
+}
+
+#[gpui::test]
+fn open_add_focuses_the_first_field(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    draw_editor(cx, &root);
+    cx.dispatch_action(super::OpenAdd);
+    cx.run_until_parked();
+    draw_editor(cx, &root);
+
+    let focused = cx.update(|window, cx| {
+        root.read(cx).add.fields[0]
+            .read(cx)
+            .focus_handle()
+            .is_focused(window)
+    });
+    assert!(focused, "OpenAdd focuses the first editable field");
+}
+
+#[gpui::test]
+fn clicking_save_keeps_the_editor_focused(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(editor_launch(EditorStore::new()), window, cx)
+    });
+    open_editor(cx, &root);
+    let handle = field_focus(cx, &root, 0);
+    cx.update(|window, _| window.focus(&handle));
+
+    let button = cx
+        .debug_bounds("add-save")
+        .expect("save button bounds")
+        .center();
+    cx.simulate_click(button, gpui::Modifiers::none());
+    cx.run_until_parked();
+
+    let focused = cx.update(|window, cx| {
+        root.read(cx).add.fields[0]
+            .read(cx)
+            .focus_handle()
+            .is_focused(window)
+    });
+    assert!(focused, "mouse save keeps the previous field focused");
+}
+
+#[gpui::test]
+fn duplicate_first_field_is_explained_inline_and_focused(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let mut store = EditorStore::new();
+    store.duplicate = true;
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(editor_launch(store), window, cx)
+    });
+    open_editor(cx, &root);
+    cx.update_entity(&root, |root, cx| {
+        root.seed_fields("Paris", cx);
+        cx.notify();
+    });
+    draw_editor(cx, &root);
+    let tags = cx.read_entity(&root, |root, cx| {
+        root.add.tags.read(cx).focus_handle().clone()
+    });
+    cx.update(|window, _| window.focus(&tags));
+
+    cx.dispatch_action(super::SaveNote);
+    cx.run_until_parked();
+    draw_editor(cx, &root);
+
+    let message = cx
+        .read_entity(&root, |root, _| root.add.errors.get("field:0").cloned());
+    assert_eq!(
+        message.as_deref(),
+        Some("A note with this first field already exists")
+    );
+    assert!(
+        cx.debug_bounds("add-field-error-0").is_some(),
+        "the duplicate is shown on the field"
+    );
+    let focused = cx.update(|window, cx| {
+        root.read(cx).add.fields[0]
+            .read(cx)
+            .focus_handle()
+            .is_focused(window)
+    });
+    assert!(focused, "the duplicate field takes focus");
+}
+
+#[gpui::test]
+fn occlusion_controls_add_and_remove_masks(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            super::Launch {
+                store: Box::new(ModalStore),
+                options: Options::default(),
+                save_settings: Arc::new(|_| Ok(())),
+            },
+            window,
+            cx,
+        )
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.view = View::AddCard;
+        let occlusion = root
+            .models
+            .iter()
+            .position(ranki_model::NoteModel::is_image_occlusion)
+            .expect("stock occlusion");
+        root.select_model(occlusion, cx);
+        root.add.occlusion.image = Some(String::from("diagram.png"));
+        cx.notify();
+    });
+    draw_editor(cx, &root);
+
+    cx.dispatch_action(super::AddOcclusionMask);
+    cx.run_until_parked();
+    draw_editor(cx, &root);
+
+    let mask = cx.read_entity(&root, |root, _| {
+        root.add.occlusion.masks.first().copied()
+    });
+    assert!(mask.is_some(), "Add mask adds a default mask");
+    let rect = mask.expect("mask").rect;
+    assert!(rect.width > 0.0 && rect.height > 0.0);
+    assert!(cx.debug_bounds("io-add-mask").is_some());
+    assert!(cx.debug_bounds("io-occlusion-hint").is_some());
+
+    let remove = cx
+        .debug_bounds("io-remove-mask-1")
+        .expect("remove control bounds")
+        .center();
+    cx.simulate_click(remove, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&root, |root, _| root.add.occlusion.masks.is_empty()),
+        "the explicit remove control deletes its mask"
+    );
+
+    cx.dispatch_action(super::AddOcclusionMask);
+    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&root, |root, _| root.add.occlusion.masks.is_empty()),
+        "Ctrl+Shift+M removes the last mask"
+    );
+}
+
+#[gpui::test]
+fn enter_applies_the_custom_color(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(editor_launch(EditorStore::new()), window, cx)
+    });
+    open_editor(cx, &root);
+    cx.update_entity(&root, |root, cx| {
+        root.seed_fields("Paris", cx);
+        cx.notify();
+    });
+    draw_editor(cx, &root);
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            let field = root.add.fields[0].clone();
+            root.toggle_color_picker(
+                crate::add_card_view::ColorTarget::Text,
+                field,
+                point(px(300.), px(360.)),
+                window,
+                cx,
+            );
+        });
+    });
+    draw_editor(cx, &root);
+
+    cx.simulate_keystrokes("f 3 8 b a 8");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    let (text, open) = cx.read_entity(&root, |root, cx| {
+        (
+            root.add.fields[0].read(cx).text(),
+            root.add.color_picker.is_some(),
+        )
+    });
+    assert_eq!(
+        text,
+        format!(
+            "Paris<span style=\"color: #{}\"></span>",
+            concat!("f3", "8b", "a8")
+        )
+    );
+    assert!(!open, "the picker closes after applying the color");
+}
+
+#[gpui::test]
+fn escape_cancels_add_after_nested_dismissals(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(editor_launch(EditorStore::new()), window, cx)
+    });
+    open_editor(cx, &root);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_ne!(
+        cx.read_entity(&root, |root, _| root.view),
+        View::AddCard,
+        "escape cancels the add form"
+    );
+
+    open_editor(cx, &root);
+    cx.update_entity(&root, |root, cx| {
+        root.add.deck_picker = true;
+        cx.notify();
+    });
+    draw_editor(cx, &root);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let (view, picker) =
+        cx.read_entity(&root, |root, _| (root.view, root.add.deck_picker));
+    assert_eq!(view, View::AddCard);
+    assert!(!picker, "the first escape only closes the picker");
+
+    let tags = cx.read_entity(&root, |root, cx| {
+        root.add.tags.read(cx).focus_handle().clone()
+    });
+    cx.update(|window, _| window.focus(&tags));
+    cx.simulate_keystrokes("j a");
+    cx.run_until_parked();
+    draw_editor(cx, &root);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let (view, dismissed) = cx.read_entity(&root, |root, _| {
+        (root.view, root.add.tag_suggestions_dismissed)
+    });
+    assert_eq!(view, View::AddCard);
+    assert!(dismissed, "the first escape only closes suggestions");
+}
+
+#[gpui::test]
+fn enter_in_deck_filter_chooses_the_first_match(cx: &mut gpui::TestAppContext) {
+    cx.update(|app| app.bind_keys(super::key_bindings()));
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(
+            editor_launch(EditorStore::with_decks(&["Alpha", "Beta"])),
+            window,
+            cx,
+        )
+    });
+    open_editor(cx, &root);
+    cx.update_entity(&root, |root, cx| {
+        root.add.deck_picker = true;
+        root.add.deck_filter.update(cx, |field, cx| {
+            field.seed("bet", cx);
+        });
+        cx.notify();
+    });
+    draw_editor(cx, &root);
+    let filter = cx.read_entity(&root, |root, cx| {
+        root.add.deck_filter.read(cx).focus_handle().clone()
+    });
+    cx.update(|window, _| window.focus(&filter));
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    let (selected, picker) = cx
+        .read_entity(&root, |root, _| (root.add.deck_id, root.add.deck_picker));
+    assert_eq!(selected, Some(2), "the first visible deck is chosen");
+    assert!(!picker, "choosing a deck closes the picker");
 }

@@ -1,10 +1,10 @@
 //! Shared navigation rail, toasts, and modal overlays.
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Corner, CursorStyle, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, Window, anchored, div,
-    point, px,
+    AnyElement, AnyView, App, AppContext, ClickEvent, Context, Corner,
+    CursorStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, anchored, div, point, px,
 };
 
 use crate::{
@@ -14,11 +14,50 @@ use crate::{
         keycap, panel, secondary_button,
     },
     theme::{
-        MOBILE_NAV_HEIGHT, MOBILE_TOUCH_TARGET, NAV_DIVIDER_WIDTH, SPACE_BLOCK,
+        BUTTON_HEIGHT, BUTTON_RADIUS, BUTTON_TEXT_SIZE, MOBILE_NAV_HEIGHT,
+        MOBILE_TOUCH_TARGET, NAV_DIVIDER_WIDTH, Palette, SPACE_BLOCK,
         SPACE_GROUP, SPACE_INLINE, SPACE_RELATED, SPACE_SECTION, Style, alpha,
         is_mobile_width, visible_nav_width,
     },
 };
+
+struct LabelTooltip {
+    text: SharedString,
+    colors: Palette,
+}
+
+impl Render for LabelTooltip {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .px(px(SPACE_GROUP))
+            .py(px(SPACE_INLINE))
+            .rounded(px(8.))
+            .bg(self.colors.mantle)
+            .border_1()
+            .border_color(self.colors.surface0)
+            .text_size(px(12.))
+            .text_color(self.colors.text)
+            .child(self.text.clone())
+    }
+}
+
+fn label_tooltip(
+    label: impl Into<SharedString>,
+    colors: Palette,
+) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    let text = label.into();
+    move |_, cx| {
+        cx.new(|_| LabelTooltip {
+            text: text.clone(),
+            colors,
+        })
+        .into()
+    }
+}
 
 impl Root {
     pub(crate) fn render_nav(
@@ -66,7 +105,9 @@ impl Root {
         .on_click(self.action_click(UiAction::OpenAdd))
         .child(icon("icon-plus", 18., add_ink));
         if compact {
-            add = add.justify_center();
+            add = add
+                .justify_center()
+                .tooltip(label_tooltip("Add card", colors));
         } else {
             add = add.child("Add card").child(div().flex_1()).child(keycap(
                 "A",
@@ -113,7 +154,8 @@ impl Root {
             }
             row = row.child(icon(icon_name, 18., ink));
             if compact {
-                row = row.justify_center();
+                row =
+                    row.justify_center().tooltip(label_tooltip(label, colors));
             } else {
                 row = row.child(label.to_owned()).child(div().flex_1()).child(
                     if enabled {
@@ -190,6 +232,7 @@ impl Root {
                 true,
             ))
             .child(div().flex_1())
+            .children(self.render_nav_sync(compact))
             .child(nav(
                 "Settings",
                 "icon-settings",
@@ -301,13 +344,21 @@ impl Root {
 
     pub(crate) fn render_overlay(
         &self,
-        window: &Window,
-        cx: &Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let nav_width = visible_nav_width(
-            f32::from(window.viewport_size().width),
-            self.nav_width,
-        );
+        let viewport_width = f32::from(window.viewport_size().width);
+        let viewport_height = f32::from(window.viewport_size().height);
+        let modal_width = (viewport_width - 32.0).clamp(0.0, 420.0);
+        let nav_width = visible_nav_width(viewport_width, self.nav_width);
+        if self.help_open && !self.dialog_focus.contains_focused(window, cx) {
+            let focus = self.dialog_focus.clone();
+            cx.defer_in(window, move |root, window, _| {
+                if root.help_open {
+                    window.focus(&focus);
+                }
+            });
+        }
         let colors = self.colors();
         let theme = self.theme();
         let style = Style::new(colors, theme);
@@ -377,6 +428,7 @@ impl Root {
                     .into_any_element(),
             );
         }
+        let toast_width = (viewport_width - 2.0 * (nav_width + 32.0)).max(0.0);
         if let Some(toast) = self.live_toast() {
             let (hue, icon_name, prefix) = match toast.kind {
                 crate::app::ToastKind::Success => {
@@ -392,6 +444,8 @@ impl Root {
             });
             let body = div()
                 .flex()
+                .w_full()
+                .min_w(px(0.))
                 .items_center()
                 .gap(px(SPACE_GROUP))
                 .px(px(SPACE_RELATED))
@@ -410,7 +464,7 @@ impl Root {
                         .text_color(hue)
                         .child(prefix),
                 )
-                .child(toast.text.clone())
+                .child(div().flex_1().min_w(px(0.)).child(toast.text.clone()))
                 .child(
                     Interaction::surface(colors)
                         .apply(
@@ -426,6 +480,7 @@ impl Root {
                                 .cursor_pointer(),
                         )
                         .on_click(dismiss)
+                        .tooltip(label_tooltip("Dismiss", colors))
                         .child(icon("icon-x", 14., colors.subtext)),
                 );
             layers.push(
@@ -433,6 +488,8 @@ impl Root {
                     .absolute()
                     .bottom(px(72.))
                     .left(px(nav_width + 32.))
+                    .right(px(nav_width + 32.))
+                    .w(px(toast_width))
                     .child(crate::components::fade_in(
                         body,
                         ("toast", usize::try_from(toast.seq).unwrap_or(0)),
@@ -456,6 +513,7 @@ impl Root {
             layers.push(
                 anchored()
                     .anchor(Corner::TopRight)
+                    .snap_to_window_with_margin(px(16.))
                     .position(menu.anchor)
                     .offset(point(px(15.), px(19.)))
                     .child(
@@ -497,9 +555,16 @@ impl Root {
                                             .cursor_pointer(),
                                     )
                                     .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, _, cx| {
+                                        move |this,
+                                              _: &ClickEvent,
+                                              window,
+                                              cx| {
                                             this.deck_menu = None;
-                                            this.start_rename(&rename_deck, cx);
+                                            this.start_rename(
+                                                &rename_deck,
+                                                window,
+                                                cx,
+                                            );
                                         },
                                     ))
                                     .text_size(px(13.))
@@ -544,7 +609,7 @@ impl Root {
                                             .text_color(colors.red),
                                     )
                                     .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, _, cx| {
+                                        move |this, _: &ClickEvent, window, cx| {
                                             this.deck_menu = None;
                                             this.confirmation = Some(
                                                 Confirmation::RemoveDeck {
@@ -555,6 +620,7 @@ impl Root {
                                                 },
                                             );
                                             cx.notify();
+                                            window.focus(&this.dialog_focus);
                                         },
                                     ))
                                     .text_size(px(13.))
@@ -573,12 +639,14 @@ impl Root {
             layers.push(
                 anchored()
                     .anchor(Corner::TopRight)
+                    .snap_to_window_with_margin(px(16.))
                     .position(menu.anchor)
                     .offset(point(px(15.), px(19.)))
                     .child(
                         div()
                             .id("card-actions-menu")
                             .debug_selector(|| "card-actions-menu".to_owned())
+                            .occlude()
                             .on_mouse_down_out(cx.listener(
                                 move |this,
                                       event: &gpui::MouseDownEvent,
@@ -724,8 +792,9 @@ impl Root {
                     ))
                     .child(
                         div()
+                            .w(px(modal_width))
+                            .min_w(px(0.))
                             .id("create-deck-modal")
-                            .w(px(420.))
                             .flex()
                             .flex_col()
                             .gap(px(16.))
@@ -789,6 +858,7 @@ impl Root {
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .justify_end()
                                     .gap(px(SPACE_GROUP))
                                     .child(secondary_button(
@@ -856,7 +926,8 @@ impl Root {
                     ))
                     .child(
                         panel(colors)
-                            .w(px(420.))
+                            .w(px(modal_width))
+                            .min_w(px(0.))
                             .child(
                                 div()
                                     .text_size(px(20.))
@@ -865,6 +936,7 @@ impl Root {
                             )
                             .child(
                                 div()
+                                    .min_w(px(0.))
                                     .text_size(px(14.))
                                     .text_color(colors.subtext)
                                     .child(detail),
@@ -872,6 +944,7 @@ impl Root {
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .justify_end()
                                     .gap(px(SPACE_GROUP))
                                     .child(secondary_button(
@@ -892,42 +965,159 @@ impl Root {
         }
         if self.help_open {
             let close = self.action_click(UiAction::ToggleHelp);
+            let help_width = (viewport_width - 32.0).clamp(0.0, 300.0);
+            let help_height = (viewport_height - 32.0).max(0.0);
             layers.push(
                 div()
                     .absolute()
-                    .top(px(16.))
-                    .right(px(20.))
-                    .w(px(300.))
+                    .inset_0()
                     .flex()
-                    .flex_col()
-                    .gap(px(SPACE_GROUP))
-                    .p(px(SPACE_BLOCK))
-                    .rounded(px(18.))
-                    .bg(colors.mantle)
-                    .border_1()
-                    .border_color(colors.surface0)
+                    .items_center()
+                    .justify_center()
+                    .bg(crate::theme::alpha(colors.crust, 0.7))
+                    .occlude()
+                    .id("help-backdrop")
+                    .debug_selector(|| "help-backdrop".to_owned())
+                    .key_context("ranki_dialog")
+                    .on_action(cx.listener(
+                        |this, _: &crate::app::CancelDialog, window, cx| {
+                            if this.help_open {
+                                this.help_open = false;
+                                let focus = this.focus.clone();
+                                window.focus(&focus);
+                                cx.defer_in(window, move |_, window, _| {
+                                    window.focus(&focus);
+                                });
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    .on_action(cx.listener(
+                        |this, _: &crate::app::ConfirmDialog, window, cx| {
+                            if this.help_open {
+                                this.help_open = false;
+                                let focus = this.focus.clone();
+                                window.focus(&focus);
+                                cx.defer_in(window, move |_, window, _| {
+                                    window.focus(&focus);
+                                });
+                                cx.notify();
+                            }
+                        },
+                    ))
                     .child(
                         div()
-                            .text_size(px(14.))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("Keyboard"),
+                            .id("help-modal")
+                            .w(px(help_width))
+                            .max_h(px(help_height))
+                            .flex()
+                            .flex_col()
+                            .gap(px(SPACE_INLINE))
+                            .p(px(SPACE_RELATED))
+                            .rounded(px(18.))
+                            .bg(colors.mantle)
+                            .border_1()
+                            .border_color(colors.surface0)
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(14.))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .child("Keyboard"),
+                            )
+                            .child(
+                                div()
+                                    .id("help-rows")
+                                    .flex_1()
+                                    .min_h(px(0.))
+                                    .overflow_scroll()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(SPACE_INLINE))
+                                    .child(help_row(
+                                        "Space",
+                                        "Reveal / Good",
+                                        colors,
+                                    ))
+                                    .child(help_row(
+                                        "1 - 4",
+                                        "Grade card",
+                                        colors,
+                                    ))
+                                    .child(help_row(
+                                        "Ctrl Z",
+                                        "Undo last grade",
+                                        colors,
+                                    ))
+                                    .child(help_row("R", "Flip card", colors))
+                                    .child(help_row("S", "Study again", colors))
+                                    .child(help_row(
+                                        "Esc",
+                                        "End session",
+                                        colors,
+                                    ))
+                                    .child(help_row("B", "Browse", colors))
+                                    .child(help_row(",", "Settings", colors))
+                                    .child(help_row("N", "Next deck", colors))
+                                    .child(help_row(
+                                        "F5",
+                                        "Reload collection",
+                                        colors,
+                                    ))
+                                    .child(help_row(
+                                        "A / D",
+                                        "Add card / Decks",
+                                        colors,
+                                    ))
+                                    .child(help_row("T", "Statistics", colors))
+                                    .child(help_row(
+                                        "Ctrl/Cmd Enter",
+                                        "Save note",
+                                        colors,
+                                    ))
+                                    .child(help_row(
+                                        "Tab",
+                                        "Next control",
+                                        colors,
+                                    ))
+                                    .child(help_row(
+                                        "Shift Tab",
+                                        "Previous control",
+                                        colors,
+                                    ))
+                                    .child(help_row("?", "This sheet", colors)),
+                            )
+                            .child(
+                                div().flex().flex_none().justify_end().child(
+                                    Interaction::surface(colors)
+                                        .apply(
+                                            div()
+                                                .id("help-close")
+                                                .debug_selector(|| {
+                                                    "help-close".to_owned()
+                                                })
+                                                .track_focus(&self.dialog_focus)
+                                                .focusable()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .h(px(BUTTON_HEIGHT))
+                                                .px(px(SPACE_RELATED))
+                                                .rounded(px(BUTTON_RADIUS))
+                                                .bg(colors.surface0)
+                                                .border_1()
+                                                .border_color(colors.surface1)
+                                                .text_size(px(BUTTON_TEXT_SIZE))
+                                                .font_weight(
+                                                    gpui::FontWeight::SEMIBOLD,
+                                                )
+                                                .cursor_pointer(),
+                                        )
+                                        .on_click(close)
+                                        .child("Close"),
+                                ),
+                            ),
                     )
-                    .child(help_row("Space", "Reveal answer", colors))
-                    .child(help_row("1 - 4", "Grade card", colors))
-                    .child(help_row("Ctrl Z", "Undo last grade", colors))
-                    .child(help_row("R", "Show question", colors))
-                    .child(help_row("S", "Study again", colors))
-                    .child(help_row("Esc", "End session", colors))
-                    .child(help_row("A / D", "Add card / Decks", colors))
-                    .child(help_row("T", "Statistics", colors))
-                    .child(help_row("?", "This sheet", colors))
-                    .child(div().flex().child(action_button(
-                        "help-close",
-                        "Close",
-                        ButtonTone::Neutral,
-                        style,
-                        close,
-                    )))
                     .into_any_element(),
             );
         }
@@ -1004,4 +1194,69 @@ fn help_row(
         .text_size(px(12.))
         .child(keycap(key, colors, false))
         .child(div().text_color(colors.subtext).child(label))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui::{AppContext as _, point, size};
+
+    use crate::{Options, app::View};
+
+    #[gpui::test]
+    fn help_modal_focuses_close_and_escape_dismisses(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("collection.anki2");
+        let store = Box::new(
+            ranki_storage::Collection::create(&path).expect("collection"),
+        );
+        let options = Options {
+            paths: ranki_model::DataPaths::new(dir.path()),
+            ..Options::default()
+        };
+        let save_settings: crate::SettingsSaver = Arc::new(|_| Ok(()));
+        cx.update(|cx| cx.bind_keys(crate::app::key_bindings()));
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            super::Root::new(
+                crate::app::Launch {
+                    store,
+                    options,
+                    save_settings,
+                },
+                window,
+                cx,
+            )
+        });
+        let viewport = size(gpui::px(720.), gpui::px(540.));
+        cx.simulate_resize(viewport);
+        cx.update_entity(&root, |root, cx| {
+            root.view = View::Review;
+            root.help_open = true;
+            cx.notify();
+        });
+        cx.draw(point(gpui::px(0.), gpui::px(0.)), viewport, |_, _| {
+            root.clone()
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+
+        let backdrop = cx
+            .debug_bounds("help-backdrop")
+            .expect("help backdrop bounds");
+        assert_eq!(backdrop.size.width, gpui::px(720.));
+        assert_eq!(backdrop.size.height, gpui::px(540.));
+        assert!(cx.debug_bounds("help-close").is_some());
+
+        let focus = cx.read_entity(&root, |root, _| root.dialog_focus.clone());
+        cx.update(|window, _| assert!(focus.is_focused(window)));
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!cx.read_entity(&root, |root, _| root.help_open));
+    }
 }
