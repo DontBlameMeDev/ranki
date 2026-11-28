@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Context, Div, InteractiveElement, IntoElement, ParentElement, SharedString,
-    Styled, div, px,
+    AnyElement, AppContext as _, Context, Div, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    Window, div, px,
 };
 use ranki_storage::ReopeningCollection;
 
@@ -17,7 +18,7 @@ use ranki_sync::{
 };
 
 use crate::{
-    app::{Root, ToastKind},
+    app::{Root, ToastKind, View},
     components::{ButtonTone, ClickHandler, action_button, dot, icon, panel},
     theme::{
         Palette, SPACE_BLOCK, SPACE_GROUP, SPACE_RELATED, SPACE_SECTION, Style,
@@ -43,7 +44,7 @@ pub enum SyncActivity {
 impl SyncActivity {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::SigningIn => "Signing in to AnkiWeb",
+            Self::SigningIn => "Signing in and syncing",
             Self::Syncing => "Syncing with AnkiWeb",
             Self::KeepingLocal => "Keeping the local copy",
             Self::KeepingRemote => "Keeping the AnkiWeb copy",
@@ -65,6 +66,23 @@ pub fn should_auto_sync(
     conflicted: bool,
 ) -> bool {
     enabled && auto && signed_in && !busy && !conflicted
+}
+
+/// Short age of a stored sync timestamp, for the panel and status text.
+pub fn relative_time(now: i64, timestamp: i64) -> String {
+    let elapsed = now.saturating_sub(timestamp).max(0);
+    if elapsed < 60 {
+        return String::from("just now");
+    }
+    if elapsed < 3_600 {
+        let seconds = i32::try_from(elapsed).unwrap_or(i32::MAX);
+        return format!("{} ago", crate::theme::interval_label(-seconds));
+    }
+    if elapsed < 86_400 {
+        return format!("{}h ago", elapsed / 3_600);
+    }
+    let days = i32::try_from(elapsed / 86_400).unwrap_or(i32::MAX);
+    format!("{} ago", crate::theme::interval_label(days))
 }
 
 /// Exchanges the password for a host key, then runs one sync immediately.
@@ -106,11 +124,20 @@ fn sync_message(outcome: &SyncOutcome) -> (ToastKind, String) {
         ),
         SyncOutcome::RetryLater { reason } => (
             ToastKind::Error,
-            format!(
-                "Signed in. Sync failed: {reason}. Run ranki sync to retry"
-            ),
+            format!("Signed in. Sync failed: {reason}. Use Sync now to retry"),
         ),
     }
+}
+
+/// Text kept in the panel after a failed collection sync.
+fn sync_error(error: &str) -> String {
+    format!("Sync failed: {error}")
+}
+
+/// Media runs get their own label so a media failure is not mistaken for a
+/// failed collection sync.
+fn media_sync_error(error: &str) -> String {
+    format!("Media sync failed: {error}")
 }
 
 fn refresh_message(outcome: &SyncOutcome) -> (ToastKind, String) {
@@ -133,7 +160,7 @@ fn refresh_message(outcome: &SyncOutcome) -> (ToastKind, String) {
         ),
         SyncOutcome::RetryLater { reason } => (
             ToastKind::Error,
-            format!("Sync failed: {reason}. Run ranki sync to retry"),
+            format!("Sync failed: {reason}. Use Sync now to retry"),
         ),
     }
 }
@@ -208,6 +235,24 @@ pub fn run_media(
 }
 
 impl Root {
+    /// Turns automatic syncing on or off, keeping the last saved value on error.
+    pub(crate) fn toggle_auto_sync(&mut self, cx: &mut Context<Self>) {
+        if self.sync.busy() || !self.sync.signed_in {
+            return;
+        }
+        let previous = self.options.sync.auto;
+        self.options.sync.auto = !previous;
+        if let Err(error) = (self.save_settings)(&self.options) {
+            self.options.sync.auto = previous;
+            self.show_toast(
+                ToastKind::Error,
+                format!("Could not save sync setting: {error}"),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
     pub(crate) fn sign_out(&mut self, cx: &mut Context<Self>) {
         if self.sync.busy() {
             return;
@@ -445,12 +490,18 @@ impl Root {
         self.sync.running = None;
         self.sync.conflict = None;
         self.sync.error = match &result {
-            Err(error) => Some(format!("Sync failed: {error}")),
-            Ok(SyncOutcome::RetryLater { reason }) => {
-                Some(format!("Sync failed: {reason}"))
-            }
+            Err(error) => Some(sync_error(error)),
+            Ok(SyncOutcome::RetryLater { reason }) => Some(sync_error(reason)),
             Ok(_) => None,
         };
+        if let Ok(outcome) = &result
+            && outcome.is_settled()
+            && let Some(last_success) =
+                read_state(&self.options.paths.sync_state)
+                    .and_then(|state| state.last_success)
+        {
+            self.sync.last_success = Some(last_success);
+        }
         let (kind, message) = match &result {
             Ok(outcome) => {
                 if let SyncOutcome::Conflict { reason } = outcome {
@@ -533,11 +584,14 @@ impl Root {
                         root.images
                             .update(cx, |cache, _| cache.forget_failed());
                     }
-                    Err(error) => root.show_toast(
-                        ToastKind::Error,
-                        format!("Media sync failed: {error}"),
-                        cx,
-                    ),
+                    Err(error) => {
+                        root.sync.error = Some(media_sync_error(&error));
+                        root.show_toast(
+                            ToastKind::Error,
+                            media_sync_error(&error),
+                            cx,
+                        );
+                    }
                 }
                 cx.notify();
             });
@@ -545,10 +599,75 @@ impl Root {
         .detach();
     }
 
-    fn reopen_collection(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn reopen_collection(&mut self, cx: &mut Context<Self>) {
+        let review_active = self.view == View::Review;
         self.store =
             Box::new(ReopeningCollection::new(&self.options.paths.collection));
-        self.reload_collection(cx);
+        self.reload(cx);
+        if review_active {
+            self.end_session(cx);
+            self.show_toast(
+                ToastKind::Success,
+                String::from(
+                    "Collection downloaded. The study session ended because its cards changed.",
+                ),
+                cx,
+            );
+            self.persist_state(cx);
+        } else {
+            if self.view == View::Browse {
+                self.refresh_browse(cx);
+            }
+            if self.view == View::Statistics {
+                self.schedule_statistics_refresh(cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// Running-sync indicator shared by the settings panel and the nav rail.
+    pub(crate) fn render_sync_activity(&self) -> Option<Div> {
+        let activity = self.sync.running?;
+        Some(activity_line(
+            activity,
+            self.colors(),
+            self.motion_ms(PULSE_MS),
+            self.sync.media,
+            "sync-panel-activity",
+        ))
+    }
+
+    /// Status line for the wide nav rail, or a dot when the rail is compact.
+    pub(crate) fn render_nav_sync(&self, compact: bool) -> Option<AnyElement> {
+        let activity = self.sync.running?;
+        let text = activity_text(activity, self.sync.media);
+        let colors = self.colors();
+        let motion_ms = self.motion_ms(PULSE_MS);
+        if compact {
+            return Some(sync_dot("sync-nav-dot", text, colors, motion_ms));
+        }
+        Some(
+            activity_line(
+                activity,
+                colors,
+                motion_ms,
+                self.sync.media,
+                "sync-nav-activity",
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// Keeps session progress visible while the study footer is on screen.
+    pub(crate) fn render_review_sync(&self) -> Option<AnyElement> {
+        let activity = self.sync.running?;
+        let text = activity_text(activity, self.sync.media);
+        Some(sync_dot(
+            "sync-review-dot",
+            text,
+            self.colors(),
+            self.motion_ms(PULSE_MS),
+        ))
     }
 
     pub(crate) fn render_sync(&self) -> impl IntoElement {
@@ -559,6 +678,7 @@ impl Root {
         let sign_in = self.action_click(crate::app::UiAction::SyncSignIn);
         let sign_out = self.action_click(crate::app::UiAction::SyncSignOut);
         let sync_now = self.action_click(crate::app::UiAction::SyncNow);
+        let auto_sync = self.action_click(crate::app::UiAction::ToggleAutoSync);
         let keep_local = self.action_click(crate::app::UiAction::SyncKeepLocal);
         let keep_remote =
             self.action_click(crate::app::UiAction::SyncKeepRemote);
@@ -585,13 +705,8 @@ impl Root {
             ));
         }
 
-        let body = if let Some(activity) = running {
-            activity_line(
-                activity,
-                colors,
-                self.motion_ms(PULSE_MS),
-                self.sync.media,
-            )
+        let body = if let Some(pill) = self.render_sync_activity() {
+            pill
         } else if !signed_in {
             div()
                 .flex()
@@ -621,24 +736,57 @@ impl Root {
         } else if let Some(reason) = self.sync.conflict.as_deref() {
             conflict_card(reason, colors, style, keep_local, keep_remote)
         } else {
+            let last_sync = self
+                .sync
+                .last_success
+                .map(|timestamp| relative_time(Self::now(), timestamp));
             let note = if self.options.sync.enabled && self.options.sync.auto {
                 "Changes sync to AnkiWeb automatically."
             } else {
                 "Use Sync now to send changes."
             };
+            let mut detail = div()
+                .flex()
+                .flex_col()
+                .gap(px(SPACE_GROUP))
+                .child(status_line(note, colors));
+            if let Some(timestamp) = last_sync {
+                detail = detail.child(status_line(
+                    format!("Last synced {timestamp}"),
+                    colors,
+                ));
+            }
             div()
                 .flex()
                 .items_center()
                 .justify_between()
                 .gap(px(SPACE_SECTION))
-                .child(status_line(note, colors))
-                .child(action_button(
-                    "sync-now",
-                    "Sync now",
-                    ButtonTone::Neutral,
-                    style,
-                    sync_now,
-                ))
+                .child(detail)
+                .child({
+                    let mut actions =
+                        div().flex().items_center().gap(px(SPACE_RELATED));
+                    if signed_in && running.is_none() {
+                        let label = if self.options.sync.auto {
+                            "Auto sync: on"
+                        } else {
+                            "Auto sync: off"
+                        };
+                        actions = actions.child(action_button(
+                            "sync-auto",
+                            label,
+                            ButtonTone::Neutral,
+                            style,
+                            auto_sync,
+                        ));
+                    }
+                    actions.child(action_button(
+                        "sync-now",
+                        "Sync now",
+                        ButtonTone::Neutral,
+                        style,
+                        sync_now,
+                    ))
+                })
         };
 
         let mut column = div().flex().flex_col().gap(px(SPACE_RELATED));
@@ -691,6 +839,7 @@ fn activity_line(
     colors: Palette,
     motion_ms: u64,
     media: Option<MediaProgress>,
+    id: &'static str,
 ) -> Div {
     use gpui::AnimationExt as _;
 
@@ -701,7 +850,7 @@ fn activity_line(
     } else {
         dot(colors.mauve, 8.)
             .with_animation(
-                "sync-activity",
+                id,
                 gpui::Animation::new(Duration::from_millis(motion_ms))
                     .repeat()
                     .with_easing(|delta| {
@@ -719,6 +868,69 @@ fn activity_line(
         .text_color(colors.text)
         .child(marker)
         .child(SharedString::from(label))
+}
+
+/// Small status marker for the compact rail and the review footer.
+fn sync_dot(
+    id: &'static str,
+    text: String,
+    colors: Palette,
+    motion_ms: u64,
+) -> AnyElement {
+    use gpui::AnimationExt as _;
+
+    let marker = dot(colors.mauve, 8.);
+    let marker = if motion_ms == 0 {
+        marker.into_any_element()
+    } else {
+        marker
+            .with_animation(
+                id,
+                gpui::Animation::new(Duration::from_millis(motion_ms))
+                    .repeat()
+                    .with_easing(|delta| {
+                        0.35 + 0.65 * (delta * std::f32::consts::PI).sin()
+                    }),
+                gpui::Styled::opacity,
+            )
+            .into_any_element()
+    };
+    let label = SharedString::from(text);
+    div()
+        .id(SharedString::from(format!("{id}-tooltip")))
+        .flex_none()
+        .child(marker)
+        .tooltip(move |_, cx| {
+            cx.new(|_| SyncTooltip {
+                text: label.clone(),
+                colors,
+            })
+            .into()
+        })
+        .into_any_element()
+}
+
+struct SyncTooltip {
+    text: SharedString,
+    colors: Palette,
+}
+
+impl Render for SyncTooltip {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .p(px(SPACE_GROUP))
+            .rounded(px(10.))
+            .bg(self.colors.base)
+            .border_1()
+            .border_color(self.colors.surface1)
+            .text_size(px(12.))
+            .text_color(self.colors.text)
+            .child(self.text.clone())
+    }
 }
 
 /// The one decision the sync panel ever asks for.
@@ -817,6 +1029,7 @@ fn labeled_input(
 
 #[cfg(test)]
 mod tests {
+    use gpui::AppContext as _;
     use ranki_sync::{
         MediaProgress, MockResponse, MockTransport, SyncClient, SyncMethod,
         SyncOutcome, SyncState, clear_host_key,
@@ -825,7 +1038,8 @@ mod tests {
 
     use super::{
         SyncActivity, activity_text, capitalized, login_and_sync, read_state,
-        refresh_message, retained_conflict, should_auto_sync, sync_message,
+        refresh_message, relative_time, retained_conflict, should_auto_sync,
+        sync_message,
     };
     #[test]
     fn footer_reads_the_last_sync_from_the_state_file() {
@@ -847,6 +1061,74 @@ mod tests {
         let loaded = read_state(&state_path).unwrap_or_default();
         assert_eq!(loaded.host_key, "stored-key");
         assert_eq!(loaded.last_success, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn retry_later_points_gui_users_to_sync_now() {
+        let reason = String::from("offline");
+        let (kind, text) = refresh_message(&SyncOutcome::RetryLater {
+            reason: reason.clone(),
+        });
+        assert_eq!(kind, crate::app::ToastKind::Error);
+        assert_eq!(text, "Sync failed: offline. Use Sync now to retry");
+        let (_, signed_in) = sync_message(&SyncOutcome::RetryLater { reason });
+        assert_eq!(
+            signed_in,
+            "Signed in. Sync failed: offline. Use Sync now to retry"
+        );
+    }
+
+    #[gpui::test]
+    fn media_failure_is_stored_as_a_media_error(cx: &mut gpui::TestAppContext) {
+        let Ok(directory) = tempfile::tempdir() else {
+            return;
+        };
+        let collection = directory.path().join("collection.anki2");
+        if ranki_storage::Collection::create(&collection).is_err() {
+            return;
+        }
+        let mut options = crate::Options::default();
+        options.paths.collection = collection.clone();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            super::Root::new(
+                crate::app::Launch {
+                    store: Box::new(ranki_storage::ReopeningCollection::new(
+                        &collection,
+                    )),
+                    options,
+                    save_settings: std::sync::Arc::new(|_| Ok(())),
+                },
+                window,
+                cx,
+            )
+        });
+        cx.update_entity(&root, |root, cx| {
+            root.sync.signed_in = true;
+            root.media_run = std::sync::Arc::new(|_, _, _, _, _, _| {
+                Err(String::from("media server unavailable"))
+            });
+            root.start_media_sync(cx);
+        });
+        cx.run_until_parked();
+        let (error, toast) = cx.read_entity(&root, |root, _| {
+            (
+                root.sync.error.clone(),
+                root.toast.clone().map(|toast| toast.text),
+            )
+        });
+        let expected =
+            Some(String::from("Media sync failed: media server unavailable"));
+        assert_eq!(error, expected);
+        assert_eq!(toast, expected);
+    }
+
+    #[test]
+    fn last_sync_uses_short_relative_times() {
+        assert_eq!(relative_time(1_700_000_010, 1_700_000_000), "just now");
+        assert_eq!(relative_time(1_700_000_350, 1_700_000_000), "5m ago");
+        assert_eq!(relative_time(1_700_007_200, 1_700_000_000), "2h ago");
+        assert_eq!(relative_time(1_700_086_400, 1_700_000_000), "1d ago");
+        assert_eq!(relative_time(1_000, 9_000), "just now");
     }
 
     #[test]
@@ -977,7 +1259,7 @@ mod tests {
         );
         assert_eq!(
             activity_text(SyncActivity::SigningIn, None),
-            "Signing in to AnkiWeb..."
+            "Signing in and syncing..."
         );
     }
 
@@ -993,6 +1275,7 @@ mod tests {
         .into_iter()
         .map(SyncActivity::label)
         .collect();
+        assert_eq!(labels[0], "Signing in and syncing");
         assert_eq!(labels[1], "Syncing with AnkiWeb");
         assert_eq!(labels[2], "Keeping the local copy");
         assert_eq!(labels[4], "Downloading media");

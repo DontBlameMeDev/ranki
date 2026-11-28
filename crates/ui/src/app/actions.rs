@@ -14,6 +14,7 @@ actions!(
         GradeGood,
         GradeEasy,
         Retry,
+        RetryStatistics,
         Reload,
         Undo,
         NextField,
@@ -29,20 +30,30 @@ actions!(
         UseLightTheme,
         UseDarkTheme,
         UseSystemTheme,
+        UseReducedMotion,
+        UseFullMotion,
+        UseSystemMotion,
         AcceptTagSuggestion,
         DismissTagSuggestions,
         SubmitDeck,
         SaveNote,
         CancelAdd,
+        AddOcclusionMask,
+        RemoveOcclusionMask,
+        ApplyCustomColor,
         ToggleHelp,
         ConfirmDialog,
         CancelDialog,
         NextDeck,
         ClearSearch,
+        FocusDeckSearch,
         ClearBrowseSearch,
+        BrowseUp,
+        BrowseDown,
         SyncSignIn,
         SyncSignOut,
         SyncNow,
+        ToggleAutoSync,
         SyncKeepLocal,
         SyncKeepRemote,
     ]
@@ -55,6 +66,7 @@ pub enum UiAction {
     Space,
     Grade(Rating),
     Retry,
+    RetryStatistics,
     Reload,
     Undo,
     StudyAgain,
@@ -65,6 +77,7 @@ pub enum UiAction {
     OpenAdd,
     OpenSettings,
     SetTheme(ThemeChoice),
+    SetReduceMotion(Option<bool>),
     CreateDeck,
     SubmitDeck,
     SaveNote,
@@ -74,10 +87,14 @@ pub enum UiAction {
     CancelDialog,
     NextDeck,
     ClearSearch,
+    FocusDeckSearch,
     ClearBrowseSearch,
+    BrowseUp,
+    BrowseDown,
     SyncSignIn,
     SyncSignOut,
     SyncNow,
+    ToggleAutoSync,
     SyncKeepLocal,
     SyncKeepRemote,
 }
@@ -115,6 +132,11 @@ impl From<&GradeEasy> for UiAction {
 impl From<&Retry> for UiAction {
     fn from(_: &Retry) -> Self {
         Self::Retry
+    }
+}
+impl From<&RetryStatistics> for UiAction {
+    fn from(_: &RetryStatistics) -> Self {
+        Self::RetryStatistics
     }
 }
 impl From<&Reload> for UiAction {
@@ -160,6 +182,21 @@ impl From<&UseDarkTheme> for UiAction {
 impl From<&UseSystemTheme> for UiAction {
     fn from(_: &UseSystemTheme) -> Self {
         Self::SetTheme(ThemeChoice::System)
+    }
+}
+impl From<&UseReducedMotion> for UiAction {
+    fn from(_: &UseReducedMotion) -> Self {
+        Self::SetReduceMotion(Some(true))
+    }
+}
+impl From<&UseFullMotion> for UiAction {
+    fn from(_: &UseFullMotion) -> Self {
+        Self::SetReduceMotion(Some(false))
+    }
+}
+impl From<&UseSystemMotion> for UiAction {
+    fn from(_: &UseSystemMotion) -> Self {
+        Self::SetReduceMotion(None)
     }
 }
 impl From<&OpenStatistics> for UiAction {
@@ -217,6 +254,11 @@ impl From<&ClearSearch> for UiAction {
         Self::ClearSearch
     }
 }
+impl From<&FocusDeckSearch> for UiAction {
+    fn from(_: &FocusDeckSearch) -> Self {
+        Self::FocusDeckSearch
+    }
+}
 impl From<&OpenBrowse> for UiAction {
     fn from(_: &OpenBrowse) -> Self {
         Self::OpenBrowse
@@ -226,6 +268,16 @@ impl From<&OpenBrowse> for UiAction {
 impl From<&ClearBrowseSearch> for UiAction {
     fn from(_: &ClearBrowseSearch) -> Self {
         Self::ClearBrowseSearch
+    }
+}
+impl From<&BrowseUp> for UiAction {
+    fn from(_: &BrowseUp) -> Self {
+        Self::BrowseUp
+    }
+}
+impl From<&BrowseDown> for UiAction {
+    fn from(_: &BrowseDown) -> Self {
+        Self::BrowseDown
     }
 }
 /// Dispatches one of the app's GPUI actions from a pointer handler.
@@ -250,6 +302,9 @@ pub fn dispatch_app_action(
             window.dispatch_action(Box::new(GradeEasy), cx);
         }
         UiAction::Retry => window.dispatch_action(Box::new(Retry), cx),
+        UiAction::RetryStatistics => {
+            window.dispatch_action(Box::new(RetryStatistics), cx);
+        }
         UiAction::Reload => window.dispatch_action(Box::new(Reload), cx),
         UiAction::Undo => window.dispatch_action(Box::new(Undo), cx),
         UiAction::StudyAgain => {
@@ -278,6 +333,15 @@ pub fn dispatch_app_action(
         UiAction::SetTheme(ThemeChoice::System) => {
             window.dispatch_action(Box::new(UseSystemTheme), cx);
         }
+        UiAction::SetReduceMotion(Some(true)) => {
+            window.dispatch_action(Box::new(UseReducedMotion), cx);
+        }
+        UiAction::SetReduceMotion(Some(false)) => {
+            window.dispatch_action(Box::new(UseFullMotion), cx);
+        }
+        UiAction::SetReduceMotion(None) => {
+            window.dispatch_action(Box::new(UseSystemMotion), cx);
+        }
         UiAction::CreateDeck => {
             window.dispatch_action(Box::new(CreateDeck), cx);
         }
@@ -299,8 +363,15 @@ pub fn dispatch_app_action(
         UiAction::ClearSearch => {
             window.dispatch_action(Box::new(ClearSearch), cx);
         }
+        UiAction::FocusDeckSearch => {
+            window.dispatch_action(Box::new(FocusDeckSearch), cx);
+        }
         UiAction::ClearBrowseSearch => {
             window.dispatch_action(Box::new(ClearBrowseSearch), cx);
+        }
+        UiAction::BrowseUp => window.dispatch_action(Box::new(BrowseUp), cx),
+        UiAction::BrowseDown => {
+            window.dispatch_action(Box::new(BrowseDown), cx);
         }
         UiAction::SyncSignIn => {
             window.dispatch_action(Box::new(SyncSignIn), cx);
@@ -310,6 +381,9 @@ pub fn dispatch_app_action(
         }
         UiAction::SyncNow => {
             window.dispatch_action(Box::new(SyncNow), cx);
+        }
+        UiAction::ToggleAutoSync => {
+            window.dispatch_action(Box::new(ToggleAutoSync), cx);
         }
         UiAction::SyncKeepLocal => {
             window.dispatch_action(Box::new(SyncKeepLocal), cx);
@@ -323,6 +397,12 @@ pub fn dispatch_app_action(
 impl From<&SyncNow> for UiAction {
     fn from(_: &SyncNow) -> Self {
         Self::SyncNow
+    }
+}
+
+impl From<&ToggleAutoSync> for UiAction {
+    fn from(_: &ToggleAutoSync) -> Self {
+        Self::ToggleAutoSync
     }
 }
 

@@ -9,11 +9,11 @@ use ranki_model::{RevLog, RevLogKind};
 use std::time::Duration;
 
 use crate::{
-    app::{Root, duration_label},
-    components::panel,
+    app::{Root, UiAction, duration_label},
+    components::{ButtonTone, action_button, panel},
     theme::{
-        PAGE_X, PAGE_Y, SPACE_BLOCK, SPACE_GROUP, SPACE_INLINE, SPACE_SECTION,
-        Style, alpha, blend, page_width, queue_text,
+        PAGE_X, PAGE_Y, Palette, SPACE_BLOCK, SPACE_GROUP, SPACE_INLINE,
+        SPACE_SECTION, Style, alpha, blend, page_width, queue_text,
     },
 };
 
@@ -56,14 +56,60 @@ fn forecast_text_size(bar_width: f32) -> f32 {
     if bar_width < 20.0 { 9.0 } else { 12.0 }
 }
 
-/// Counts need four characters at most; hide them before they can crowd the
-/// weekday label on a narrow chart.
-fn forecast_value_label(count: Option<usize>, bar_width: f32) -> String {
-    if bar_width < 32.0 {
-        String::new()
-    } else {
-        count.map_or_else(|| String::from("-"), |value| value.to_string())
+/// Compact count for a narrow forecast bar. Rounding keeps small labels short
+/// without dropping a count close to a million.
+fn compact_forecast_value(value: usize) -> String {
+    if value >= 1_000_000 {
+        let millions = (value.saturating_add(500_000) / 1_000_000).min(99);
+        return format!("{millions}m");
     }
+    let thousands = value.saturating_add(500) / 1_000;
+    if thousands >= 1_000 {
+        return String::from("1m");
+    }
+    format!("{thousands}k")
+}
+
+/// Counts stay visible on narrow charts; zeros stay quiet to reduce noise.
+fn forecast_value_label(count: Option<usize>, bar_width: f32) -> String {
+    match count {
+        None => String::from("-"),
+        Some(value) if bar_width < 32.0 && value > 0 => {
+            if value < 1_000 {
+                value.to_string()
+            } else {
+                compact_forecast_value(value)
+            }
+        }
+        Some(_) if bar_width < 32.0 => String::new(),
+        Some(value) => value.to_string(),
+    }
+}
+
+const EMPTY_CHART_COPY: &str = "Review a card to see your activity";
+
+fn empty_chart(colors: Palette) -> Div {
+    div()
+        .flex_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .min_h(px(150.))
+        .text_size(px(14.))
+        .text_color(colors.subtext)
+        .child(EMPTY_CHART_COPY)
+}
+
+fn charts_are_empty(stats: &Statistics, due: &[usize]) -> bool {
+    stats.total_reviews == 0 && due.iter().all(|&count| count == 0)
+}
+
+fn activity_summary(total_days: usize, total: usize, peak: usize) -> String {
+    format!("{total_days} days, {total} reviews, max {peak}/day")
+}
+
+fn hover_caption(day: i64, collection_start: i64) -> String {
+    format!("{}, day {day}", weekday(day, collection_start))
 }
 
 /// One day of the review heatmap, oldest first.
@@ -291,9 +337,10 @@ fn build_statistics_impl(
 }
 
 impl Root {
-    pub(crate) fn render_statistics(
+    pub(crate) fn render_statistics_with_error(
         &self,
         window: &Window,
+        error: Option<&str>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let width =
@@ -302,6 +349,7 @@ impl Root {
         let style = Style::new(colors, self.theme());
         let stats = &self.statistics;
         let totals = self.leaf_totals;
+        let empty = error.is_none() && charts_are_empty(stats, &self.forecast);
         div()
             .size_full()
             .flex()
@@ -318,8 +366,8 @@ impl Root {
                     .font_weight(gpui::FontWeight::BOLD)
                     .child("Statistics"),
             )
-            .child(self.render_activity(stats, style, width, cx))
-            .child(self.render_history(stats, style, width))
+            .child(self.render_activity(stats, style, width, error, empty, cx))
+            .child(self.render_history(stats, style, width, empty))
             .child(Self::render_card_counts(totals, style))
     }
 
@@ -328,6 +376,8 @@ impl Root {
         stats: &Statistics,
         style: Style,
         width: f32,
+        error: Option<&str>,
+        empty: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let (cell_size, gap) = heatmap_geometry(width);
@@ -493,6 +543,8 @@ impl Root {
         let hovered = self
             .heatmap_hover
             .and_then(|day| stats.days.iter().find(|entry| entry.day == day));
+        let caption =
+            hovered.map(|day| hover_caption(day.day, collection_start));
         let accuracy = hovered
             .map_or_else(
                 || stats.accuracy_percent(),
@@ -540,22 +592,67 @@ impl Root {
                                 div()
                                     .text_size(px(12.))
                                     .text_color(colors.subtext)
-                                    .child(format!(
-                                        "{HEATMAP_DAYS} days · {total} reviews"
+                                    .child(activity_summary(
+                                        HEATMAP_DAYS,
+                                        total,
+                                        peak,
                                     )),
                             )
                             .child(legend),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .min_w(px(0.))
-                    .justify_center()
-                    .gap(px(SPACE_GROUP))
-                    .child(labels)
-                    .child(columns),
-            )
+            .child({
+                if let Some(error) = error {
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .min_h(px(150.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap(px(SPACE_GROUP))
+                                .child(
+                                    div()
+                                        .text_size(px(14.))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(colors.red)
+                                        .child("Could not load review history"),
+                                )
+                                .child(
+                                    div()
+                                        .max_w(px(360.))
+                                        .text_size(px(12.))
+                                        .text_color(colors.subtext)
+                                        .child(error.to_owned()),
+                                )
+                                .child(action_button(
+                                    "statistics-retry",
+                                    "Retry",
+                                    ButtonTone::Primary,
+                                    style,
+                                    self.action_click(
+                                        UiAction::RetryStatistics,
+                                    ),
+                                )),
+                        )
+                        .into_any_element()
+                } else if empty {
+                    empty_chart(colors).into_any_element()
+                } else {
+                    div()
+                        .flex()
+                        .min_w(px(0.))
+                        .justify_center()
+                        .gap(px(SPACE_GROUP))
+                        .child(labels)
+                        .child(columns)
+                        .into_any_element()
+                }
+            })
             .child(
                 div()
                     .flex()
@@ -564,12 +661,20 @@ impl Root {
                     .border_t_1()
                     .border_color(colors.surface1)
                     .pt(px(SPACE_BLOCK))
+                    .children(caption.map(|label| {
+                        div()
+                            .w_full()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(colors.text)
+                            .child(label)
+                    }))
                     .child(metric(
                         "Accuracy",
                         div()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(accuracy),
-                        colors.green,
+                        queue_text(2, style.theme),
                     ))
                     .child(metric(
                         "Time spent learning",
@@ -597,9 +702,11 @@ impl Root {
         stats: &Statistics,
         style: Style,
         width: f32,
+        empty: bool,
     ) -> impl IntoElement {
         let (bar_width, gap) = forecast_geometry(width);
         let colors = style.colors;
+        let due_text = queue_text(2, style.theme);
         let collection_start = self.collection_start;
         let days = forecast_days(stats, &self.forecast);
         let peak = days
@@ -675,7 +782,7 @@ impl Root {
                             .text_color(if index == DAYS - 1 {
                                 colors.mauve
                             } else if index == DAYS {
-                                colors.green
+                                due_text
                             } else {
                                 colors.subtext
                             })
@@ -731,12 +838,16 @@ impl Root {
                             .items_center()
                             .gap(px(SPACE_GROUP))
                             .text_size(px(12.))
-                            .text_color(colors.subtext)
+                            .text_color(due_text)
                             .child(crate::components::dot(colors.green, 8.))
                             .child("Due, next 7 days"),
                     ),
             )
-            .child(bars.h(px(150.)))
+            .child(if empty {
+                empty_chart(colors).into_any_element()
+            } else {
+                bars.h(px(150.)).into_any_element()
+            })
     }
 
     fn render_card_counts(
@@ -802,15 +913,19 @@ impl Root {
 
 #[cfg(test)]
 mod tests {
+
+    use gpui::Rgba;
     use ranki_model::{Rating, RevLog, RevLogKind};
 
     use super::{
-        DAYS, ForecastDay, HEATMAP_COLUMNS, HEATMAP_DAYS, HEATMAP_LABEL_WIDTH,
-        PANEL_PADDING, SPACE_GROUP, build_statistics, calendar_week,
-        day_number, forecast_days, forecast_geometry, forecast_text_size,
-        forecast_value_label, heatmap_geometry, heatmap_start, weekday,
-        weekday_index,
+        DAYS, EMPTY_CHART_COPY, ForecastDay, HEATMAP_COLUMNS, HEATMAP_DAYS,
+        HEATMAP_LABEL_WIDTH, PANEL_PADDING, SPACE_GROUP, Statistics,
+        activity_summary, build_statistics, calendar_week, charts_are_empty,
+        compact_forecast_value, day_number, forecast_days, forecast_geometry,
+        forecast_text_size, forecast_value_label, heatmap_geometry,
+        heatmap_start, hover_caption, weekday, weekday_index,
     };
+    use crate::theme::{Theme, palette, queue_text};
 
     #[test]
     fn charts_fit_narrow_pages() {
@@ -831,9 +946,10 @@ mod tests {
 
             let label = forecast_value_label(Some(5555), bar);
             let size = forecast_text_size(bar);
+            let pitch = bar + gap;
             assert!(
-                label.chars().count() as f32 * size * 0.6 <= bar,
-                "forecast label overflows {width}px bar"
+                label.chars().count() as f32 * size * 0.6 <= pitch,
+                "forecast label overlaps at {width}px"
             );
         }
     }
@@ -1054,5 +1170,91 @@ mod tests {
         let upcoming: Vec<_> = days[7..].iter().map(|day| day.day).collect();
         assert_eq!(upcoming, [6, 7, 8, 9, 10, 11, 12]);
         assert!(days[7..].iter().all(|day| day.due.is_none()));
+    }
+
+    #[test]
+    fn narrow_forecast_bars_keep_nonzero_values_legible() {
+        for width in [292.0, 320.0, 408.0, 504.0] {
+            let (bar, gap) = forecast_geometry(width);
+            assert!(
+                (10.0..32.0).contains(&bar),
+                "expected a compact bar at {width}px, got {bar}"
+            );
+            let pitch = bar + gap;
+            let size = forecast_text_size(bar);
+            for value in [1, 42, 999, 5_555, 999_999] {
+                let label = forecast_value_label(Some(value), bar);
+                assert!(!label.is_empty(), "value hidden at {width}px");
+                assert!(label.chars().count() <= 3, "label too long: {label}");
+                assert!(
+                    label.chars().count() as f32 * size * 0.6 <= pitch,
+                    "labels overlap at {width}px"
+                );
+            }
+        }
+        assert_eq!(compact_forecast_value(5_555), "6k");
+        assert_eq!(compact_forecast_value(999_499), "999k");
+        assert_eq!(compact_forecast_value(999_999), "1m");
+        assert_eq!(forecast_value_label(Some(0), 12.0), "");
+        assert_eq!(forecast_value_label(None, 12.0), "-");
+    }
+
+    #[test]
+    fn empty_charts_wait_for_a_review_or_due_card() {
+        let stats = Statistics::default();
+        assert!(charts_are_empty(&stats, &[0; DAYS]));
+        assert!(charts_are_empty(&stats, &[]));
+        let mut reviewed = stats.clone();
+        reviewed.total_reviews = 1;
+        assert!(!charts_are_empty(&reviewed, &[0; DAYS]));
+        assert!(!charts_are_empty(&stats, &[0, 1, 0, 0, 0, 0, 0]));
+        assert_eq!(EMPTY_CHART_COPY, "Review a card to see your activity");
+    }
+
+    #[test]
+    fn hover_caption_names_the_weekday_and_day() {
+        assert_eq!(hover_caption(162, START + 86_400), "Thu, day 162");
+        assert_eq!(hover_caption(0, START), "Tue, day 0");
+    }
+
+    #[test]
+    fn activity_header_explains_the_heatmap_scale() {
+        assert_eq!(
+            activity_summary(HEATMAP_DAYS, 42, 7),
+            format!("{HEATMAP_DAYS} days, 42 reviews, max 7/day")
+        );
+    }
+
+    #[test]
+    fn light_chart_text_does_not_use_raw_green() {
+        let light = palette(Theme::Light);
+        let ink = queue_text(2, Theme::Light);
+        assert_eq!(ink, light.text);
+        assert_ne!(ink, light.green);
+        assert_eq!(queue_text(2, Theme::Dark), palette(Theme::Dark).green);
+        assert!(contrast(ink, light.mantle) >= 4.5);
+        assert!(contrast(light.green, light.mantle) < 4.5);
+    }
+
+    fn luminance(color: Rgba) -> f32 {
+        let linear = |channel: f32| {
+            if channel <= 0.040_45 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r)
+            + 0.7152 * linear(color.g)
+            + 0.0722 * linear(color.b)
+    }
+
+    fn contrast(a: Rgba, b: Rgba) -> f32 {
+        let (first, second) = if luminance(a) >= luminance(b) {
+            (luminance(a), luminance(b))
+        } else {
+            (luminance(b), luminance(a))
+        };
+        (first + 0.05) / (second + 0.05)
     }
 }

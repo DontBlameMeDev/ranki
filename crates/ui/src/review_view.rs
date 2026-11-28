@@ -1,8 +1,9 @@
 //! Learning screen: header, fixed card stage, reveal and rating controls.
 
 use gpui::{
-    ClickEvent, Context, InteractiveElement, IntoElement, ParentElement, Rgba,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+    ClickEvent, Context, FocusHandle, InteractiveElement, IntoElement,
+    ParentElement, Rgba, SharedString, StatefulInteractiveElement, Styled,
+    Window, div, px,
 };
 use ranki_model::{CardType, Note, NoteModel};
 
@@ -23,13 +24,66 @@ use crate::{
     },
 };
 
+fn review_button_handle(
+    root: &Root,
+    cx: &Context<Root>,
+    index: usize,
+) -> FocusHandle {
+    let mut handles = root.review_button_focus.borrow_mut();
+    while handles.len() <= index {
+        handles.push(cx.focus_handle());
+    }
+    handles
+        .get(index)
+        .cloned()
+        .unwrap_or_else(|| cx.focus_handle())
+}
+
+const NARROW_REVIEW_WIDTH: f32 = 400.0;
+const COMPACT_RATING_CELL_HEIGHT: f32 = BUTTON_HEIGHT;
+
+fn compact_review(viewport_width: f32) -> bool {
+    viewport_width < NARROW_REVIEW_WIDTH
+}
+
+fn rating_control_height(viewport_width: f32) -> f32 {
+    if compact_review(viewport_width) {
+        2.0 * COMPACT_RATING_CELL_HEIGHT + RATING_GAP
+    } else {
+        CONTROL_HEIGHT
+    }
+}
+
+/// Leaves equal room for the end button and queue counts, so the centered
+/// progress block stays centered when the counts disappear.
+fn balanced_progress_width(viewport_width: f32) -> f32 {
+    PROGRESS_WIDTH.min(viewport_width - 480.0).max(80.0)
+}
 impl Root {
     pub(crate) fn render_review(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let colors = self.colors();
+        if self.review_answer_scroll_pending
+            && self.review.phase == Phase::Answer
+            && self.review.current.is_some()
+        {
+            if let Some(anchor) = self.review_answer_anchor.as_ref() {
+                anchor.scroll_to(window, cx);
+            }
+            // Test draws do not run GPUI frame callbacks, so mirror the
+            // anchor's origin and apply the same scroll during the draw.
+            if let Some(origin) = self.review_answer_origin.get() {
+                let viewport = self.review_stage_scroll.bounds();
+                self.review_stage_scroll
+                    .set_offset(viewport.origin - origin);
+                self.review_answer_scroll_pending = false;
+            } else {
+                cx.notify();
+            }
+        }
         let style = self.style();
         let theme = self.theme();
         let session = queue_counts(
@@ -44,12 +98,13 @@ impl Root {
         let card_width = stage_width(viewport_width);
         let text_width = (card_width - 2.0 * STAGE_PADDING).max(0.0);
         let topbar_compact = viewport_width < NAV_AUTO_COMPACT_WIDTH;
-        let progress_width =
-            PROGRESS_WIDTH.min(viewport_width - 240.0).max(80.0);
+        let compact = compact_review(viewport_width);
+        let progress_width = balanced_progress_width(viewport_width);
+        let control_height = rating_control_height(viewport_width);
         let stage_height = (viewport_height
             - TOPBAR_HEIGHT
             - FOOTER_HEIGHT
-            - CONTROL_HEIGHT
+            - control_height
             - 48.0
             - 18.0)
             .clamp(220.0, STAGE_HEIGHT);
@@ -74,6 +129,7 @@ impl Root {
         };
         let note = self.review.note.as_ref();
         let answered = self.review.answered;
+        let animation_seq = self.review.animation_seq;
         let load_errors = self.review.load_errors;
         let load_error = self.review.load_error.clone();
         let again = self.review.again_count;
@@ -98,7 +154,9 @@ impl Root {
             .then(|| reading_label(&self.models, note))
             .flatten();
         let reveal = self.action_click(UiAction::Reveal);
+        let reveal_focus = review_button_handle(self, cx, 1);
         let end = self.action_click(UiAction::EndSession);
+        let end_focus = review_button_handle(self, cx, 0);
         let queue_count = |name: &str,
                            value: usize,
                            color: Rgba,
@@ -174,60 +232,79 @@ impl Root {
                 .flex_none()
                 .flex()
                 .items_center()
-                .justify_between()
                 .px(px(SPACE_GUTTER))
                 .child(
-                    div()
-                        .id("review-end")
-                        .flex()
-                        .items_center()
-                        .gap(px(SPACE_GROUP))
-                        .h(px(40.))
-                        .px(px(SPACE_RELATED))
-                        .rounded(px(12.))
-                        .bg(colors.surface0)
-                        .text_size(px(14.))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .cursor_pointer()
-                        .focusable()
-                        .border_1()
-                        .border_color(alpha(colors.text, 0.0))
-                        .hover(move |row| row.bg(colors.surface1))
-                        .active(move |row| row.bg(alpha(colors.text, 0.08)))
-                        .focus(move |row| row.border_color(colors.mauve))
-                        .on_click(end)
-                        .child(icon("icon-arrow-left", 18., colors.text))
-                        .child("End session")
-                        .child(keycap("Esc", colors, false)),
+                    div().flex_1().min_w(px(0.)).justify_start().child(
+                        div()
+                            .id("review-end")
+                            .flex()
+                            .items_center()
+                            .gap(px(SPACE_GROUP))
+                            .h(px(40.))
+                            .px(px(SPACE_RELATED))
+                            .rounded(px(12.))
+                            .bg(colors.surface0)
+                            .text_size(px(14.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .cursor_pointer()
+                            .focusable()
+                            .track_focus(&end_focus)
+                            .key_context("ranki_button")
+                            .border_1()
+                            .border_color(alpha(colors.text, 0.0))
+                            .hover(move |row| row.bg(colors.surface1))
+                            .active(move |row| row.bg(alpha(colors.text, 0.08)))
+                            .focus(move |row| row.border_color(colors.mauve))
+                            .on_click(end)
+                            .child(icon("icon-arrow-left", 18., colors.text))
+                            .children(
+                                (!compact).then(|| div().child("End session")),
+                            )
+                            .children(
+                                (!compact)
+                                    .then(|| keycap("Esc", colors, false)),
+                            ),
+                    ),
+                )
+                .child(
+                    div().flex_none().child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(SPACE_INLINE))
+                            .child(
+                                div()
+                                    .max_w(px(progress_width))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(14.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(deck_name),
+                            )
+                            .child(progress_bar(
+                                from,
+                                fraction,
+                                colors,
+                                progress_width,
+                                progress_ms,
+                                SharedString::from(format!(
+                                    "progress-{answered}-{animation_seq}"
+                                )),
+                            )),
+                    ),
                 )
                 .child(
                     div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap(px(SPACE_INLINE))
-                        .child(
-                            div()
-                                .max_w(px(progress_width))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_size(px(14.))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child(deck_name),
-                        )
-                        .child(progress_bar(
-                            from,
-                            fraction,
-                            colors,
-                            progress_width,
-                            progress_ms,
-                            ("progress", answered),
-                        )),
-                )
-                .children(queue_counts),
+                        .flex_1()
+                        .min_w(px(0.))
+                        .justify_end()
+                        .children(queue_counts),
+                ),
         );
 
+        let skipped = (load_errors > 0).then(|| skipped_copy(load_errors));
         let load_failure = load_error.or_else(|| {
             (load_errors > 0).then(|| {
                 format!(
@@ -236,6 +313,7 @@ impl Root {
             })
         });
         let body = if current.is_none()
+            && answered == 0
             && let Some(message) = load_failure
         {
             let retry = self.action_click(UiAction::StudyAgain);
@@ -275,12 +353,14 @@ impl Root {
                                     "Back to decks",
                                     colors,
                                     false,
+                                    None,
                                     back,
                                 ))
                                 .child(footer_button(
                                     "Try again",
                                     colors,
                                     true,
+                                    None,
                                     retry,
                                 )),
                         )
@@ -339,6 +419,12 @@ impl Root {
                                     colors,
                                 )),
                         )
+                        .children(skipped.map(|text| {
+                            div()
+                                .text_size(px(14.))
+                                .text_color(colors.subtext)
+                                .child(text)
+                        }))
                         .children(more_due.then(|| {
                             div()
                                 .text_size(px(14.))
@@ -353,6 +439,7 @@ impl Root {
                                     "Back to decks",
                                     colors,
                                     !more_due,
+                                    Some(BACK_HINT),
                                     back,
                                 ))
                                 .children(more_due.then(|| {
@@ -360,6 +447,7 @@ impl Root {
                                         "Study again",
                                         colors,
                                         true,
+                                        Some(STUDY_HINT),
                                         practice,
                                     )
                                 })),
@@ -393,6 +481,7 @@ impl Root {
                             "Back to decks",
                             colors,
                             true,
+                            None,
                             self.action_click(UiAction::EndSession),
                         ))
                         .into_any_element(),
@@ -535,9 +624,21 @@ impl Root {
                 }
                 let key = current
                     .map_or(0, |card| usize::try_from(card.id).unwrap_or(0));
+                let origin = self.review_answer_origin.clone();
+                let answer_track = div()
+                    .on_children_prepainted(move |bounds, window, _| {
+                        if let Some(child) = bounds.first() {
+                            origin.set(Some(
+                                child.origin - window.element_offset(),
+                            ));
+                        }
+                    })
+                    .id("review-answer-anchor")
+                    .anchor_scroll(self.review_answer_anchor.clone())
+                    .child(answer_group);
                 content = content.child(fade_in(
-                    answer_group,
-                    ("answer", key),
+                    answer_track,
+                    SharedString::from(format!("answer-{key}-{animation_seq}")),
                     quick,
                 ));
             }
@@ -554,7 +655,11 @@ impl Root {
                 .items_center()
                 .justify_center()
                 .gap(px(SPACE_SECTION))
-                .child(fade_in(stage, ("stage", key), quick))
+                .child(fade_in(
+                    stage,
+                    SharedString::from(format!("stage-{key}-{animation_seq}")),
+                    quick,
+                ))
                 .child(if phase == Phase::Question {
                     div()
                         .id("review-reveal")
@@ -571,6 +676,8 @@ impl Root {
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .cursor_pointer()
                         .focusable()
+                        .track_focus(&reveal_focus)
+                        .key_context("ranki_button")
                         .border_1()
                         .border_color(alpha(colors.text, 0.0))
                         .hover(move |button| button.bg(accent_hover(theme)))
@@ -581,7 +688,7 @@ impl Root {
                         .child(keycap("Space", colors, true))
                         .into_any_element()
                 } else {
-                    rating_row(card_width, colors, &previews, cx)
+                    rating_row(card_width, colors, &previews, self, compact, cx)
                         .into_any_element()
                 })
                 .into_any_element()
@@ -605,7 +712,7 @@ impl Root {
                         .gap(px(SPACE_INLINE))
                         .child(footer_action(
                             "Undo",
-                            "Ctrl Z",
+                            (!compact).then_some("Ctrl Z"),
                             Some("icon-undo"),
                             colors,
                             can_undo,
@@ -613,17 +720,18 @@ impl Root {
                         ))
                         .child(footer_action(
                             "Shortcuts",
-                            "?",
+                            (!compact).then_some("?"),
                             None,
                             colors,
                             true,
                             help,
                         )),
                 )
+                .children(self.render_review_sync())
                 .child(div().flex().gap(px(SPACE_INLINE)).child(
                     footer_action(
                         "Add card",
-                        "A",
+                        (!compact).then_some("A"),
                         Some("icon-plus"),
                         colors,
                         true,
@@ -706,6 +814,18 @@ fn stage_text_sizes(
     (question_size, answer_size)
 }
 
+const BACK_HINT: &str = "Space / Esc";
+const STUDY_HINT: &str = "S";
+
+/// Note under a completed summary when some cards could not be loaded.
+fn skipped_copy(load_errors: usize) -> String {
+    if load_errors == 1 {
+        String::from("1 card was skipped.")
+    } else {
+        format!("{load_errors} cards were skipped.")
+    }
+}
+
 /// Headline for a finished session, sized by what actually happened.
 fn summary_title(answered: usize) -> String {
     match answered {
@@ -782,13 +902,29 @@ fn rating_row(
     card_width: f32,
     colors: crate::theme::Palette,
     previews: &[i32; 4],
+    root: &Root,
+    compact: bool,
     cx: &Context<Root>,
 ) -> gpui::Div {
+    let cell_height = if compact {
+        COMPACT_RATING_CELL_HEIGHT
+    } else {
+        CONTROL_HEIGHT
+    };
+    let grid_height = if compact {
+        2.0 * cell_height + RATING_GAP
+    } else {
+        CONTROL_HEIGHT
+    };
+    let cell_width = (card_width - RATING_GAP).max(0.0) / 2.0;
     let mut row = div()
         .w(px(card_width))
-        .h(px(CONTROL_HEIGHT))
+        .h(px(grid_height))
         .flex()
         .gap(px(RATING_GAP));
+    if compact {
+        row = row.flex_wrap();
+    }
     for (index, (rating, interval)) in [
         (ranki_model::Rating::Again, previews[0]),
         (ranki_model::Rating::Hard, previews[1]),
@@ -807,60 +943,65 @@ fn rating_row(
         let hover_border = alpha(hue, 0.6);
         let press_fill = alpha(hue, 0.3);
         let press_border = alpha(hue, 0.8);
-        row = row.child(
-            div()
-                .id(SharedString::from(format!("review-rating-{code}")))
-                .flex_1()
-                .h(px(CONTROL_HEIGHT))
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap(px(SPACE_INLINE))
-                .rounded(px(18.))
-                .bg(alpha(hue, 0.14))
-                .border_1()
-                .border_color(alpha(hue, 0.4))
-                .cursor_pointer()
-                .focusable()
-                .hover(move |button| {
-                    button.bg(hover_fill).border_color(hover_border)
-                })
-                .active(move |button| {
-                    button.bg(press_fill).border_color(press_border)
-                })
-                .focus(move |button| button.border_color(hue))
-                .on_click(cx.listener(
-                    move |this, _: &ClickEvent, window, cx| {
-                        this.dispatch(action.clone(), window, cx);
-                    },
-                ))
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(colors.text)
-                        .child(interval_label(interval)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(SPACE_GROUP))
-                        .text_size(px(16.))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(label_color)
-                        .child(rating_name(rating))
-                        .child(
-                            div()
-                                .px(px(SPACE_GROUP))
-                                .py(px(SPACE_INLINE))
-                                .rounded(px(6.))
-                                .bg(alpha(hue, 0.2))
-                                .text_size(px(11.))
-                                .child(format!("{}", index + 1)),
-                        ),
-                ),
-        );
+        let focus = review_button_handle(root, cx, index + 2).tab_stop(true);
+        let mut grade = div()
+            .id(SharedString::from(format!("review-rating-{code}")))
+            .debug_selector(move || format!("review-rating-{code}"))
+            .h(px(cell_height))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(SPACE_INLINE))
+            .rounded(px(18.))
+            .bg(alpha(hue, 0.14))
+            .border_1()
+            .border_color(alpha(hue, 0.4))
+            .cursor_pointer()
+            .focusable()
+            .track_focus(&focus)
+            .key_context("ranki_button")
+            .hover(move |button| {
+                button.bg(hover_fill).border_color(hover_border)
+            })
+            .active(move |button| {
+                button.bg(press_fill).border_color(press_border)
+            })
+            .focus(move |button| button.border_color(hue))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.dispatch(action.clone(), window, cx);
+            }))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(colors.text)
+                    .child(interval_label(interval)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(SPACE_GROUP))
+                    .text_size(px(16.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(label_color)
+                    .child(rating_name(rating))
+                    .child(
+                        div()
+                            .px(px(SPACE_GROUP))
+                            .py(px(SPACE_INLINE))
+                            .rounded(px(6.))
+                            .bg(alpha(hue, 0.2))
+                            .text_size(px(11.))
+                            .child(format!("{}", index + 1)),
+                    ),
+            );
+        if compact {
+            grade = grade.w(px(cell_width)).flex_none();
+        } else {
+            grade = grade.flex_1();
+        }
+        row = row.child(grade);
     }
     row
 }
@@ -877,7 +1018,7 @@ fn theme_from(colors: crate::theme::Palette) -> crate::theme::Theme {
 /// reason through their label, so a dead control never looks live.
 fn footer_action(
     label: &'static str,
-    key: &'static str,
+    key: Option<&'static str>,
     icon_name: Option<&'static str>,
     colors: crate::theme::Palette,
     enabled: bool,
@@ -888,19 +1029,26 @@ fn footer_action(
     } else {
         alpha(colors.subtext, 0.4)
     };
+    let tight = key.is_none();
+    let gap = if tight { SPACE_INLINE } else { SPACE_GROUP };
+    let padding = if tight { SPACE_INLINE } else { SPACE_RELATED };
     let mut row = div()
         .id(SharedString::from(format!("footer-{label}")))
+        .key_context("ranki_button")
         .flex()
         .items_center()
-        .gap(px(SPACE_GROUP))
+        .gap(px(gap))
         .h(px(36.))
-        .px(px(SPACE_RELATED))
+        .px(px(padding))
         .rounded(px(10.))
         .text_size(px(13.))
         .text_color(ink)
         .children(icon_name.map(|name| icon(name, 16., ink)))
         .child(label.to_owned())
-        .children(enabled.then(|| keycap(key.to_owned(), colors, false)));
+        .children(
+            key.filter(|_| enabled)
+                .map(|key| keycap(key.to_owned(), colors, false)),
+        );
     if enabled {
         row = Interaction::surface(colors)
             .apply(row.cursor_pointer())
@@ -914,6 +1062,7 @@ fn footer_button(
     label: &'static str,
     colors: crate::theme::Palette,
     primary: bool,
+    key: Option<&'static str>,
     on_click: ClickHandler,
 ) -> impl IntoElement {
     let theme = theme_from(colors);
@@ -950,6 +1099,7 @@ fn footer_button(
     .apply(
         div()
             .id(SharedString::from(format!("summary-{label}")))
+            .key_context("ranki_button")
             .flex()
             .items_center()
             .justify_center()
@@ -964,6 +1114,7 @@ fn footer_button(
     )
     .on_click(on_click)
     .child(label)
+    .children(key.map(|key| keycap(key, colors, primary)))
 }
 
 #[cfg(test)]
@@ -1116,10 +1267,42 @@ mod tests {
 
     #[test]
     fn short_viewports_leave_room_for_grading_controls() {
-        let stage = (600.0_f32 - 72.0 - 64.0 - 76.0 - 48.0 - 18.0)
-            .clamp(220.0, crate::theme::STAGE_HEIGHT);
-        assert!(stage <= 322.0);
-        assert!(stage + 72.0 + 64.0 + 76.0 + 48.0 + 18.0 <= 600.0);
+        for width in [320.0, 400.0, 720.0] {
+            let stage = (600.0_f32
+                - 72.0
+                - 64.0
+                - super::rating_control_height(width)
+                - 48.0
+                - 18.0)
+                .clamp(220.0, crate::theme::STAGE_HEIGHT);
+            assert!(
+                stage
+                    + 72.0
+                    + 64.0
+                    + super::rating_control_height(width)
+                    + 48.0
+                    + 18.0
+                    <= 600.0
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_review_uses_a_two_row_rating_grid() {
+        assert!(super::compact_review(320.0));
+        assert!(!super::compact_review(400.0));
+        assert_eq!(super::rating_control_height(320.0), 100.0);
+        assert_eq!(super::rating_control_height(400.0), 76.0);
+    }
+
+    #[test]
+    fn progress_keeps_equal_slots_at_both_breakpoints() {
+        let wide = super::balanced_progress_width(900.0);
+        let narrow = super::balanced_progress_width(720.0);
+        assert_eq!(wide, 420.0);
+        assert_eq!(narrow, 240.0);
+        assert!(900.0 - 2.0 * 32.0 - wide >= 180.0 * 2.0);
+        assert!(720.0 - 2.0 * 32.0 - narrow >= 180.0 * 2.0);
     }
 
     #[test]
@@ -1136,5 +1319,16 @@ mod tests {
         assert_eq!(super::summary_title(0), "Nothing due");
         assert_eq!(super::summary_title(1), "One card reviewed");
         assert_eq!(super::summary_title(12), "12 cards reviewed");
+    }
+    #[test]
+    fn skipped_copy_counts_the_cards_that_failed_to_load() {
+        assert_eq!(super::skipped_copy(1), "1 card was skipped.");
+        assert_eq!(super::skipped_copy(3), "3 cards were skipped.");
+    }
+
+    #[test]
+    fn summary_badges_name_the_available_keys() {
+        assert_eq!(super::BACK_HINT, "Space / Esc");
+        assert_eq!(super::STUDY_HINT, "S");
     }
 }

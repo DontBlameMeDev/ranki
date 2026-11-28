@@ -1,9 +1,11 @@
 //! Root application state, keyboard dispatcher, and store-backed actions.
 
 use std::{
+    cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -11,7 +13,7 @@ use std::{
 use gpui::{
     App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable,
     KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, PathPromptOptions,
-    Pixels, Point, Render, ScrollHandle, SharedString, Window,
+    Pixels, Point, Render, ScrollAnchor, ScrollHandle, SharedString, Window,
     WindowAppearance, div, point, prelude::*, px,
 };
 use ranki_core::{FsrsScheduler, from_settings};
@@ -45,6 +47,7 @@ pub const DEBOUNCE: Duration = Duration::from_millis(120);
 pub const FORECAST_DAYS: usize = 7;
 const TOAST_LIFETIME: Duration = Duration::from_secs(5);
 const MAX_REVIEW_TIME: Duration = Duration::from_secs(60);
+pub const DECK_SUMMARY_LABEL: &str = "Due today (all decks)";
 const TAG_SUGGESTION_LIMIT: usize = 6;
 
 mod actions;
@@ -66,11 +69,9 @@ impl View {
     const fn key_context(self) -> &'static str {
         match self {
             Self::Review => "ranki ranki_review",
-            Self::Decks
-            | Self::Browse
-            | Self::AddCard
-            | Self::Settings
-            | Self::Statistics => "ranki",
+            Self::Decks => "ranki ranki_decks",
+            Self::Browse => "ranki ranki_browse",
+            Self::AddCard | Self::Settings | Self::Statistics => "ranki",
         }
     }
 }
@@ -192,6 +193,8 @@ pub struct SyncUiState {
     pub conflict: Option<String>,
     /// Failure from the last attempt, kept on screen after the toast fades.
     pub error: Option<String>,
+    /// Cached timestamp from the sync state file, read once at startup.
+    pub last_success: Option<i64>,
 }
 impl SyncUiState {
     pub(crate) const fn busy(&self) -> bool {
@@ -581,6 +584,10 @@ pub struct ReviewState {
     /// Last grade this session, cleared once it is undone or replaced.
     pub last_grade: Option<UndoEntry>,
     pub previews: [i32; 4],
+    /// Monotonic key for stage and progress animations, including undo.
+    pub animation_seq: u64,
+    /// Session-end sync must be repeated after an undo rewrites the log.
+    pub session_dirty: bool,
     /// Step delays from the current card's deck preset.
     pub steps: DeckSteps,
     pub more_due: bool,
@@ -612,6 +619,8 @@ pub struct Root {
     pub(crate) statistics_next_day_at: i64,
     /// Ignores background refreshes started before the latest click.
     pub(crate) statistics_generation: u64,
+    /// Failure from the last statistics build, kept on screen until a retry.
+    pub(crate) statistics_error: Option<String>,
     /// Anki day shown in the heatmap's hover details.
     pub(crate) heatmap_hover: Option<i64>,
     pub(crate) deck_rows: Vec<DeckRow>,
@@ -641,6 +650,9 @@ pub struct Root {
     pub(crate) help_open: bool,
     pub(crate) dev_reveal: bool,
     pub(crate) external_change: bool,
+    pub(crate) import_running: bool,
+    pub(crate) browse_ready: bool,
+    pub(crate) statistics_ready: bool,
     pub(crate) collection_modified: i64,
     pub(crate) collection_start: i64,
     pub(crate) decks_scroll: SmoothScroll,
@@ -651,6 +663,11 @@ pub struct Root {
     pub(crate) browse_scroll: ScrollHandle,
     pub(crate) browse_detail_scroll: ScrollHandle,
     pub(crate) review_stage_scroll: ScrollHandle,
+    /// `ScrollAnchor` for the answer group inside the review stage.
+    pub(crate) review_answer_anchor: Option<ScrollAnchor>,
+    /// Unscrolled origin of the answer group, mirrored from its prepaint.
+    pub(crate) review_answer_origin: Rc<Cell<Option<Point<Pixels>>>>,
+    pub(crate) review_answer_scroll_pending: bool,
     pub(crate) scrollbar_drag: Option<ScrollbarDrag>,
     pub(crate) scrollbar_layouts: BTreeMap<&'static str, (Bounds<Pixels>, f32)>,
     pub(crate) browse_smooth: SmoothScroll,
@@ -660,6 +677,7 @@ pub struct Root {
     pub(crate) save_settings: SettingsSaver,
     pub(crate) images: Entity<card_view::LruImageCache>,
     pub(crate) font_family: &'static str,
+    pub(crate) review_button_focus: RefCell<Vec<FocusHandle>>,
     pub(crate) last_change_check: Instant,
     pub(crate) nav_width: f32,
     pub(crate) nav_drag: Option<NavDrag>,
@@ -1129,6 +1147,7 @@ impl Root {
             statistics_modified: 0,
             statistics_next_day_at: 0,
             statistics_generation: 0,
+            statistics_error: None,
             heatmap_hover: None,
             deck_rows: Vec::new(),
             deck_rows_rev: 0,
@@ -1144,6 +1163,7 @@ impl Root {
                 entries: Vec::new(),
                 rows: HashMap::new(),
                 expanded: HashSet::new(),
+                last_query: None,
                 selected: None,
                 error: None,
                 generation: 0,
@@ -1191,6 +1211,9 @@ impl Root {
             dev_reveal: env::var("RANKI_UI_DEV_REVEAL")
                 .is_ok_and(|value| value == "1"),
             external_change: false,
+            import_running: false,
+            browse_ready: false,
+            statistics_ready: false,
             collection_modified: 0,
             collection_start: 0,
             decks_scroll: SmoothScroll::new(),
@@ -1201,6 +1224,9 @@ impl Root {
             browse_scroll: browse_scroll.clone(),
             browse_detail_scroll: ScrollHandle::new(),
             review_stage_scroll: ScrollHandle::new(),
+            review_answer_anchor: None,
+            review_answer_origin: Rc::new(Cell::new(None)),
+            review_answer_scroll_pending: false,
             scrollbar_drag: None,
             scrollbar_layouts: BTreeMap::new(),
             browse_smooth: SmoothScroll::with_handle(browse_scroll),
@@ -1212,16 +1238,24 @@ impl Root {
                 media: None,
                 conflict: None,
                 error: None,
+                last_success: sync_state
+                    .as_ref()
+                    .and_then(|state| state.last_success),
             },
             sync_run: Arc::new(crate::sync_view::run_sync),
             media_run: Arc::new(crate::sync_view::run_media),
             save_settings,
             images: card_view::LruImageCache::new(cx),
+            review_button_focus: RefCell::new(Vec::new()),
             last_change_check: Instant::now(),
             nav_width: theme::NAV_WIDTH,
             nav_drag: None,
             font_family: theme::ui_font_family(),
         };
+        root.review_answer_anchor =
+            Some(ScrollAnchor::for_handle(root.review_stage_scroll.clone()));
+        root.view = saved.view.into();
+        root.previous_view = saved.previous_view.into();
         root.reload(cx);
         root.nav_width = theme::nav_width(
             saved
@@ -1235,8 +1269,6 @@ impl Root {
             .filter(|path| !path.is_empty())
             .collect();
         root.rebuild_deck_rows();
-        root.view = saved.view.into();
-        root.previous_view = saved.previous_view.into();
         root.review.scope_all = saved.review_all_decks;
         if let Some(id) = saved.selected_deck {
             root.selected = root
@@ -1251,7 +1283,10 @@ impl Root {
         root.browse
             .search
             .update(cx, |field, cx| field.seed(saved.browse_query, cx));
-        root.refresh_browse(cx);
+        if root.view == View::Browse {
+            root.refresh_browse(cx);
+            root.browse_ready = true;
+        }
         if let (Ok(deck_name), Ok(path)) = (
             env::var("RANKI_UI_DEV_EXPORT_DECK"),
             env::var("RANKI_UI_DEV_EXPORT_PATH"),
@@ -1351,12 +1386,17 @@ impl Root {
         }
         match env::var("RANKI_UI_DEV_VIEW").as_deref() {
             Ok("decks") => root.view = View::Decks,
-            Ok("statistics") => root.view = View::Statistics,
+            Ok("statistics") => {
+                root.view = View::Statistics;
+                root.schedule_statistics_refresh(cx);
+                root.statistics_ready = true;
+            }
             Ok("add") => root.view = View::AddCard,
             Ok("settings") => root.view = View::Settings,
             Ok("browse") => {
                 root.view = View::Browse;
                 root.refresh_browse(cx);
+                root.browse_ready = true;
             }
             _ => {}
         }
@@ -1369,6 +1409,7 @@ impl Root {
                     field.seed(query.to_owned(), cx);
                 });
                 root.refresh_browse(cx);
+                root.browse_ready = true;
                 if expand != "0" {
                     root.browse.expanded =
                         browse_expand_paths(&root.browse.hits);
@@ -1377,10 +1418,12 @@ impl Root {
             }
             if let Ok(paths) = env::var("RANKI_UI_DEV_OPEN_BROWSE_GROUP") {
                 root.view = View::Browse;
+                root.refresh_browse(cx);
                 for path in paths.split('|').filter(|path| !path.is_empty()) {
                     let _ = root.browse.expanded.insert(path.to_owned());
                 }
                 root.rebuild_browse_entries();
+                root.browse_ready = true;
             }
         }
         match env::var("RANKI_UI_DEV_VIEW").as_deref() {
@@ -1641,10 +1684,10 @@ impl Root {
         if env::var("RANKI_UI_DEV_SAVE").is_ok_and(|value| value == "1") {
             root.view = View::AddCard;
             let weak = cx.entity().downgrade();
-            cx.defer(move |cx| {
+            window.defer(cx, move |window, cx| {
                 let _ = weak.update(cx, |root, cx| {
                     root.view = View::AddCard;
-                    root.save_note(cx);
+                    root.save_note(window, cx);
                 });
             });
         }
@@ -1713,6 +1756,9 @@ impl Root {
             app.defer(move |app| {
                 let _ = weak.update(app, |root, cx| {
                     root.sync_tags(cx);
+                    if root.view == View::AddCard {
+                        root.add.errors.clear();
+                    }
                     root.add.tag_suggestion = 0;
                     root.add.tag_suggestions_dismissed = false;
                     cx.notify();
@@ -1772,7 +1818,12 @@ impl Root {
         Arc::new(move |app| {
             let weak = weak.clone();
             app.defer(move |app| {
-                let _ = weak.update(app, |_, cx| cx.notify());
+                let _ = weak.update(app, |root, cx| {
+                    if root.view == View::AddCard {
+                        root.add.errors.clear();
+                    }
+                    cx.notify();
+                });
             });
         })
     }
@@ -1842,6 +1893,19 @@ impl Root {
         self.persist_state(cx);
     }
 
+    pub(crate) fn set_reduce_motion(
+        &mut self,
+        choice: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.options.reduce_motion == choice {
+            return;
+        }
+        self.options.reduce_motion = choice;
+        cx.notify();
+        self.persist_state(cx);
+    }
+
     pub(crate) fn now() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1858,11 +1922,12 @@ impl Root {
         self.last_change_check = Instant::now();
     }
 
-    fn poll_external_change(&mut self, cx: &mut Context<Self>) {
-        if self.external_change
-            || self.last_change_check.elapsed() < Duration::from_secs(1)
-        {
-            return;
+    fn poll_external_change(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.external_change {
+            return true;
+        }
+        if self.last_change_check.elapsed() < Duration::from_secs(1) {
+            return false;
         }
         self.last_change_check = Instant::now();
         if self
@@ -1871,8 +1936,14 @@ impl Root {
             .is_ok_and(|stamp| stamp != self.collection_modified)
         {
             self.external_change = true;
+            self.show_toast(
+                ToastKind::Error,
+                "Collection changed outside Ranki. Reload before grading, undoing, or saving notes.",
+                cx,
+            );
             cx.notify();
         }
+        self.external_change
     }
 
     pub(crate) fn start_external_change_poll(cx: &mut Context<Self>) {
@@ -1888,16 +1959,39 @@ impl Root {
     }
 
     pub(crate) fn reload_collection(&mut self, cx: &mut Context<Self>) {
+        self.deck_edit = None;
+        if self.import_running {
+            self.show_toast(
+                ToastKind::Error,
+                "Import in progress. Wait for it to finish before reloading.",
+                cx,
+            );
+            return;
+        }
         self.review = ReviewState::default();
         self.view = View::Decks;
         self.previous_view = View::Decks;
         self.add.deck_picker = false;
         self.add.color_picker = None;
+        self.images.update(cx, |cache, _| cache.forget_failed());
         self.reload(cx);
+        self.statistics_ready = false;
+        self.browse_ready = false;
         self.persist_state(cx);
     }
 
     fn request_reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.import_running {
+            self.show_toast(
+                ToastKind::Error,
+                "Import in progress. Wait for it to finish before reloading.",
+                cx,
+            );
+            return;
+        }
+        if self.confirmation.is_some() {
+            return;
+        }
         if self.review.current.is_some() || self.review.answered > 0 {
             self.confirmation = Some(Confirmation::Reload);
             window.focus(&self.dialog_focus);
@@ -1907,6 +2001,7 @@ impl Root {
         cx.notify();
     }
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
+        self.heatmap_hover = None;
         let selected_id = self
             .selected
             .and_then(|index| self.decks.get(index))
@@ -1963,7 +2058,6 @@ impl Root {
         }
         self.refresh_stats();
         self.collection_start = self.store.collection_created().unwrap_or(0);
-        self.refresh_statistics(cx);
         self.collection_modified =
             self.store.collection_modified().unwrap_or(0);
         self.refresh_statistics(cx);
@@ -2056,16 +2150,11 @@ impl Root {
                 self.statistics = build_statistics_timed(&history, &timing);
                 self.statistics_modified = modified;
                 self.statistics_next_day_at = timing.next_day_at;
+                self.statistics_error = None;
             }
             Err(error) => {
-                self.statistics = build_statistics_timed(&[], &timing);
-                self.statistics_modified = 0;
-                self.statistics_next_day_at = 0;
-                self.show_toast(
-                    ToastKind::Error,
-                    format!("Could not load review history: {error}"),
-                    cx,
-                );
+                self.statistics_error = Some(error.to_string());
+                cx.notify();
             }
         }
     }
@@ -2075,10 +2164,14 @@ impl Root {
     /// Reading a large review log can take hundreds of milliseconds, so the
     /// click only switches views. A separate store reads the log on a
     /// background thread and closes the file between calls.
-    fn schedule_statistics_refresh(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn schedule_statistics_refresh(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
         let timing = self.timing(Self::now());
         let modified = self.store.collection_modified().unwrap_or(0);
-        if modified == self.statistics_modified
+        if self.statistics_error.is_none()
+            && modified == self.statistics_modified
             && timing.next_day_at == self.statistics_next_day_at
         {
             return;
@@ -2106,13 +2199,13 @@ impl Root {
                         root.statistics = statistics;
                         root.statistics_modified = modified;
                         root.statistics_next_day_at = timing.next_day_at;
+                        root.statistics_error = None;
                         cx.notify();
                     }
-                    Err(error) => root.show_toast(
-                        ToastKind::Error,
-                        format!("Could not load review history: {error}"),
-                        cx,
-                    ),
+                    Err(error) => {
+                        root.statistics_error = Some(error.to_string());
+                        cx.notify();
+                    }
                 }
             });
         })
@@ -2168,6 +2261,17 @@ impl Root {
 
     pub(crate) fn clear_toast(&mut self) {
         self.toast = None;
+    }
+
+    /// Clears a toast only when the message still belongs to this task.
+    pub(crate) fn clear_toast_if(&mut self, seq: Option<u64>) {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| Some(toast.seq) == seq)
+        {
+            self.toast = None;
+        }
     }
 
     /// Errors from the create-deck dialog belong next to its input, not in a
@@ -2275,6 +2379,20 @@ impl Root {
             .deck_id
             .and_then(|id| self.decks.iter().position(|deck| deck.id == id))
     }
+
+    /// Deck indices currently visible in the add-card picker.
+    pub(crate) fn add_deck_matches(&self, cx: &Context<Self>) -> Vec<usize> {
+        let query = self.add.deck_filter.read(cx).text();
+        let needle = query.trim().to_lowercase();
+        self.decks
+            .iter()
+            .enumerate()
+            .filter(|(_, deck)| {
+                needle.is_empty() || contains_lowercase(&deck.name, &needle)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
     pub(crate) fn select_add_deck(
         &mut self,
         index: usize,
@@ -2352,10 +2470,21 @@ impl Root {
     /// Opens a picker for `.apkg` and `.colpkg` files, then imports the choice.
     pub(crate) fn import_deck(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
+            let seq = this
+                .update(cx, |root, cx| {
+                    root.show_toast(
+                        ToastKind::Success,
+                        "Importing package...",
+                        cx,
+                    );
+                    root.toast.as_ref().map(|toast| toast.seq)
+                })
+                .ok()
+                .flatten();
             let chosen = choose_import_path(cx).await;
             let _ = this.update(cx, |root, cx| match chosen {
                 Ok(Some(path)) => root.import_path(path, cx),
-                Ok(None) => {}
+                Ok(None) => root.clear_toast_if(seq),
                 Err(error) => root.show_toast(
                     ToastKind::Error,
                     format!("Could not choose package: {error}"),
@@ -2372,6 +2501,14 @@ impl Root {
         path: PathBuf,
         cx: &mut Context<Self>,
     ) {
+        if self.import_running {
+            self.show_toast(
+                ToastKind::Error,
+                "An import is already running. Wait for it to finish.",
+                cx,
+            );
+            return;
+        }
         if !is_anki_package(&path) {
             self.show_toast(
                 ToastKind::Error,
@@ -2386,25 +2523,30 @@ impl Root {
         let import = cx.background_executor().spawn(async move {
             ranki_format::import_apkg(&path, &collection, &media_dir)
         });
+        self.import_running = true;
+        self.show_toast(ToastKind::Success, format!("Importing {name}..."), cx);
         cx.spawn(async move |this, cx| {
             let result = import.await;
-            let _ = this.update(cx, |root, cx| match result {
-                Ok(report) => {
-                    root.reload_collection(cx);
-                    root.show_toast(
-                        ToastKind::Success,
-                        format!(
-                            "Imported {} notes, {} cards, {} media from {name}",
-                            report.notes, report.cards, report.media
-                        ),
+            let _ = this.update(cx, |root, cx| {
+                root.import_running = false;
+                match result {
+                    Ok(report) => {
+                        root.reload_collection(cx);
+                        root.show_toast(
+                            ToastKind::Success,
+                            format!(
+                                "Imported {} notes, {} cards, {} media from {name}",
+                                report.notes, report.cards, report.media
+                            ),
+                            cx,
+                        );
+                    }
+                    Err(error) => root.show_toast(
+                        ToastKind::Error,
+                        format!("Could not import {name}: {error}"),
                         cx,
-                    );
+                    ),
                 }
-                Err(error) => root.show_toast(
-                    ToastKind::Error,
-                    format!("Could not import {name}: {error}"),
-                    cx,
-                ),
             });
         })
         .detach();
@@ -2441,6 +2583,12 @@ impl Root {
         let media_dir = self.options.paths.media_dir.clone();
         let deck_id = deck.id;
         let deck_name = deck.name.clone();
+        self.show_toast(
+            ToastKind::Success,
+            format!("Exporting {deck_name}..."),
+            cx,
+        );
+        let seq = self.toast.as_ref().map(|toast| toast.seq);
         let suggested = Self::export_file_name(&deck.name);
         let directory = collection
             .parent()
@@ -2450,7 +2598,13 @@ impl Root {
         cx.spawn(async move |this, cx| {
             let chosen = match receiver.await {
                 Ok(Ok(Some(path))) => path,
-                Ok(Ok(None)) => return,
+                Ok(Ok(None)) => {
+                    let _ = this.update(cx, |root, cx| {
+                        root.clear_toast_if(seq);
+                        cx.notify();
+                    });
+                    return;
+                }
                 Ok(Err(error)) => {
                     let _ = this.update(cx, |root, cx| {
                         root.show_toast(
@@ -2472,12 +2626,16 @@ impl Root {
                     return;
                 }
             };
-            let result = ranki_format::export_deck_apkg(
-                &collection,
-                &media_dir,
-                &chosen,
-                deck_id,
-            );
+            let export_path = chosen.clone();
+            let export = cx.background_executor().spawn(async move {
+                ranki_format::export_deck_apkg(
+                    &collection,
+                    &media_dir,
+                    &export_path,
+                    deck_id,
+                )
+            });
+            let result = export.await;
             let _ = this.update(cx, |root, cx| match result {
                 Ok(()) => root.show_toast(
                     ToastKind::Success,
@@ -2621,6 +2779,36 @@ impl Root {
         cx.notify();
     }
 
+    /// Adds a default mask without requiring a pointer drag.
+    pub(crate) fn add_default_occlusion_mask(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self.add.occlusion.masks.len();
+        self.add_occlusion_mask(occlusion::default_mask(index), cx);
+    }
+
+    /// Removes one mask from its explicit remove control.
+    pub(crate) fn remove_occlusion_mask(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.add.occlusion.remove_mask(index) {
+            let _ = self.add.errors.remove("masks");
+            cx.notify();
+        }
+    }
+
+    /// Keyboard counterpart of the remove control on the newest mask.
+    pub(crate) fn remove_last_occlusion_mask(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self.add.occlusion.masks.len().saturating_sub(1);
+        self.remove_occlusion_mask(index, cx);
+    }
+
     /// Records the drawing area so pointer positions can be normalized.
     pub(crate) fn set_occlusion_bounds(
         &mut self,
@@ -2698,6 +2886,7 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.deck_edit = None;
         if let Some(deck) = self.decks.get(index) {
             window.focus(&self.focus);
             self.selected = Some(index);
@@ -2731,6 +2920,7 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.deck_edit = None;
         window.focus(&self.focus);
         self.review = ReviewState::default();
         self.review.scope_all = true;
@@ -2819,8 +3009,6 @@ impl Root {
         self.view == View::Review
             && self.review.current.is_none()
             && self.review.answered > 0
-            && self.review.load_errors == 0
-            && self.review.load_error.is_none()
     }
 
     pub(crate) fn end_session(&mut self, cx: &mut Context<Self>) {
@@ -2828,6 +3016,7 @@ impl Root {
         self.review.pending.clear();
         self.review.current = None;
         self.review.last_grade = None;
+        self.review.session_dirty = false;
         self.review.phase = Phase::Question;
         self.view = View::Decks;
         self.refresh_stats();
@@ -2959,7 +3148,7 @@ impl Root {
         let Some(note) = self.store.note(card.note_id).ok().flatten() else {
             self.show_toast(
                 ToastKind::Error,
-                format!("Card {} has no readable note", card.id),
+                "This card's note cannot be read. Refresh the collection.",
                 cx,
             );
             return None;
@@ -2969,7 +3158,7 @@ impl Root {
         else {
             self.show_toast(
                 ToastKind::Error,
-                format!("Card {} has no note type", card.id),
+                "This card's note type is missing. Refresh the collection.",
                 cx,
             );
             return None;
@@ -3020,6 +3209,20 @@ impl Root {
         })
     }
 
+    fn reset_review_scroll(&mut self) {
+        self.review_stage_scroll = ScrollHandle::new();
+        self.review_answer_anchor =
+            Some(ScrollAnchor::for_handle(self.review_stage_scroll.clone()));
+        self.review_answer_origin.set(None);
+        self.review_answer_scroll_pending = false;
+    }
+
+    /// Ask the next frames to bring the answer's top into view.
+    fn request_answer_scroll(&mut self) {
+        self.review_answer_origin.set(None);
+        self.review_answer_scroll_pending = true;
+    }
+
     /// Puts a prepared card on the stage and restarts its timers.
     fn apply_loaded(
         &mut self,
@@ -3027,7 +3230,7 @@ impl Root {
         loaded: LoadedCard,
         _cx: &mut Context<Self>,
     ) {
-        self.review_stage_scroll = ScrollHandle::new();
+        self.reset_review_scroll();
         self.review.phase = if self.dev_reveal {
             Phase::Answer
         } else {
@@ -3041,10 +3244,12 @@ impl Root {
         self.review.occlusion_image = loaded.occlusion_image;
         self.review.occlusion_image_size = loaded.occlusion_image_size;
         self.review.last_tick = Some(Instant::now());
-        self.review.last_grade_at = Some(Instant::now());
         self.review.steps =
             self.store.deck_steps(card.deck_id).unwrap_or_default();
         self.refresh_previews();
+        if self.dev_reveal {
+            self.request_answer_scroll();
+        }
     }
 
     pub(crate) fn reveal(&mut self, cx: &mut Context<Self>) {
@@ -3055,7 +3260,7 @@ impl Root {
             Phase::Question => {
                 self.review.phase = Phase::Answer;
                 self.review.last_tick = Some(Instant::now());
-                self.review_stage_scroll.scroll_to_bottom();
+                self.request_answer_scroll();
                 cx.notify();
             }
             Phase::Answer => self.grade(ranki_model::Rating::Good, cx),
@@ -3072,9 +3277,9 @@ impl Root {
             Phase::Answer => Phase::Question,
         };
         if revealing {
-            self.review_stage_scroll.scroll_to_bottom();
+            self.request_answer_scroll();
         } else {
-            self.review_stage_scroll = ScrollHandle::new();
+            self.reset_review_scroll();
         }
         self.review.last_tick = Some(Instant::now());
         cx.notify();
@@ -3108,8 +3313,6 @@ impl Root {
         let Some(current) = self.review.current.clone() else {
             return;
         };
-        let card =
-            refreshed_card(&current, |id| self.store.card(id).ok().flatten());
         let now = Instant::now();
         if self
             .review
@@ -3118,6 +3321,8 @@ impl Root {
         {
             return;
         }
+        let card =
+            refreshed_card(&current, |id| self.store.card(id).ok().flatten());
         let max_taken = self.store.max_taken_secs(card.deck_id).unwrap_or(60);
         let scheduler = self
             .scheduler
@@ -3137,15 +3342,19 @@ impl Root {
         ) else {
             self.show_toast(
                 ToastKind::Error,
-                format!("Card {} is not due", card.id),
+                "This card is no longer due. Refresh the collection.",
                 cx,
             );
+            self.review.phase = Phase::Question;
+            self.reset_review_scroll();
             cx.notify();
             return;
         };
         let decision: ReviewDecision = decision;
         let before_progress = self.progress_fraction();
-        self.poll_external_change(cx);
+        if self.poll_external_change(cx) {
+            return;
+        }
         let log_id = match self.store.apply_review(&decision) {
             Ok(id) => id,
             Err(error) => {
@@ -3159,6 +3368,7 @@ impl Root {
             }
         };
 
+        self.review.animation_seq = self.review.animation_seq.wrapping_add(1);
         self.record_local_write();
         self.review.answered = self.review.answered.saturating_add(1);
         if rating == Rating::Again {
@@ -3194,6 +3404,7 @@ impl Root {
         self.ensure_current(cx);
         cx.notify();
         if self.session_complete() {
+            self.review.session_dirty = true;
             self.sync_after_session(cx);
         }
     }
@@ -3202,6 +3413,28 @@ impl Root {
     /// queue. Repeats stay pending, so they leave the bar unchanged.
     pub(crate) fn progress_fraction(&self) -> f32 {
         session_progress(self.review.completed, self.review.session_total)
+    }
+
+    /// Repeats the session sync after undo rewrites what it may have uploaded.
+    fn repeat_session_sync(&mut self, cx: &mut Context<Self>) {
+        if !self.sync.busy() {
+            self.sync_after_session(cx);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                match this.update(cx, |root, _| !root.sync.busy()) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(_) => return,
+                }
+            }
+            let _ = this.update(cx, Self::sync_after_session);
+        })
+        .detach();
     }
 
     /// Reverses the last grade in this session: the review log is deleted, the
@@ -3214,7 +3447,9 @@ impl Root {
         let Some(entry) = self.review.last_grade.clone() else {
             return;
         };
-        self.poll_external_change(cx);
+        if self.poll_external_change(cx) {
+            return;
+        }
         match self.store.undo_review(&entry.card, entry.revlog_id) {
             Ok(false) => {
                 self.review.last_grade = None;
@@ -3226,8 +3461,13 @@ impl Root {
                 cx.notify();
             }
             Ok(true) => {
+                self.record_local_write();
                 let before = self.progress_fraction();
                 self.review.last_grade = None;
+                if self.review.session_dirty {
+                    self.review.session_dirty = false;
+                    self.repeat_session_sync(cx);
+                }
                 self.review.answered = self.review.answered.saturating_sub(1);
                 if entry.rating == Rating::Again {
                     self.review.again_count =
@@ -3267,9 +3507,10 @@ impl Root {
                 let Some(loaded) = self.render_state(&restored, cx) else {
                     return;
                 };
+                self.review.animation_seq =
+                    self.review.animation_seq.wrapping_add(1);
                 self.apply_loaded(&restored, loaded, cx);
                 self.review.last_grade_at = None;
-                self.record_local_write();
                 self.review.focused_elapsed = entry.spent;
                 self.review.studied =
                     self.review.studied.saturating_sub(entry.spent);
@@ -3288,26 +3529,35 @@ impl Root {
     }
 
     pub(crate) fn confirm(&mut self, cx: &mut Context<Self>) {
-        match self.confirmation.take() {
-            Some(Confirmation::RemoveDeck { id, .. }) => {
-                match self.store.remove_deck(id) {
+        self.deck_edit = None;
+        let Some(confirmation) = self.confirmation.take() else {
+            return;
+        };
+        match &confirmation {
+            Confirmation::RemoveDeck { id, .. } => {
+                match self.store.remove_deck(*id) {
                     Ok(()) => {
                         self.show_toast(ToastKind::Success, "Deck removed", cx);
                         self.reload(cx);
                     }
-                    Err(error) => self.show_toast(
-                        ToastKind::Error,
-                        format!("Could not remove deck: {error}"),
-                        cx,
-                    ),
+                    Err(error) => {
+                        self.confirmation = Some(confirmation.clone());
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not remove deck: {error}"),
+                            cx,
+                        );
+                    }
                 }
             }
-            Some(Confirmation::RemoveCard { id, .. }) => {
-                match self.store.remove_card(id) {
+            Confirmation::RemoveCard { id, .. } => {
+                match self.store.remove_card(*id) {
                     Ok(()) => {
                         self.clear_toast();
-                        self.forget_card(id, cx);
-                        if self.card_edit.is_some_and(|edit| edit.card_id == id)
+                        self.forget_card(*id, cx);
+                        if self
+                            .card_edit
+                            .is_some_and(|edit| edit.card_id == *id)
                         {
                             self.discard_card_edit(cx);
                         }
@@ -3318,15 +3568,17 @@ impl Root {
                         self.refresh_known_tags();
                         self.show_toast(ToastKind::Success, "Card removed", cx);
                     }
-                    Err(error) => self.show_toast(
-                        ToastKind::Error,
-                        format!("Could not remove card: {error}"),
-                        cx,
-                    ),
+                    Err(error) => {
+                        self.confirmation = Some(confirmation.clone());
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not remove card: {error}"),
+                            cx,
+                        );
+                    }
                 }
             }
-            Some(Confirmation::Reload) => self.reload_collection(cx),
-            None => {}
+            Confirmation::Reload => self.reload_collection(cx),
         }
         cx.notify();
     }
@@ -3336,6 +3588,7 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.deck_edit = None;
         self.create_field.update(cx, TextField::clear);
         self.create_error = None;
         self.create_modal = true;
@@ -3364,6 +3617,10 @@ impl Root {
                 self.create_modal = false;
                 self.clear_toast();
                 self.reload(cx);
+                self.selected =
+                    self.decks.iter().position(|item| item.id == deck.id);
+                self.add.deck_id = Some(deck.id);
+                self.show_toast(ToastKind::Success, "Deck created", cx);
                 self.persist_state(cx);
                 window.focus(&self.focus);
             }
@@ -3388,14 +3645,25 @@ impl Root {
         cx.notify();
     }
 
-    pub(crate) fn start_rename(&mut self, deck: &Deck, cx: &mut Context<Self>) {
+    pub(crate) fn start_rename(
+        &mut self,
+        deck: &Deck,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.deck_edit = Some(DeckEdit { id: deck.id });
         self.rename_field
             .update(cx, |field, cx| field.set_text(deck.name.clone(), cx));
+        self.rename_field.update(cx, TextField::select_all);
+        window.focus(self.rename_field.read(cx).focus_handle());
         cx.notify();
     }
 
-    pub(crate) fn apply_rename(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn apply_rename(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(edit) = self.deck_edit.clone() else {
             return;
         };
@@ -3405,11 +3673,22 @@ impl Root {
             cx.notify();
             return;
         }
+        let old_name = self
+            .decks
+            .iter()
+            .find(|deck| deck.id == edit.id)
+            .map(|deck| deck.name.clone());
         match self.store.rename_deck(edit.id, &name) {
             Ok(_) => {
                 self.deck_edit = None;
+                if let Some(old) = old_name.as_deref() {
+                    self.rename_expanded_paths(old, &name);
+                }
                 self.clear_toast();
                 self.reload(cx);
+                self.show_toast(ToastKind::Success, "Deck renamed", cx);
+                self.persist_state(cx);
+                window.focus(&self.focus);
             }
             Err(error) => {
                 self.show_toast(
@@ -3419,6 +3698,24 @@ impl Root {
                 );
             }
         }
+    }
+
+    fn rename_expanded_paths(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        let prefix = format!("{old}::");
+        let mut renamed = HashSet::with_capacity(self.expanded.len());
+        for path in self.expanded.drain() {
+            if path == old {
+                let _ = renamed.insert(new.to_owned());
+            } else if let Some(rest) = path.strip_prefix(&prefix) {
+                let _ = renamed.insert(format!("{new}::{rest}"));
+            } else {
+                let _ = renamed.insert(path);
+            }
+        }
+        self.expanded = renamed;
     }
 
     /// Drops the edit draft and restores the empty add-card form.
@@ -3530,7 +3827,50 @@ impl Root {
         }
     }
 
-    pub(crate) fn save_note(&mut self, cx: &mut Context<Self>) {
+    /// Brings the first invalid control into view and focuses it.
+    fn reveal_first_invalid(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.add_scroll.set_offset(point(px(0.), px(0.)));
+        let field = if let Some(key) =
+            self.add.errors.keys().find(|key| key.starts_with("field:"))
+        {
+            key.strip_prefix("field:")
+                .and_then(|index| index.parse::<usize>().ok())
+        } else if self.add.errors.contains_key("fields")
+            || self.add.errors.contains_key("model")
+        {
+            Some(0)
+        } else if self.add.errors.contains_key("occlusion")
+            || self.add.errors.contains_key("masks")
+        {
+            Some(2)
+        } else {
+            None
+        };
+        if let Some(index) = field
+            && let Some(handle) = self.add.fields.get(index)
+        {
+            let handle = handle.read(cx).focus_handle().clone();
+            window.focus(&handle);
+            return;
+        }
+        if self.add.errors.contains_key("deck") {
+            self.add.deck_picker = true;
+            let filter = self.add.deck_filter.read(cx).focus_handle().clone();
+            window.focus(&filter);
+            return;
+        }
+        window.focus(&self.focus);
+    }
+
+    pub(crate) fn save_note(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.view != View::AddCard {
             return;
         }
@@ -3541,6 +3881,7 @@ impl Root {
             self.add
                 .errors
                 .insert("deck".into(), "Choose a deck first".into());
+            self.reveal_first_invalid(window, cx);
             cx.notify();
             return;
         };
@@ -3548,6 +3889,7 @@ impl Root {
             self.add
                 .errors
                 .insert("model".into(), "Choose a note type first".into());
+            self.reveal_first_invalid(window, cx);
             cx.notify();
             return;
         };
@@ -3578,11 +3920,14 @@ impl Root {
         };
         self.add.errors = errors;
         if !self.add.errors.is_empty() {
+            self.reveal_first_invalid(window, cx);
             cx.notify();
             return;
         }
         let edit = self.card_edit;
-        self.poll_external_change(cx);
+        if self.poll_external_change(cx) {
+            return;
+        }
         if let Some(edit) = edit {
             let mut saved = match self.store.note(edit.note_id) {
                 Ok(Some(note)) => note,
@@ -3648,22 +3993,39 @@ impl Root {
                         field.seed("", cx);
                     });
                     self.add.errors.clear();
+                    self.add.tag_chips.clear();
                     self.refresh_stats();
                     self.add.occlusion = OcclusionState::default();
                     self.record_local_write();
                     self.refresh_known_tags();
                     self.show_toast(
                         ToastKind::Success,
-                        format!("Added {count} cards"),
+                        format!(
+                            "Added {count} {}",
+                            if count == 1 { "card" } else { "cards" }
+                        ),
                         cx,
                     );
                 }
                 Err(error) => {
-                    self.show_toast(
-                        ToastKind::Error,
-                        format!("Could not add note: {error}"),
-                        cx,
-                    );
+                    if matches!(
+                        &error,
+                        ranki_model::StoreError::InvalidData(message)
+                            if message.eq_ignore_ascii_case("duplicate")
+                    ) {
+                        self.add.errors.insert(
+                            "field:0".into(),
+                            "A note with this first field already exists"
+                                .into(),
+                        );
+                        self.reveal_first_invalid(window, cx);
+                    } else {
+                        self.show_toast(
+                            ToastKind::Error,
+                            format!("Could not add note: {error}"),
+                            cx,
+                        );
+                    }
                 }
             }
         }
@@ -3698,6 +4060,7 @@ impl Root {
         if !self.expanded.remove(&path) {
             let _ = self.expanded.insert(path);
         }
+        self.deck_menu = None;
         self.rebuild_deck_rows();
         cx.notify();
         self.persist_state(cx);
@@ -3718,6 +4081,19 @@ impl Root {
         self.review.last_tick = Some(now);
     }
 
+    /// A graded card unmounts its rating button; keep keys on the app.
+    fn restore_review_focus(&self, window: &mut Window) {
+        if self.view == View::Review
+            && self
+                .review_button_focus
+                .borrow()
+                .iter()
+                .any(|handle| handle.is_focused(window))
+        {
+            window.focus(&self.focus);
+        }
+    }
+
     pub(crate) fn dispatch(
         &mut self,
         action: UiAction,
@@ -3734,30 +4110,57 @@ impl Root {
             cx.notify();
         }
         let had_dialog = self.confirmation.is_some();
+        // A focused review button handles Enter and Space itself. The root
+        // reveal must not run a second action for the same keystroke.
+        let button_focused = self
+            .review_button_focus
+            .borrow()
+            .iter()
+            .any(|handle| handle.is_focused(window));
         match action {
-            UiAction::Reveal => self.reveal(cx),
+            UiAction::Reveal => {
+                if !button_focused {
+                    self.reveal(cx);
+                }
+            }
             UiAction::Space => {
-                if self.view == View::Review
+                let caught_up = self.view == View::Review
                     && self.review.current.is_none()
-                    && self.review.load_errors == 0
-                    && self.review.load_error.is_none()
+                    && (self.session_complete()
+                        || (self.review.answered == 0
+                            && self.review.load_errors == 0
+                            && self.review.load_error.is_none()));
+                if !button_focused
+                    && caught_up
                     && self
                         .review
                         .last_grade_at
                         .is_none_or(|last| last.elapsed() >= DEBOUNCE)
                 {
                     self.end_session(cx);
-                } else {
+                } else if !button_focused {
                     self.reveal(cx);
                 }
             }
-            UiAction::Grade(Rating::Again) => self.grade(Rating::Again, cx),
-            UiAction::Grade(Rating::Hard) => self.grade(Rating::Hard, cx),
-            UiAction::Grade(Rating::Good) => self.grade(Rating::Good, cx),
-            UiAction::Grade(Rating::Easy) => self.grade(Rating::Easy, cx),
-            UiAction::Retry => self.toggle_reveal(cx),
+            UiAction::Grade(rating) => {
+                self.grade(rating, cx);
+                self.restore_review_focus(window);
+            }
+            UiAction::Retry => {
+                self.toggle_reveal(cx);
+                self.restore_review_focus(window);
+            }
             UiAction::Reload => self.request_reload(window, cx),
-            UiAction::Undo => self.undo_grade(cx),
+            UiAction::RetryStatistics => {
+                if self.view == View::Statistics {
+                    self.schedule_statistics_refresh(cx);
+                    cx.notify();
+                }
+            }
+            UiAction::Undo => {
+                self.undo_grade(cx);
+                self.restore_review_focus(window);
+            }
             UiAction::StudyAgain => {
                 if self.view == View::Review
                     && self.review.current.is_none()
@@ -3769,16 +4172,7 @@ impl Root {
                 }
             }
             UiAction::EndSession => {
-                if self.view == View::Review {
-                    self.end_session(cx);
-                } else if self.view == View::AddCard
-                    && (self.add.deck_picker || self.add.color_picker.is_some())
-                {
-                    self.add.deck_picker = false;
-                    window.focus(&self.focus);
-                    self.close_color_picker(window, cx);
-                    cx.notify();
-                } else if self.confirmation.is_some()
+                if self.confirmation.is_some()
                     || self.help_open
                     || self.create_modal
                 {
@@ -3788,30 +4182,54 @@ impl Root {
                         self.cancel_create(window, cx);
                     }
                     cx.notify();
+                } else if self.view == View::Review {
+                    self.end_session(cx);
+                } else if self.view == View::AddCard
+                    && (self.add.deck_picker || self.add.color_picker.is_some())
+                {
+                    self.add.deck_picker = false;
+                    window.focus(&self.focus);
+                    self.close_color_picker(window, cx);
+                    cx.notify();
+                } else if self.view == View::AddCard
+                    && (self.add.tag_suggestions_dismissed
+                        || self.tag_suggestions(cx).is_empty())
+                {
+                    self.dispatch(UiAction::CancelAdd, window, cx);
+                } else if self.deck_edit.take().is_some() {
+                    window.focus(&self.focus);
+                    cx.notify();
                 }
             }
             UiAction::OpenDecks => {
+                self.deck_edit = None;
                 self.view = next_view(self.view, View::Decks);
                 self.refresh_stats();
                 window.focus(&self.focus);
                 cx.notify();
             }
             UiAction::OpenStatistics => {
+                self.deck_edit = None;
                 self.view = next_view(self.view, View::Statistics);
+                self.heatmap_hover = None;
                 self.refresh_stats();
                 self.schedule_statistics_refresh(cx);
+                self.statistics_ready = true;
                 cx.notify();
             }
             UiAction::OpenBrowse => {
+                self.deck_edit = None;
                 self.view = View::Browse;
                 let field = self.browse.search.clone();
                 self.refresh_browse(cx);
+                self.browse_ready = true;
                 cx.notify();
                 window.defer(cx, move |window, cx| {
                     window.focus(field.read(cx).focus_handle());
                 });
             }
             UiAction::OpenAdd => {
+                self.deck_edit = None;
                 self.discard_card_edit(cx);
                 if self.view != View::AddCard {
                     if let Some(deck) =
@@ -3827,25 +4245,53 @@ impl Root {
                 self.add.errors.clear();
                 window.focus(&self.focus);
                 cx.notify();
+                let first = if self
+                    .models
+                    .get(self.add.model_index)
+                    .is_some_and(NoteModel::is_image_occlusion)
+                {
+                    2
+                } else {
+                    0
+                };
+                let field = self.add.fields.get(first).cloned();
+                window.defer(cx, move |window, cx| {
+                    if let Some(field) = field {
+                        window.focus(field.read(cx).focus_handle());
+                    }
+                });
             }
             UiAction::OpenSettings => {
+                self.deck_edit = None;
                 self.view = next_view(self.view, View::Settings);
                 window.focus(&self.settings_focus);
                 cx.notify();
             }
             UiAction::SetTheme(choice) => {
+                self.set_theme(choice, cx);
+            }
+            UiAction::SetReduceMotion(choice) => {
                 if self.view == View::Settings {
                     window.focus(&self.settings_focus);
                 }
-                self.set_theme(choice, cx);
+                self.set_reduce_motion(choice, cx);
             }
             UiAction::CreateDeck => self.open_create_modal(window, cx),
             UiAction::SubmitDeck => {
                 if self.create_modal {
                     self.create_deck(window, cx);
+                } else if self.view == View::AddCard
+                    && self.add.deck_picker
+                    && let Some(index) =
+                        self.add_deck_matches(cx).into_iter().next()
+                {
+                    self.select_add_deck(index, cx);
+                    window.focus(&self.focus);
+                } else if self.view == View::Decks && self.deck_edit.is_some() {
+                    self.apply_rename(window, cx);
                 }
             }
-            UiAction::SaveNote => self.save_note(cx),
+            UiAction::SaveNote => self.save_note(window, cx),
             UiAction::CancelAdd => {
                 self.discard_card_edit(cx);
                 self.view = next_view(self.view, self.previous_view);
@@ -3857,19 +4303,31 @@ impl Root {
                 cx.notify();
             }
             UiAction::Confirm => {
-                if self.create_modal {
-                    self.create_deck(window, cx);
-                } else {
+                if self.confirmation.is_some() {
                     self.confirm(cx);
+                } else if self.create_modal {
+                    self.create_deck(window, cx);
                 }
             }
             UiAction::CancelDialog => {
                 self.confirmation = None;
                 self.close_color_picker(window, cx);
+                let leaving_rename = self.deck_edit.take().is_some();
+                if self.help_open {
+                    self.help_open = false;
+                    let focus = self.focus.clone();
+                    window.focus(&focus);
+                    cx.defer_in(window, move |_, window, _| {
+                        window.focus(&focus);
+                    });
+                }
                 if self.create_modal {
                     self.cancel_create(window, cx);
                 } else {
                     cx.notify();
+                }
+                if leaving_rename {
+                    window.focus(&self.focus);
                 }
             }
             UiAction::NextDeck => {
@@ -3880,9 +4338,18 @@ impl Root {
                     self.study_deck(index, window, cx);
                 }
             }
+            UiAction::FocusDeckSearch => {
+                self.view = View::Decks;
+                let field = self.deck_search.clone();
+                cx.notify();
+                window.defer(cx, move |window, cx| {
+                    window.focus(field.read(cx).focus_handle());
+                });
+            }
             UiAction::ClearSearch => {
                 self.deck_search
                     .update(cx, super::text_field::TextField::clear);
+                window.focus(self.deck_search.read(cx).focus_handle());
                 self.view = View::Decks;
                 cx.notify();
             }
@@ -3894,15 +4361,27 @@ impl Root {
                 window.focus(self.browse.search.read(cx).focus_handle());
                 cx.notify();
             }
+            UiAction::BrowseUp => {
+                if self.view == View::Browse {
+                    self.move_browse_selection(-1, cx);
+                }
+            }
+            UiAction::BrowseDown => {
+                if self.view == View::Browse {
+                    self.move_browse_selection(1, cx);
+                }
+            }
             UiAction::SyncSignIn => self.sign_in(cx),
             UiAction::SyncSignOut => self.sign_out(cx),
             UiAction::SyncNow => self.sync_now(cx),
+            UiAction::ToggleAutoSync => self.toggle_auto_sync(cx),
             UiAction::SyncKeepLocal => self.resolve_sync_conflict(true, cx),
             UiAction::SyncKeepRemote => self.resolve_sync_conflict(false, cx),
         }
         if self.view == View::Review
             && self.confirmation.is_none()
             && !self.create_modal
+            && !matches!(action, UiAction::Reveal | UiAction::Space)
         {
             window.focus(&self.focus);
         }
@@ -3931,6 +4410,14 @@ impl Render for Root {
         if view == View::Decks {
             self.refresh_visible_deck_rows(cx);
         }
+        if view == View::Browse && !self.browse_ready {
+            self.refresh_browse(cx);
+            self.browse_ready = true;
+        }
+        if view == View::Statistics && !self.statistics_ready {
+            self.refresh_statistics(cx);
+            self.statistics_ready = true;
+        }
         let colors = self.colors();
         let main = match view {
             View::Decks => self.render_decks(window, cx).into_any_element(),
@@ -3940,9 +4427,13 @@ impl Render for Root {
                 self.render_add_card(window, cx).into_any_element()
             }
             View::Settings => self.render_settings().into_any_element(),
-            View::Statistics => {
-                self.render_statistics(window, cx).into_any_element()
-            }
+            View::Statistics => self
+                .render_statistics_with_error(
+                    window,
+                    self.statistics_error.as_deref(),
+                    cx,
+                )
+                .into_any_element(),
         };
         let mobile_nav = view != View::Review
             && theme::is_mobile_width(f32::from(window.viewport_size().width));
@@ -3950,7 +4441,11 @@ impl Render for Root {
             .id("root")
             .size_full()
             .flex()
-            .key_context(view.key_context())
+            .key_context(if view == View::AddCard {
+                "ranki ranki_occlusion"
+            } else {
+                view.key_context()
+            })
             .bg(colors.base)
             .text_color(colors.text)
             .font_family(self.font_family)
@@ -4053,6 +4548,9 @@ impl Render for Root {
                     this.dispatch(UiAction::from(action), window, cx);
                 },
             ))
+            .on_action(cx.listener(|this, _: &RetryStatistics, window, cx| {
+                this.dispatch(UiAction::RetryStatistics, window, cx);
+            }))
             .on_action(cx.listener(|this, action: &OpenBrowse, window, cx| {
                 this.dispatch(UiAction::from(action), window, cx);
             }))
@@ -4088,6 +4586,38 @@ impl Render for Root {
             .on_action(cx.listener(|this, action: &SaveNote, window, cx| {
                 this.dispatch(UiAction::from(action), window, cx);
             }))
+            .on_action(cx.listener(|this, _: &AddOcclusionMask, _, cx| {
+                let occlusion_model = this
+                    .models
+                    .get(this.add.model_index)
+                    .is_some_and(ranki_model::NoteModel::is_image_occlusion);
+                if this.view == View::AddCard
+                    && occlusion_model
+                    && this.add.occlusion.image.is_some()
+                {
+                    this.add_default_occlusion_mask(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &RemoveOcclusionMask, _, cx| {
+                if this.view == View::AddCard {
+                    this.remove_last_occlusion_mask(cx);
+                }
+            }))
+            .on_action(cx.listener(
+                |this, action: &UseReducedMotion, window, cx| {
+                    this.dispatch(UiAction::from(action), window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, action: &UseFullMotion, window, cx| {
+                    this.dispatch(UiAction::from(action), window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, action: &UseSystemMotion, window, cx| {
+                    this.dispatch(UiAction::from(action), window, cx);
+                },
+            ))
             .on_action(cx.listener(|this, action: &CancelAdd, window, cx| {
                 this.dispatch(UiAction::from(action), window, cx);
             }))
@@ -4108,10 +4638,21 @@ impl Render for Root {
                 this.dispatch(UiAction::from(action), window, cx);
             }))
             .on_action(cx.listener(
+                |this, action: &FocusDeckSearch, window, cx| {
+                    this.dispatch(UiAction::from(action), window, cx);
+                },
+            ))
+            .on_action(cx.listener(
                 |this, action: &ClearBrowseSearch, window, cx| {
                     this.dispatch(UiAction::from(action), window, cx);
                 },
             ))
+            .on_action(cx.listener(|this, action: &BrowseUp, window, cx| {
+                this.dispatch(UiAction::from(action), window, cx);
+            }))
+            .on_action(cx.listener(|this, action: &BrowseDown, window, cx| {
+                this.dispatch(UiAction::from(action), window, cx);
+            }))
             .on_action(cx.listener(|this, action: &NextDeck, window, cx| {
                 this.dispatch(UiAction::from(action), window, cx);
             }))
@@ -4123,6 +4664,9 @@ impl Render for Root {
             }))
             .on_action(cx.listener(|this, _: &SyncNow, window, cx| {
                 this.dispatch(UiAction::SyncNow, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleAutoSync, window, cx| {
+                this.dispatch(UiAction::ToggleAutoSync, window, cx);
             }))
             .on_action(cx.listener(|this, _: &SyncKeepLocal, window, cx| {
                 this.dispatch(UiAction::SyncKeepLocal, window, cx);
@@ -4609,7 +5153,7 @@ pub fn validate_draft(
     }
     if fields.is_empty() || fields.iter().all(|value| value.trim().is_empty()) {
         let _ = errors.insert(
-            "fields".to_owned(),
+            "field:0".to_owned(),
             "Enter text in at least one field".to_owned(),
         );
     }
@@ -4848,10 +5392,15 @@ const SETTINGS_CONTEXT: &str =
     "ranki_settings && !ranki_input && !ranki_dialog";
 const STATISTICS_CONTEXT: &str =
     "ranki && !ranki_review && !ranki_input && !ranki_dialog";
+const DECKS_CONTEXT: &str = "ranki_decks && !ranki_input && !ranki_dialog";
 
 /// Tab navigation stays out of modal dialogs.
 const FOCUS_CONTEXT: &str = "ranki && !ranki_dialog";
-
+const RELOAD_CONTEXT: &str = "ranki && !ranki_input && !ranki_dialog";
+const END_SESSION_CONTEXT: &str = "ranki && !ranki_dialog";
+/// Browse navigation stays out of the search field and dialogs.
+const BROWSE_CONTEXT: &str =
+    "ranki && ranki_browse && !ranki_input && !ranki_dialog";
 #[must_use]
 pub fn key_bindings() -> Vec<KeyBinding> {
     let mut bindings = vec![
@@ -4869,7 +5418,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("4", GradeEasy, Some(STUDY_CONTEXT)),
         KeyBinding::new("r", Retry, Some(STUDY_CONTEXT)),
         KeyBinding::new("enter", Reveal, Some(STUDY_CONTEXT)),
-        KeyBinding::new("f5", Reload, Some("ranki")),
+        KeyBinding::new("f5", Reload, Some(RELOAD_CONTEXT)),
         KeyBinding::new("ctrl-z", Undo, Some(STUDY_CONTEXT)),
         KeyBinding::new("s", StudyAgain, Some(STUDY_CONTEXT)),
         KeyBinding::new("d", OpenDecks, Some(STUDY_CONTEXT)),
@@ -4881,9 +5430,13 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("f1", ToggleHelp, Some(STUDY_CONTEXT)),
         KeyBinding::new("t", OpenStatistics, Some(STATISTICS_CONTEXT)),
         KeyBinding::new("n", NextDeck, Some(STUDY_CONTEXT)),
+        KeyBinding::new("up", BrowseUp, Some(BROWSE_CONTEXT)),
+        KeyBinding::new("down", BrowseDown, Some(BROWSE_CONTEXT)),
         KeyBinding::new("d", OpenDecks, Some(SETTINGS_CONTEXT)),
         KeyBinding::new("a", OpenAdd, Some(SETTINGS_CONTEXT)),
-        KeyBinding::new("escape", EndSession, Some("ranki")),
+        KeyBinding::new("/", FocusDeckSearch, Some(DECKS_CONTEXT)),
+        KeyBinding::new("c", CreateDeck, Some(DECKS_CONTEXT)),
+        KeyBinding::new("escape", EndSession, Some(END_SESSION_CONTEXT)),
         KeyBinding::new("tab", NextField, Some(FOCUS_CONTEXT)),
         KeyBinding::new("shift-tab", PreviousField, Some(FOCUS_CONTEXT)),
         KeyBinding::new("cmd-enter", SaveNote, Some("ranki")),
@@ -4892,6 +5445,22 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("escape", CancelDialog, Some("ranki_dialog")),
         KeyBinding::new("enter", SubmitDeck, Some("ranki_input")),
         KeyBinding::new("ctrl-enter", SaveNote, Some("ranki_input")),
+        KeyBinding::new("cmd-enter", SaveNote, Some("ranki_input")),
+        KeyBinding::new(
+            "ctrl-m",
+            AddOcclusionMask,
+            Some("ranki_occlusion && !ranki_input"),
+        ),
+        KeyBinding::new(
+            "ctrl-shift-m",
+            RemoveOcclusionMask,
+            Some("ranki_occlusion && !ranki_input"),
+        ),
+        KeyBinding::new(
+            "enter",
+            ApplyCustomColor,
+            Some("ranki_color_input > ranki_input"),
+        ),
         KeyBinding::new(
             "enter",
             AcceptTagSuggestion,
@@ -4902,7 +5471,6 @@ pub fn key_bindings() -> Vec<KeyBinding> {
             DismissTagSuggestions,
             Some("ranki_tag_input > ranki_input"),
         ),
-        KeyBinding::new("cmd-enter", SaveNote, Some("ranki_input")),
     ];
     bindings.extend(crate::text_field::key_bindings());
     bindings

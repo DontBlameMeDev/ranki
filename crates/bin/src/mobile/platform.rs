@@ -138,9 +138,41 @@ fn set_android_dir(name: &str, path: &Path) {
 }
 
 fn run_with_options(options: eframe::NativeOptions) -> eframe::Result<()> {
-    let app = build_app()
-        .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
-    eframe::run_native(APP_ID, options, Box::new(move |_| Ok(Box::new(app))))
+    match build_app() {
+        Ok(app) => eframe::run_native(
+            APP_ID,
+            options,
+            Box::new(move |_| Ok(Box::new(app))),
+        ),
+        Err(error) => {
+            let message = error.to_string();
+            eframe::run_native(
+                APP_ID,
+                options,
+                Box::new(move |_| Ok(Box::new(StartupError { message }))),
+            )
+        }
+    }
+}
+
+/// Visible replacement when the collection or settings cannot be opened.
+struct StartupError {
+    message: String,
+}
+
+impl eframe::App for StartupError {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(48.0);
+            ui.heading("Ranki could not start");
+            ui.add_space(12.0);
+            ui.label(&self.message);
+            ui.add_space(20.0);
+            ui.label(
+                "Check that the app data directory is writable, then reopen Ranki.",
+            );
+        });
+    }
 }
 
 fn build_app() -> Result<MobileApp> {

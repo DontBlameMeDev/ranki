@@ -19,14 +19,38 @@ use crate::{
     },
 };
 use gpui::{
-    ClickEvent, Context, Entity, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Pixels, Point, ScrollWheelEvent,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+    AppContext as _, ClickEvent, Context, Entity, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
+    Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
+    Window, div, point, px,
 };
 use ranki_model::{
     BrowseCard, Card, CardQueue, Deck, Id, Note, NoteModel, Store,
 };
 
+/// Tooltip for the icon-only card actions trigger.
+struct CardActionsTooltip {
+    colors: crate::theme::Palette,
+}
+
+impl Render for CardActionsTooltip {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("card-actions-tooltip")
+            .debug_selector(|| "card-actions-tooltip".to_owned())
+            .px(px(SPACE_GROUP))
+            .py(px(SPACE_RELATED))
+            .rounded(px(8.))
+            .bg(self.colors.surface1)
+            .text_size(px(12.))
+            .text_color(self.colors.text)
+            .child("Card actions")
+    }
+}
 /// Rendered height of a browse table line.
 const GROUP_HEIGHT: f32 = 48.0;
 const CARD_HEIGHT: f32 = 52.0;
@@ -90,6 +114,8 @@ pub struct BrowseState {
     pub rows: HashMap<Id, BrowserRow>,
     /// Deck paths opened by the user or by a search with matches.
     pub expanded: HashSet<String>,
+    /// Query behind the current hits and expansion. A new query reopens paths.
+    pub last_query: Option<String>,
     pub selected: Option<Id>,
     pub error: Option<String>,
     pub generation: u64,
@@ -375,7 +401,6 @@ impl Root {
             app.defer(move |app| {
                 let _ = weak.update(app, |root, cx| {
                     root.schedule_browse_refresh(cx);
-                    root.persist_state(cx);
                 });
             });
         })
@@ -391,6 +416,7 @@ impl Root {
             let _ = this.update(cx, |root, cx| {
                 if root.browse.generation == generation {
                     root.refresh_browse(cx);
+                    root.persist_state(cx);
                 }
             });
         })
@@ -402,11 +428,19 @@ impl Root {
     /// Cards are not read here: the table renders the lines it shows.
     pub(crate) fn refresh_browse(&mut self, cx: &mut Context<Self>) {
         let query = self.browse.search.read(cx).text();
+        self.card_menu = None;
+        self.card_menu_dismissed_press = None;
         if self.browse.query.as_deref() == Some(query.as_str())
             && self.browse.modified == Some(self.collection_modified)
         {
             self.browse.loading = false;
             return;
+        }
+        let query_changed =
+            self.browse.last_query.as_deref() != Some(query.as_str());
+        if query_changed {
+            self.browse.last_query = Some(query.clone());
+            self.browse_smooth.clamp(0.0);
         }
         let mut matches = match self.store.browse_cards(&query) {
             Ok(matches) => matches,
@@ -414,6 +448,9 @@ impl Root {
                 self.browse.hits.clear();
                 self.browse.entries.clear();
                 self.browse.rows.clear();
+                if query_changed {
+                    self.browse.expanded.clear();
+                }
                 self.browse.selected = None;
                 self.browse.error =
                     Some(format!("Could not search cards: {error}"));
@@ -439,13 +476,20 @@ impl Root {
                 card_id: card.card_id,
             })
             .collect::<Vec<_>>();
-        if !hits
+        let selected = if hits
             .iter()
             .any(|hit| self.browse.selected == Some(hit.card_id))
         {
-            self.browse.selected = hits.first().map(|hit| hit.card_id);
+            self.browse.selected
+        } else {
+            hits.first().map(|hit| hit.card_id)
+        };
+        if self.browse.selected != selected {
+            self.browse.selected = selected;
+            self.browse_detail_scroll
+                .set_offset(point(Pixels::ZERO, px(0.)));
         }
-        if !query.trim().is_empty() {
+        if query_changed {
             self.browse.expanded = browse_expand_paths(&hits);
         }
         self.browse.hits = hits;
@@ -483,7 +527,11 @@ impl Root {
     }
 
     /// Reads the rows for the lines the table shows and for the preview.
-    fn load_browse_rows(&mut self, visible: &BrowseWindow) {
+    fn load_browse_rows(
+        &mut self,
+        visible: &BrowseWindow,
+        cx: &mut Context<Self>,
+    ) {
         let mut needed = Vec::new();
         if let Some(id) = self.browse.selected {
             needed.push(id);
@@ -496,15 +544,22 @@ impl Root {
         needed.retain(|id| !self.browse.rows.contains_key(id));
         needed.sort_unstable();
         needed.dedup();
-        if needed.is_empty() {
-            return;
-        }
-        let loaded = self.store.cards_with_notes(&needed).unwrap_or_default();
-        for (card, note) in loaded {
-            if let Some(row) =
-                browser_row(&card, &note, &self.decks, &self.models)
+        if !needed.is_empty() {
+            let loaded =
+                self.store.cards_with_notes(&needed).unwrap_or_default();
+            for (card, note) in loaded {
+                if let Some(row) =
+                    browser_row(&card, &note, &self.decks, &self.models)
+                {
+                    let _ = self.browse.rows.insert(card.id, row);
+                }
+            }
+            if needed.iter().any(|id| !self.browse.rows.contains_key(id))
+                && self.browse.error.is_none()
             {
-                let _ = self.browse.rows.insert(card.id, row);
+                self.browse.error =
+                    Some(String::from("Could not load some cards"));
+                cx.notify();
             }
         }
     }
@@ -524,8 +579,79 @@ impl Root {
     pub(crate) fn select_browse_row(&mut self, id: Id, cx: &mut Context<Self>) {
         if self.browse.selected != Some(id) {
             self.browse.selected = Some(id);
+            self.browse_detail_scroll
+                .set_offset(point(Pixels::ZERO, px(0.)));
             cx.notify();
         }
+    }
+
+    /// Moves the selection through the cards that are open in the table.
+    pub(crate) fn move_browse_selection(
+        &mut self,
+        step: isize,
+        cx: &mut Context<Self>,
+    ) {
+        let cards = self
+            .browse
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                BrowseEntry::Card { row } => {
+                    Some((index, self.browse.hits[*row].card_id))
+                }
+                BrowseEntry::Group(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if cards.is_empty() {
+            return;
+        }
+        let selected = cards
+            .iter()
+            .position(|(_, id)| Some(*id) == self.browse.selected);
+        let next = match selected {
+            Some(position) if step < 0 => {
+                position.saturating_sub(step.unsigned_abs())
+            }
+            Some(position) => position
+                .saturating_add(step.unsigned_abs())
+                .min(cards.len() - 1),
+            None if step < 0 => cards.len() - 1,
+            None => 0,
+        };
+        let (entry, id) = cards[next];
+        self.scroll_browse_entry_into_view(entry);
+        if self.browse.selected != Some(id) {
+            self.browse.selected = Some(id);
+            self.browse_detail_scroll
+                .set_offset(point(Pixels::ZERO, px(0.)));
+            cx.notify();
+        }
+    }
+
+    fn scroll_browse_entry_into_view(&mut self, entry: usize) {
+        let header = self
+            .browse_smooth
+            .handle()
+            .bounds_for_item(0)
+            .map_or(2.0 * SPACE_RELATED + 16.0, |bounds| {
+                f32::from(bounds.size.height)
+            });
+        let viewport = self.browse.viewport.unwrap_or(0.0);
+        let top = self.browse.entries[..entry]
+            .iter()
+            .map(browse_entry_height)
+            .sum::<f32>();
+        let bottom = top + browse_entry_height(&self.browse.entries[entry]);
+        let offset = self.browse_smooth.offset();
+        let target = if top + header < offset {
+            top + header
+        } else if bottom + header > offset + viewport {
+            bottom + header - viewport
+        } else {
+            return;
+        };
+        self.browse_smooth.wheel(target.max(0.0) - offset);
     }
 
     /// Opens or closes the card actions menu for one result.
@@ -553,7 +679,14 @@ impl Root {
             page_width(f32::from(window.viewport_size().width), self.nav_width);
         let columns = BrowseColumns::for_width(width);
         let show_detail_side = width >= 900.0;
-        let show_detail = width >= BROWSE_DETAIL_MIN_WIDTH;
+        let viewport_height = f32::from(window.viewport_size().height);
+        let compact = viewport_height < 600.0;
+        let stacked_detail_height = if compact {
+            116.0
+        } else {
+            (viewport_height * 0.28).clamp(120.0, 220.0)
+        };
+
         let smooth = self.motion_ms(1) > 0;
         if self.browse_smooth.advance(window, smooth) {
             cx.notify();
@@ -563,14 +696,19 @@ impl Root {
         let query = self.browse.search.read(cx).text();
         let selected = self.browse.selected;
         let error = self.browse.error.clone();
+        let pending = self.browse.loading;
         let mut content = div()
             .id("browse-scroll")
             .size_full()
             .flex()
             .flex_col()
-            .gap(px(SPACE_SECTION))
+            .gap(px(if compact {
+                SPACE_RELATED
+            } else {
+                SPACE_SECTION
+            }))
             .px(px(PAGE_X))
-            .py(px(PAGE_Y))
+            .py(px(if compact { SPACE_BLOCK } else { PAGE_Y }))
             .child(
                 div()
                     .flex()
@@ -593,7 +731,7 @@ impl Root {
                                     .items_center()
                                     .gap(px(SPACE_GROUP))
                                     .flex_initial()
-                                    .w(px(460.))
+                                    .w(px((width - 180.0).clamp(160.0, 460.0)))
                                     .min_w(px(160.))
                                     .h(px(44.))
                                     .px(px(SPACE_RELATED))
@@ -619,7 +757,19 @@ impl Root {
                                 div()
                                     .flex_1()
                                     .min_w(px(0.))
-                                    .child(self.browse.search.clone()),
+                                    .child(self.browse.search.clone())
+                                    .children(pending.then(|| {
+                                        div()
+                                            .id("browse-search-pending")
+                                            .debug_selector(|| {
+                                                "browse-search-pending"
+                                                    .to_owned()
+                                            })
+                                            .flex_none()
+                                            .text_size(px(12.))
+                                            .text_color(colors.subtext)
+                                            .child("Searching...")
+                                    })),
                             ),
                     ),
             );
@@ -627,6 +777,7 @@ impl Root {
         let mut table = div()
             .flex_1()
             .min_w(px(0.))
+            .min_h(px(BROWSE_TABLE_MIN_HEIGHT))
             .id("browse-table")
             .debug_selector(|| "browse-table".to_owned())
             .flex()
@@ -696,7 +847,7 @@ impl Root {
             viewport,
             header,
         );
-        self.load_browse_rows(&visible);
+        self.load_browse_rows(&visible, cx);
         if visible.first > 0 {
             table = table.child(div().h(px(visible.before)).flex_none());
         }
@@ -711,7 +862,21 @@ impl Root {
             let Some(row) =
                 self.browse.rows.get(&self.browse.hits[*index].card_id)
             else {
-                table = table.child(div().h(px(CARD_HEIGHT)).flex_none());
+                let key =
+                    SharedString::from(format!("browse-failed-row-{index}"));
+                table = table.child(
+                    div()
+                        .id(key.clone())
+                        .debug_selector(|| key.to_string())
+                        .h(px(CARD_HEIGHT))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .px(px(SPACE_BLOCK))
+                        .text_size(px(13.))
+                        .text_color(colors.red)
+                        .child("Could not load card"),
+                );
                 continue;
             };
             let id = row.card.id;
@@ -752,6 +917,7 @@ impl Root {
                 })
                 .cursor_pointer()
                 .focusable()
+                .tab_stop(true)
                 .hover(move |style| style.bg(hover_bg))
                 .active(move |style| style.bg(press_bg))
                 .focus(move |style| {
@@ -859,6 +1025,10 @@ impl Root {
                             }
                         },
                     ))
+                    .tooltip(move |_, cx| {
+                        let colors = colors;
+                        cx.new(|_| CardActionsTooltip { colors }).into()
+                    })
                     .child(icon(
                         "icon-more",
                         18.,
@@ -877,10 +1047,17 @@ impl Root {
                 style,
             ));
         }
-        let detail = show_detail.then(|| {
-            self.render_browse_detail(selected, style, show_detail_side)
-        });
-        let body = div().flex().flex_1().min_h(px(0.)).gap(px(SPACE_SECTION));
+        let detail = Some(self.render_browse_detail(
+            selected,
+            style,
+            show_detail_side,
+            stacked_detail_height,
+        ));
+        let body = div().flex().flex_1().min_h(px(0.)).gap(px(if compact {
+            SPACE_RELATED
+        } else {
+            SPACE_SECTION
+        }));
         let body = if show_detail_side {
             body.child(table).children(detail)
         } else {
@@ -915,12 +1092,14 @@ impl Root {
             .border_color(colors.surface0)
             .bg(bg)
             .cursor_pointer()
+            .focusable()
+            .tab_stop(true)
             .hover(move |style| style.bg(hover_bg))
             .active(move |style| style.bg(press_bg))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_browse_group(path.clone(), cx);
             }));
-        if group.has_children {
+        if group.has_children || group.count > 0 {
             line = line.child(
                 Interaction::surface(colors).apply(
                     div()
@@ -1024,7 +1203,7 @@ impl Root {
                     .text_color(colors.subtext)
                     .child(detail.to_owned()),
             );
-        if error.is_none() && !query.trim().is_empty() {
+        if !query.trim().is_empty() {
             empty = empty.child(secondary_button(
                 "Clear search",
                 colors,
@@ -1046,6 +1225,7 @@ impl Root {
         selected: Option<Id>,
         style: Style,
         side: bool,
+        stacked_height: f32,
     ) -> impl IntoElement {
         let colors = style.colors;
         let mut detail = div()
@@ -1064,7 +1244,7 @@ impl Root {
         if side {
             detail = detail.w(px(BROWSE_PREVIEW_WIDTH));
         } else {
-            detail = detail.w_full().h(px(220.0)).flex_none();
+            detail = detail.w_full().h(px(stacked_height)).flex_none();
         }
         let Some(row) = selected.and_then(|id| self.browse.rows.get(&id))
         else {
@@ -1153,17 +1333,35 @@ fn browse_meta(
     label: &str,
     value: &str,
     colors: crate::theme::Palette,
-) -> gpui::Div {
+) -> gpui::Stateful<gpui::Div> {
+    let selector = SharedString::from(format!("browse-meta-{label}"));
     div()
+        .id(selector.clone())
+        .debug_selector(move || selector.to_string())
         .flex()
         .justify_between()
         .gap(px(SPACE_RELATED))
         .text_size(px(12.))
-        .child(div().text_color(colors.subtext).child(label.to_owned()))
-        .child(div().child(value.to_owned()))
+        .child(
+            div()
+                .flex_none()
+                .text_color(colors.subtext)
+                .child(label.to_owned()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_right()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(value.to_owned()),
+        )
 }
 
 pub const BROWSE_DETAIL_MIN_WIDTH: f32 = 520.;
+const BROWSE_TABLE_MIN_HEIGHT: f32 = 140.;
 const BROWSE_PREVIEW_WIDTH: f32 = 320.;
 const BROWSE_COLUMNS: [f32; 6] = [1.0, 105., 90., 75., 65., 50.];
 const BROWSE_ACTION_WIDTH: f32 = 30.;

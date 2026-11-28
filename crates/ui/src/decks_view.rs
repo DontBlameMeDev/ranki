@@ -34,7 +34,7 @@ impl DeckColumns {
     fn for_width(width: f32) -> Self {
         Self {
             new: width >= 420.0,
-            learning: width >= 700.0,
+            learning: width >= 580.0,
             review: width >= 580.0,
         }
     }
@@ -71,16 +71,18 @@ impl Root {
             .px(px(PAGE_X))
             .py(px(PAGE_Y));
 
-        if smooth {
-            content = content.on_scroll_wheel(cx.listener(
-                |this, event: &ScrollWheelEvent, window, cx| {
+        content = content.on_scroll_wheel(cx.listener(
+            move |this, event: &ScrollWheelEvent, window, cx| {
+                this.deck_menu = None;
+                if smooth {
                     let delta = event.delta.pixel_delta(window.line_height());
                     this.decks_scroll.wheel(-f32::from(delta.y));
                     window.refresh();
                     cx.stop_propagation();
-                },
-            ));
-        }
+                }
+                cx.notify();
+            },
+        ));
 
         content = content.child(
             div()
@@ -373,7 +375,7 @@ impl Root {
                                             .text_size(px(13.))
                                             .line_height(px(16.))
                                             .text_color(colors.subtext)
-                                            .child("Due today"),
+                                            .child(app::DECK_SUMMARY_LABEL),
                                     )
                                     .child(
                                         div()
@@ -566,6 +568,8 @@ impl Root {
     ) -> impl IntoElement {
         let colors = self.colors();
         let style = Style::new(colors, self.theme());
+        let row_path = row.path.clone();
+        let virtual_parent = row.id.is_none() && row.has_children;
         let deck_id = row.id;
         let index = row.deck_index;
         let is_selected = index.is_some() && index == self.selected;
@@ -684,10 +688,12 @@ impl Root {
                     "Save",
                     ButtonTone::Primary,
                     style,
-                    Box::new(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        cx.stop_propagation();
-                        this.apply_rename(cx);
-                    })),
+                    Box::new(cx.listener(
+                        |this, _: &ClickEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.apply_rename(window, cx);
+                        },
+                    )),
                 ));
         }
         let count = |value: usize, color: Rgba| {
@@ -837,6 +843,8 @@ impl Root {
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 if let Some(index) = index {
                     this.study_deck(index, window, cx);
+                } else if virtual_parent {
+                    this.toggle_deck(row_path.clone(), cx);
                 }
             }))
             .bg(if is_selected {
@@ -963,7 +971,7 @@ mod tests {
         let narrow = DeckColumns::for_width(340.0);
         assert!(!narrow.new && !narrow.learning && !narrow.review);
         let medium = DeckColumns::for_width(600.0);
-        assert!(medium.new && !medium.learning && medium.review);
+        assert!(medium.new && medium.learning && medium.review);
         let wide = DeckColumns::for_width(1048.0);
         assert!(wide.new && wide.learning && wide.review);
     }

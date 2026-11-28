@@ -3,16 +3,17 @@
 use std::collections::BTreeMap;
 
 use gpui::{
-    App, ClickEvent, Context, Entity, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    Pixels, Point, SharedString, StatefulInteractiveElement, Styled,
-    StyledImage, TextOverflow, Window, div, img, px, relative,
+    App, AppContext as _, ClickEvent, Context, Entity, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, Render, SharedString,
+    StatefulInteractiveElement, Styled, StyledImage, TextOverflow, Window, div,
+    img, px, relative,
 };
 
 use crate::{
     app::{
-        AcceptTagSuggestion, DismissTagSuggestions, Root, UiAction,
-        note_type_name, resolve_model,
+        AcceptTagSuggestion, ApplyCustomColor, DismissTagSuggestions, Root,
+        UiAction, dispatch_app_action, note_type_name, resolve_model,
     },
     card_view::{self, Side},
     components::{
@@ -97,7 +98,10 @@ impl Root {
         } else {
             note_type_tabs(models)
         };
-        let save = self.action_click(UiAction::SaveNote);
+        let save: ClickHandler =
+            Box::new(|_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                dispatch_app_action(window, cx, UiAction::SaveNote);
+            });
         let content_width =
             page_width(f32::from(window.viewport_size().width), self.nav_width);
         let side_by_side = content_width >= 900.;
@@ -302,7 +306,9 @@ impl Root {
                 .and_then(|model| model.fields.get(index).cloned())
                 .unwrap_or_else(|| format!("Field {}", index + 1));
             let focused = field.read(cx).focus_handle().is_focused(window);
-            let invalid = errors.contains_key("fields");
+            let field_error = errors.get(&format!("field:{index}"));
+            let invalid =
+                errors.contains_key("fields") || field_error.is_some();
             let border = if invalid {
                 colors.red
             } else if focused {
@@ -336,6 +342,12 @@ impl Root {
                     colors,
                     cx,
                 ));
+            }
+            if let Some(error) = field_error {
+                field_box =
+                    field_box.child(validation(error, colors).debug_selector(
+                        move || format!("add-field-error-{index}"),
+                    ));
             }
             left = left.child(
                 div()
@@ -662,6 +674,7 @@ impl Root {
                         .apply(
                             div()
                                 .id("add-save")
+                                .debug_selector(|| "add-save".to_owned())
                                 .h(px(48.))
                                 .px(px(SPACE_SECTION))
                                 .flex()
@@ -872,8 +885,18 @@ impl Root {
             .h(relative(fitted.height))
             .id("io-overlay");
         for (index, mask) in masks.iter().enumerate() {
-            overlay =
-                overlay.child(mask_box(mask, index.saturating_add(1), colors));
+            let remove: ClickHandler =
+                Box::new(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.remove_occlusion_mask(index, cx);
+                    cx.stop_propagation();
+                }));
+            overlay = overlay.child(mask_box(
+                mask,
+                index.saturating_add(1),
+                colors,
+                remove,
+                cx,
+            ));
         }
         if let Some(rect) = dragging {
             overlay = overlay.child(
@@ -975,9 +998,50 @@ impl Root {
                             .child("OCCLUSION EDITOR"),
                     )
                     .child(div().flex_1())
+                    .child(
+                        Interaction::new(
+                            alpha(colors.mauve, 0.3),
+                            alpha(colors.mauve, 0.22),
+                            alpha(colors.mauve, 0.34),
+                            colors.mauve,
+                        )
+                        .apply(
+                            div()
+                                .id("io-add-mask")
+                                .debug_selector(|| "io-add-mask".to_owned())
+                                .flex()
+                                .items_center()
+                                .gap(px(SPACE_GROUP))
+                                .h(px(32.))
+                                .px(px(SPACE_RELATED))
+                                .rounded(px(10.))
+                                .bg(alpha(colors.mauve, 0.14))
+                                .text_size(px(13.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(colors.mauve)
+                                .cursor_pointer()
+                                .child(icon("icon-plus", 14., colors.mauve))
+                                .child("Add mask"),
+                        )
+                        .on_click(cx.listener(
+                            |this, _: &ClickEvent, _, cx| {
+                                this.add_default_occlusion_mask(cx);
+                            },
+                        )),
+                    )
                     .child(image_button),
             )
             .child(canvas);
+        editor = editor.child(
+            div()
+                .debug_selector(|| "io-occlusion-hint".to_owned())
+                .text_size(px(11.))
+                .text_color(colors.overlay)
+                .child(
+                    "Drag to draw or move. Right-drag a mask to resize. \
+                     Ctrl+M adds a mask, Ctrl+Shift+M removes the last one.",
+                ),
+        );
         if let Some(error) = errors.get("occlusion") {
             editor = editor.child(validation(error, colors));
         }
@@ -994,8 +1058,7 @@ impl Root {
         window: &Window,
         cx: &Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let query = self.add.deck_filter.read(cx).text();
-        let needle = query.trim().to_lowercase();
+        let matching = self.add_deck_matches(cx);
         let filter = self.add.deck_filter.clone();
         let mut list = div()
             .flex()
@@ -1006,14 +1069,10 @@ impl Root {
             .overflow_scroll()
             .track_scroll(&self.deck_picker_scroll)
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
-        let mut matches = 0;
-        for (index, deck) in self.decks.iter().enumerate() {
-            if !needle.is_empty()
-                && !crate::app::contains_lowercase(&deck.name, &needle)
-            {
-                continue;
-            }
-            matches += 1;
+        let mut visible = 0;
+        for index in matching {
+            let deck = &self.decks[index];
+            visible += 1;
             let selected = self.add.deck_id == Some(deck.id);
             let due = self.stats.get(index).map_or(0, |stats| {
                 stats
@@ -1094,7 +1153,7 @@ impl Root {
                 ),
             );
         }
-        if matches == 0 {
+        if visible == 0 {
             list = list.child(
                 div()
                     .p(px(SPACE_RELATED))
@@ -1280,6 +1339,18 @@ impl Root {
         div()
             .id("add-color-picker-popup")
             .debug_selector(|| "add-color-picker-popup".to_owned())
+            .key_context("ranki_color_input")
+            .on_action(cx.listener(|this, _: &ApplyCustomColor, window, cx| {
+                let value = this.add.color_hex.read(cx).text();
+                if parse_hex_color(&value).is_none() {
+                    return;
+                }
+                let Some(picker) = this.add.color_picker.as_ref() else {
+                    return;
+                };
+                let (target, field) = (picker.target, picker.field.clone());
+                this.apply_color(target, field, &value, window, cx);
+            }))
             .w(px(276.))
             .occlude()
             .on_mouse_down_out(cx.listener(
@@ -1354,11 +1425,38 @@ impl Root {
     }
 }
 
+/// Label shown when hovering an icon-only formatting button.
+struct TooltipLabel {
+    text: SharedString,
+    colors: crate::theme::Palette,
+}
+
+impl Render for TooltipLabel {
+    fn render(
+        &mut self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .px(px(SPACE_GROUP))
+            .py(px(SPACE_INLINE))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(self.colors.surface1)
+            .bg(self.colors.mantle)
+            .text_size(px(12.))
+            .text_color(self.colors.text)
+            .child(self.text.clone())
+    }
+}
+
 /// One drawn mask, translucent red with its cloze ordinal.
 fn mask_box(
     mask: &OcclusionMask,
     ordinal: usize,
     colors: crate::theme::Palette,
+    remove: ClickHandler,
+    cx: &Context<Root>,
 ) -> gpui::Div {
     let mut shape = div()
         .absolute()
@@ -1380,7 +1478,31 @@ fn mask_box(
     } else {
         shape.rounded(px(4.))
     };
-    shape
+    shape.child(
+        div()
+            .id(SharedString::from(format!("io-remove-mask-{ordinal}")))
+            .debug_selector(move || format!("io-remove-mask-{ordinal}"))
+            .absolute()
+            .right(px(0.))
+            .top(px(0.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(18.))
+            .w(px(18.))
+            .rounded_full()
+            .bg(colors.crust)
+            .text_color(colors.red)
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .on_click(remove)
+            .child("×"),
+    )
 }
 
 fn pointer(position: gpui::Point<Pixels>) -> (f32, f32) {
@@ -1469,6 +1591,8 @@ fn formatting_toolbar(
                   icon_name: Option<&'static str>,
                   bold: bool,
                   on_click: ClickHandler| {
+        let tooltip_label = label;
+        let tooltip_colors = colors;
         let button = Interaction::surface(colors)
             .apply(
                 div()
@@ -1486,6 +1610,13 @@ fn formatting_toolbar(
                         gpui::FontWeight::BOLD
                     } else {
                         gpui::FontWeight::MEDIUM
+                    })
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| TooltipLabel {
+                            text: tooltip_label.into(),
+                            colors: tooltip_colors,
+                        })
+                        .into()
                     })
                     .cursor_pointer(),
             )

@@ -4,27 +4,34 @@
     clippy::arithmetic_side_effects,
     clippy::cast_precision_loss,
     clippy::excessive_nesting,
+    clippy::fn_params_excessive_bools,
     clippy::shadow_reuse,
     clippy::too_many_arguments,
     clippy::too_many_lines,
+    clippy::wildcard_enum_match_arm,
     reason = "egui widget nesting and bounded layout math keep screen order obvious"
 )]
 
+use crate::mobile::card::{render_side, sides, sides_answer};
+use crate::mobile::state::{AppState, DeckRow, ReviewPhase, Screen, ToastKind};
 use egui::{
-    Align, Button, Color32, ComboBox, CornerRadius, FontId, Frame as EguiFrame,
-    Layout, Margin, ProgressBar, RichText, ScrollArea, Sense, Stroke, TextEdit,
-    TextStyle, Ui, vec2,
+    Align, Button, Color32, ComboBox, CornerRadius, Event, FontId,
+    Frame as EguiFrame, Key, Layout, Margin, ProgressBar, RichText, ScrollArea,
+    Sense, Stroke, TextEdit, TextStyle, Ui, vec2,
 };
 use ranki_model::{Card, CardType, Rating, ThemeChoice};
 use std::time::Duration;
-
-use crate::mobile::card::{render_side, sides};
-use crate::mobile::state::{AppState, DeckRow, ReviewPhase, Screen, ToastKind};
+use std::time::Instant;
 
 const PAGE_MARGIN: i8 = 16;
 const TAB_HEIGHT: f32 = 56.0;
 const TAP_HEIGHT: f32 = 48.0;
 const RATING_HEIGHT: f32 = 60.0;
+const REVIEW_GAP: f32 = 8.0;
+const COMPACT_HEIGHT: f32 = 360.0;
+const NARROW_WIDTH: f32 = 320.0;
+
+type Tab = (Screen, &'static str, &'static str);
 
 /// egui app that owns the mobile state.
 pub struct MobileApp {
@@ -44,13 +51,8 @@ impl MobileApp {
 
 impl eframe::App for MobileApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let _ = self.state.poll_sync();
-        if self.state.sync.busy {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
         apply_style(ctx, self.state.settings.theme);
-        let reviewing = self.state.screen == Screen::Review
-            && self.state.review.current.is_some();
+        let reviewing = self.state.screen == Screen::Review;
         let focused = reviewing && ctx.input(|input| input.focused);
         self.state.tick_focus(focused);
         if self.state.review.phase == ReviewPhase::Waiting {
@@ -60,6 +62,46 @@ impl eframe::App for MobileApp {
                     u64::try_from(delay).unwrap_or(3_600).min(3_600),
                 )),
                 None => {}
+            }
+        }
+        let now = Instant::now();
+        if let Some(wait) = self.state.poll_toast(now) {
+            ctx.request_repaint_after(wait);
+        }
+        let _ = self.state.poll_sync();
+        if self.state.sync.busy {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if reviewing && !text_field_focused(ctx) {
+            let keys = ctx.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Key {
+                            key, pressed: true, ..
+                        } => Some(*key),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for key in keys {
+                let phase = self.state.review.phase;
+                let can_undo = self.state.review.last.is_some();
+                let Some(action) = review_shortcut(key, phase, can_undo, false)
+                else {
+                    continue;
+                };
+                match action {
+                    ReviewShortcut::Reveal => self.state.reveal(),
+                    ReviewShortcut::Grade(rating) => {
+                        let _ = self.state.rate(rating);
+                    }
+                    ReviewShortcut::Undo => {
+                        let _ = self.state.undo();
+                    }
+                    ReviewShortcut::End => self.state.end_review(),
+                }
             }
         }
         render(&mut self.state, ctx);
@@ -88,6 +130,50 @@ impl eframe::App for MobileApp {
             }
             self.last_ime_focus = ime_focus;
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReviewShortcut {
+    Reveal,
+    Grade(Rating),
+    Undo,
+    End,
+}
+
+fn text_field_focused(ctx: &egui::Context) -> bool {
+    ctx.memory(egui::Memory::focused)
+        .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some())
+}
+
+fn review_shortcut(
+    key: Key,
+    phase: ReviewPhase,
+    can_undo: bool,
+    text_focused: bool,
+) -> Option<ReviewShortcut> {
+    if text_focused {
+        return None;
+    }
+    match key {
+        Key::Space | Key::Enter if phase == ReviewPhase::Question => {
+            Some(ReviewShortcut::Reveal)
+        }
+        Key::Num1 if phase == ReviewPhase::Answer => {
+            Some(ReviewShortcut::Grade(Rating::Again))
+        }
+        Key::Num2 if phase == ReviewPhase::Answer => {
+            Some(ReviewShortcut::Grade(Rating::Hard))
+        }
+        Key::Num3 if phase == ReviewPhase::Answer => {
+            Some(ReviewShortcut::Grade(Rating::Good))
+        }
+        Key::Num4 if phase == ReviewPhase::Answer => {
+            Some(ReviewShortcut::Grade(Rating::Easy))
+        }
+        Key::Backspace if can_undo => Some(ReviewShortcut::Undo),
+        Key::Escape => Some(ReviewShortcut::End),
+        _ => None,
     }
 }
 
@@ -186,7 +272,7 @@ fn apply_style(ctx: &egui::Context, theme: ThemeChoice) {
     ctx.set_style(style);
 }
 
-/// Draws the current screen and, outside review, the bottom tabs.
+/// Draws the current screen, with review actions or tabs pinned to the bottom.
 pub fn render(app: &mut AppState, ctx: &egui::Context) {
     let system_dark = matches!(ctx.theme(), egui::Theme::Dark);
     let p = palette(app.settings.theme, system_dark);
@@ -199,13 +285,19 @@ pub fn render(app: &mut AppState, ctx: &egui::Context) {
         .show(ctx, |ui| {
             show_toast(app, ui, &p);
             let size = ui.available_size();
-            let show_tabs = app.screen != Screen::Review;
-            let tab_space = if show_tabs {
-                TAB_HEIGHT + ui.spacing().item_spacing.y
+            let short = size.y < 420.0;
+            let reviewing = app.screen == Screen::Review;
+            let show_tabs = !reviewing;
+            let compact = size.y < COMPACT_HEIGHT || size.x < NARROW_WIDTH;
+            let spacing = ui.spacing().item_spacing.y;
+            let chrome = if show_tabs {
+                tab_height(size.x) + spacing
+            } else if reviewing {
+                review_actions_height(app, compact, short) + spacing
             } else {
                 0.0
             };
-            let content_height = (size.y - tab_space).max(1.0);
+            let content_height = (size.y - chrome).max(1.0);
             ui.allocate_ui_with_layout(
                 vec2(size.x, content_height),
                 Layout::top_down(Align::Min),
@@ -220,7 +312,9 @@ pub fn render(app: &mut AppState, ctx: &egui::Context) {
                             ui.set_width(ui.available_width());
                             match app.screen {
                                 Screen::Decks => render_decks(app, ui, &p),
-                                Screen::Review => render_review(app, ui, &p),
+                                Screen::Review => {
+                                    render_review_content(app, ui, &p, short);
+                                }
                                 Screen::Add => render_add(app, ui, &p),
                                 Screen::Browse => render_browse(app, ui, &p),
                                 Screen::Statistics => {
@@ -233,9 +327,19 @@ pub fn render(app: &mut AppState, ctx: &egui::Context) {
                         });
                 },
             );
-            if show_tabs {
+            if reviewing {
+                let height = review_actions_height(app, compact, short);
                 ui.allocate_ui_with_layout(
-                    vec2(size.x, TAB_HEIGHT),
+                    vec2(size.x, height),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        render_review_actions(app, ui, &p, compact, short);
+                    },
+                );
+            } else if show_tabs {
+                let height = tab_height(size.x);
+                ui.allocate_ui_with_layout(
+                    vec2(size.x, height),
                     Layout::top_down(Align::Min),
                     |ui| render_tabs(app, ui, &p),
                 );
@@ -308,35 +412,57 @@ fn title(ui: &mut Ui, text: &str, p: &Palette) {
     ui.add_space(10.0);
 }
 
+fn tab_height(width: f32) -> f32 {
+    if width < NARROW_WIDTH {
+        TAP_HEIGHT + REVIEW_GAP + TAP_HEIGHT
+    } else {
+        TAB_HEIGHT
+    }
+}
+
 fn render_tabs(app: &mut AppState, ui: &mut Ui, p: &Palette) {
     let tabs = [
-        (Screen::Decks, "Decks"),
-        (Screen::Add, "Add"),
-        (Screen::Browse, "Browse"),
-        (Screen::Statistics, "Stats"),
-        (Screen::Settings, "Settings"),
+        (Screen::Decks, "Decks", "Decks"),
+        (Screen::Add, "Add", "Add"),
+        (Screen::Browse, "Browse", "Browse"),
+        (Screen::Statistics, "Stats", "Stats"),
+        (Screen::Settings, "Settings", "Prefs"),
     ];
-    let width = (ui.available_width() - ((tabs.len() as f32) - 1.0) * 8.0)
-        / (tabs.len() as f32);
+    let narrow = ui.available_width() < NARROW_WIDTH;
+    let rows: &[&[Tab]] = if narrow {
+        &[&tabs[..3], &tabs[3..]]
+    } else {
+        &[&tabs[..]]
+    };
+    let height = if narrow { TAP_HEIGHT } else { TAB_HEIGHT };
     ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.spacing_mut().item_spacing =
+            vec2(8.0, if narrow { REVIEW_GAP } else { 0.0 });
         ui.spacing_mut().button_padding = vec2(2.0, 8.0);
         ui.style_mut()
             .text_styles
             .insert(TextStyle::Button, FontId::proportional(14.0));
-        ui.horizontal(|ui| {
-            for (screen, label) in tabs {
-                let selected = app.screen == screen;
-                let button = touch_button(
-                    RichText::new(label),
-                    TAB_HEIGHT,
-                    if selected { p.accent } else { p.panel },
-                    if selected { p.accent_ink } else { p.text },
-                )
-                .stroke(Stroke::new(1.0_f32, p.border));
-                if ui.add_sized([width, TAB_HEIGHT], button).clicked() {
-                    let _ = app.set_screen(screen);
-                }
+        ui.vertical(|ui| {
+            for row in rows {
+                let width = (ui.available_width()
+                    - ((row.len() as f32) - 1.0) * 8.0)
+                    / (row.len() as f32);
+                ui.horizontal(|ui| {
+                    for (screen, wide, short) in *row {
+                        let label = if narrow { *short } else { *wide };
+                        let selected = app.screen == *screen;
+                        let button = touch_button(
+                            RichText::new(label),
+                            height,
+                            if selected { p.accent } else { p.panel },
+                            if selected { p.accent_ink } else { p.text },
+                        )
+                        .stroke(Stroke::new(1.0_f32, p.border));
+                        if ui.add_sized([width, height], button).clicked() {
+                            let _ = app.set_screen(*screen);
+                        }
+                    }
+                });
             }
         });
     });
@@ -573,8 +699,17 @@ fn stat(ui: &mut Ui, label: &str, value: usize, p: &Palette) {
     metric(ui, label, value.to_string(), p);
 }
 
-fn render_review(app: &mut AppState, ui: &mut Ui, p: &Palette) {
-    title(ui, "Review", p);
+fn render_review_content(
+    app: &mut AppState,
+    ui: &mut Ui,
+    p: &Palette,
+    short: bool,
+) {
+    if short {
+        ui.add_space(4.0);
+    } else {
+        title(ui, "Review", p);
+    }
     let review = app.review.clone();
     let remaining = review.queue.len()
         + review.pending.len()
@@ -591,20 +726,25 @@ fn render_review(app: &mut AppState, ui: &mut Ui, p: &Palette) {
             .desired_height(8.0)
             .fill(p.accent),
     );
-    ui.add_space(8.0);
+    ui.add_space(if short { 4.0 } else { 8.0 });
     ui.label(
         RichText::new(format!("{} / {} reviewed", review.answered, total))
             .color(p.muted),
     );
-    let counts =
-        review_counts(&review.queue, &review.pending, review.current.as_ref());
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        stat(ui, "New", counts[0], p);
-        stat(ui, "Learning", counts[1], p);
-        stat(ui, "Review", counts[2], p);
-    });
-    ui.add_space(12.0);
+    if !short {
+        let counts = review_counts(
+            &review.queue,
+            &review.pending,
+            review.current.as_ref(),
+        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            stat(ui, "New", counts[0], p);
+            stat(ui, "Learning", counts[1], p);
+            stat(ui, "Review", counts[2], p);
+        });
+    }
+    ui.add_space(if short { 6.0 } else { 12.0 });
 
     if matches!(review.phase, ReviewPhase::Summary | ReviewPhase::Waiting) {
         let waiting = review.phase == ReviewPhase::Waiting;
@@ -624,43 +764,13 @@ fn render_review(app: &mut AppState, ui: &mut Ui, p: &Palette) {
                 ui.add_space(8.0);
                 ui.label(&review.summary);
             });
-        ui.add_space(12.0);
-        if review.last.is_some() {
-            let undo = secondary_button(
-                RichText::new("Undo last grade"),
-                TAP_HEIGHT,
-                p,
-            );
-            if ui
-                .add_sized([ui.available_width(), TAP_HEIGHT], undo)
-                .clicked()
-            {
+        if short && app.review.last.is_some() {
+            ui.add_space(8.0);
+            let undo = secondary_button(RichText::new("Undo"), TAP_HEIGHT, p)
+                .min_size(vec2(ui.available_width(), TAP_HEIGHT));
+            if ui.add(undo).clicked() {
                 let _ = app.undo();
             }
-            ui.add_space(8.0);
-        }
-        if !waiting {
-            let again = touch_button(
-                RichText::new("Study again"),
-                TAP_HEIGHT,
-                p.accent,
-                p.accent_ink,
-            );
-            if ui
-                .add_sized([ui.available_width(), TAP_HEIGHT], again)
-                .clicked()
-            {
-                let _ = app.start_review(app.review_scope);
-            }
-            ui.add_space(8.0);
-        }
-        let done =
-            secondary_button(RichText::new("Back to decks"), TAP_HEIGHT, p);
-        if ui
-            .add_sized([ui.available_width(), TAP_HEIGHT], done)
-            .clicked()
-        {
-            app.end_review();
         }
         return;
     }
@@ -671,7 +781,8 @@ fn render_review(app: &mut AppState, ui: &mut Ui, p: &Palette) {
         review.note.as_ref(),
         review.model.as_ref(),
     ) {
-        let (question, answer) = sides(model, note, card.ordinal);
+        let (question, _) = sides(model, note, card.ordinal);
+        let (_, answer) = sides_answer(model, note, card.ordinal);
         EguiFrame::new()
             .fill(p.panel)
             .stroke(Stroke::new(1.0_f32, p.border))
@@ -694,71 +805,192 @@ fn render_review(app: &mut AppState, ui: &mut Ui, p: &Palette) {
     } else {
         ui.label(RichText::new("No card loaded.").color(p.muted));
     }
-    ui.add_space(12.0);
-
-    if review.phase == ReviewPhase::Question {
-        let reveal = touch_button(
-            RichText::new("Show answer"),
-            TAP_HEIGHT,
-            p.accent,
-            p.accent_ink,
-        );
-        if ui
-            .add_sized([ui.available_width(), TAP_HEIGHT], reveal)
-            .clicked()
-        {
-            app.reveal();
+    if short {
+        ui.add_space(8.0);
+        if app.review.last.is_some() {
+            let undo = secondary_button(RichText::new("Undo"), TAP_HEIGHT, p)
+                .min_size(vec2(ui.available_width(), TAP_HEIGHT));
+            if ui.add(undo).clicked() {
+                let _ = app.undo();
+            }
+            ui.add_space(6.0);
         }
+        let end = secondary_button(RichText::new("End session"), TAP_HEIGHT, p)
+            .min_size(vec2(ui.available_width(), TAP_HEIGHT));
+        if ui.add(end).clicked() {
+            app.end_review();
+        }
+    }
+}
+
+fn review_actions_height(app: &AppState, compact: bool, short: bool) -> f32 {
+    if short {
+        let primary = match app.review.phase {
+            ReviewPhase::Answer if compact => TAP_HEIGHT,
+            ReviewPhase::Answer => RATING_HEIGHT,
+            ReviewPhase::Question
+            | ReviewPhase::Summary
+            | ReviewPhase::Waiting => TAP_HEIGHT,
+        };
+        return REVIEW_GAP + primary + REVIEW_GAP;
+    }
+    let primary = match app.review.phase {
+        ReviewPhase::Question | ReviewPhase::Summary => TAP_HEIGHT,
+        ReviewPhase::Answer if compact => TAP_HEIGHT,
+        ReviewPhase::Answer => RATING_HEIGHT,
+        ReviewPhase::Waiting => 0.0,
+    };
+    let gap = if primary > 0.0 { REVIEW_GAP } else { 0.0 };
+    let height = REVIEW_GAP + primary + gap + TAP_HEIGHT + REVIEW_GAP;
+    if compact || app.review.last.is_none() {
+        height
     } else {
-        let ratings = [
-            (Rating::Again, "Again", p.danger),
-            (Rating::Hard, "Hard", p.peach),
-            (Rating::Good, "Good", p.accent),
-            (Rating::Easy, "Easy", p.success),
-        ];
-        let width = (ui.available_width() - 24.0).max(0.0) / 4.0;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            for (index, (rating, label, fill)) in ratings.iter().enumerate() {
-                let ink = if matches!(rating, Rating::Hard | Rating::Easy) {
-                    Color32::from_rgb(24, 24, 37)
-                } else {
-                    p.accent_ink
-                };
-                let interval =
-                    interval_label(*review.intervals.get(index).unwrap_or(&0));
-                let text = format!("{label}\n{interval}");
-                let button = touch_button(
-                    RichText::new(text),
-                    RATING_HEIGHT,
-                    *fill,
-                    ink,
-                );
-                if ui.add_sized([width, RATING_HEIGHT], button).clicked() {
-                    let _ = app.rate(*rating);
+        height + TAP_HEIGHT + REVIEW_GAP
+    }
+}
+
+fn render_review_actions(
+    app: &mut AppState,
+    ui: &mut Ui,
+    p: &Palette,
+    compact: bool,
+    short: bool,
+) {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
+        ui.add_space(REVIEW_GAP);
+        let phase = app.review.phase;
+        if short && matches!(phase, ReviewPhase::Summary | ReviewPhase::Waiting)
+        {
+            let back =
+                secondary_button(RichText::new("Back to decks"), TAP_HEIGHT, p)
+                    .min_size(vec2(ui.available_width(), TAP_HEIGHT));
+            if ui.add(back).clicked() {
+                app.end_review();
+            }
+            return;
+        }
+        match phase {
+            ReviewPhase::Question => {
+                let reveal = touch_button(
+                    RichText::new("Show answer"),
+                    TAP_HEIGHT,
+                    p.accent,
+                    p.accent_ink,
+                )
+                .min_size(vec2(ui.available_width(), TAP_HEIGHT));
+                if ui.add(reveal).clicked() {
+                    app.reveal();
                 }
             }
-        });
-    }
-
-    ui.add_space(10.0);
-    if review.last.is_some() {
-        let undo = secondary_button(RichText::new("Undo"), TAP_HEIGHT, p);
-        if ui
-            .add_sized([ui.available_width(), TAP_HEIGHT], undo)
-            .clicked()
-        {
-            let _ = app.undo();
+            ReviewPhase::Answer => {
+                let ratings = [
+                    (Rating::Again, "Again", p.danger),
+                    (Rating::Hard, "Hard", p.peach),
+                    (Rating::Good, "Good", p.accent),
+                    (Rating::Easy, "Easy", p.success),
+                ];
+                let height = if compact { TAP_HEIGHT } else { RATING_HEIGHT };
+                let gap = if compact { 4.0 } else { 8.0 };
+                let width = (ui.available_width() - 3.0 * gap).max(0.0) / 4.0;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    if compact {
+                        ui.spacing_mut().button_padding = vec2(4.0, 2.0);
+                    }
+                    for (index, (rating, label, fill)) in
+                        ratings.iter().enumerate()
+                    {
+                        let ink =
+                            if matches!(rating, Rating::Hard | Rating::Easy) {
+                                Color32::from_rgb(24, 24, 37)
+                            } else {
+                                p.accent_ink
+                            };
+                        let interval = interval_label(
+                            *app.review.intervals.get(index).unwrap_or(&0),
+                        );
+                        let text = format!("{label}\n{interval}");
+                        let size = if compact { 14.0 } else { 17.0 };
+                        let button = touch_button(
+                            RichText::new(text).size(size),
+                            height,
+                            *fill,
+                            ink,
+                        );
+                        if ui.add_sized([width, height], button).clicked() {
+                            let _ = app.rate(*rating);
+                        }
+                    }
+                });
+            }
+            ReviewPhase::Summary => {
+                let again = touch_button(
+                    RichText::new("Study again"),
+                    TAP_HEIGHT,
+                    p.accent,
+                    p.accent_ink,
+                )
+                .min_size(vec2(ui.available_width(), TAP_HEIGHT));
+                if ui.add(again).clicked() {
+                    let _ = app.start_review(app.review_scope);
+                }
+            }
+            ReviewPhase::Waiting => {}
         }
-        ui.add_space(8.0);
-    }
-    let end = secondary_button(RichText::new("End session"), TAP_HEIGHT, p);
-    if ui
-        .add_sized([ui.available_width(), TAP_HEIGHT], end)
-        .clicked()
-    {
-        app.end_review();
-    }
+        if short {
+            return;
+        }
+        if phase != ReviewPhase::Waiting {
+            ui.add_space(REVIEW_GAP);
+        }
+        let undo = app.review.last.is_some();
+        let end_label =
+            if matches!(phase, ReviewPhase::Summary | ReviewPhase::Waiting) {
+                "Back to decks"
+            } else {
+                "End session"
+            };
+        if compact {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = REVIEW_GAP;
+                let width = if undo {
+                    (ui.available_width() - REVIEW_GAP) / 2.0
+                } else {
+                    ui.available_width()
+                };
+                if undo {
+                    let button =
+                        secondary_button(RichText::new("Undo"), TAP_HEIGHT, p);
+                    if ui.add_sized([width, TAP_HEIGHT], button).clicked() {
+                        let _ = app.undo();
+                    }
+                }
+                let button =
+                    secondary_button(RichText::new(end_label), TAP_HEIGHT, p);
+                if ui.add_sized([width, TAP_HEIGHT], button).clicked() {
+                    app.end_review();
+                }
+            });
+        } else {
+            if undo {
+                let button =
+                    secondary_button(RichText::new("Undo"), TAP_HEIGHT, p)
+                        .min_size(vec2(ui.available_width(), TAP_HEIGHT));
+                if ui.add(button).clicked() {
+                    let _ = app.undo();
+                }
+                ui.add_space(REVIEW_GAP);
+            }
+            let button =
+                secondary_button(RichText::new(end_label), TAP_HEIGHT, p)
+                    .min_size(vec2(ui.available_width(), TAP_HEIGHT));
+            if ui.add(button).clicked() {
+                app.end_review();
+            }
+        }
+        ui.add_space(REVIEW_GAP);
+    });
 }
 
 fn review_counts(
@@ -1031,6 +1263,13 @@ fn render_browse(app: &mut AppState, ui: &mut Ui, p: &Palette) {
         }
         ui.add_space(8.0);
     }
+    if app.browse.rows.len() < app.browse.total {
+        let more = secondary_button(RichText::new("Load more"), TAP_HEIGHT, p)
+            .min_size(vec2(ui.available_width(), TAP_HEIGHT));
+        if ui.add(more).clicked() {
+            app.load_more();
+        }
+    }
     if let Some(card_id) = open {
         let _ = app.start_edit(card_id);
     }
@@ -1284,7 +1523,10 @@ const fn theme_name(theme: ThemeChoice) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::interval_label;
+    use super::{ReviewShortcut, interval_label, review_shortcut};
+    use crate::mobile::state::ReviewPhase;
+    use egui::Key;
+    use ranki_model::Rating;
 
     #[test]
     fn interval_labels_use_readable_time_units() {
@@ -1293,5 +1535,59 @@ mod tests {
         assert_eq!(interval_label(-7_200), "2h");
         assert_eq!(interval_label(-86_400), "1d");
         assert_eq!(interval_label(3), "3d");
+    }
+
+    #[test]
+    fn review_keys_reveal_grade_undo_and_end() {
+        assert_eq!(
+            review_shortcut(Key::Space, ReviewPhase::Question, false, false),
+            Some(ReviewShortcut::Reveal)
+        );
+        assert_eq!(
+            review_shortcut(Key::Enter, ReviewPhase::Question, false, false),
+            Some(ReviewShortcut::Reveal)
+        );
+        let grades = [
+            (Key::Num1, Rating::Again),
+            (Key::Num2, Rating::Hard),
+            (Key::Num3, Rating::Good),
+            (Key::Num4, Rating::Easy),
+        ];
+        for (key, rating) in grades {
+            assert_eq!(
+                review_shortcut(key, ReviewPhase::Answer, false, false),
+                Some(ReviewShortcut::Grade(rating))
+            );
+        }
+        assert_eq!(
+            review_shortcut(Key::Backspace, ReviewPhase::Answer, true, false),
+            Some(ReviewShortcut::Undo)
+        );
+        assert_eq!(
+            review_shortcut(Key::Escape, ReviewPhase::Question, false, false),
+            Some(ReviewShortcut::End)
+        );
+    }
+
+    #[test]
+    fn review_keys_skip_text_fields_and_inactive_phases() {
+        for key in [Key::Space, Key::Num3, Key::Backspace, Key::Escape] {
+            assert_eq!(
+                review_shortcut(key, ReviewPhase::Answer, true, true),
+                None
+            );
+        }
+        assert_eq!(
+            review_shortcut(Key::Num3, ReviewPhase::Question, true, false),
+            None
+        );
+        assert_eq!(
+            review_shortcut(Key::Space, ReviewPhase::Answer, true, false),
+            None
+        );
+        assert_eq!(
+            review_shortcut(Key::Backspace, ReviewPhase::Answer, false, false),
+            None
+        );
     }
 }
