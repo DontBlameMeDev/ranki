@@ -166,6 +166,16 @@ fn decode_request(request: &crate::RecordedRequest) -> TestResult<Vec<u8>> {
     wire::decode(&response)
 }
 
+fn changes_last_usn(request: &crate::RecordedRequest) -> TestResult<i32> {
+    let bytes = decode_request(request)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    Ok(value
+        .get("lastUsn")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|usn| i32::try_from(usn).ok())
+        .unwrap_or(-1))
+}
+
 fn assert_status(
     client: &mut SyncClient<MockTransport>,
 ) -> TestResult<RemoteStatus> {
@@ -973,6 +983,132 @@ fn failed_media_refill_keeps_retrying() -> TestResult {
     client.sync_media()?;
     assert_eq!(fs::read(media.join("Afghanistan.png"))?, b"flag bytes");
     assert!(!client.state().media_refill_needed);
+    Ok(())
+}
+
+#[test]
+fn incremental_media_sync_starts_at_the_checkpoint() -> TestResult {
+    let directory = TempDir::new()?;
+    let collection = directory.path().join("collection.anki2");
+    let media = directory.path().join("media");
+    let state_path = directory.path().join("sync.json");
+    make_collection(&collection, (100, 100, 1))?;
+    fs::create_dir_all(&media)?;
+    fs::write(media.join("old.png"), b"old bytes")?;
+    write_state(
+        &state_path,
+        &SyncState {
+            host_key: fixture_key(&directory),
+            last_mod: Some(100),
+            last_scm: Some(100),
+            last_media_usn: 1,
+            media_scan_usn: 1,
+            ..SyncState::default()
+        },
+    )?;
+    let transport = MockTransport::new()
+        .with_response(SyncMethod::MediaBegin, media_begin(2)?)
+        .with_response(
+            SyncMethod::MediaChanges,
+            MockResponse::ok_json(&json!({
+                "data": [["new.png", 2, "8ca7fb2f88e412618b0dc9caa9cabac52d27b0bf"]],
+                "err": ""
+            }))?,
+        )
+        .with_response(
+            SyncMethod::MediaDownload,
+            MockResponse::ok_bytes(media_zip("new.png", b"late bytes")?)?,
+        );
+    let mut client =
+        SyncClient::new(transport, &collection, &media, &state_path)?;
+
+    client.sync_media()?;
+
+    assert_eq!(fs::read(media.join("new.png"))?, b"late bytes");
+    assert_eq!(client.state().media_scan_usn, 2);
+    assert_eq!(client.state().last_media_usn, 2);
+    let cursors = client
+        .transport()
+        .requests()
+        .iter()
+        .filter(|request| request.method == SyncMethod::MediaChanges)
+        .map(changes_last_usn)
+        .collect::<TestResult<Vec<_>>>()?;
+    assert_eq!(cursors, [1]);
+    Ok(())
+}
+
+#[test]
+fn interrupted_media_sync_resumes_from_the_saved_checkpoint() -> TestResult {
+    let directory = TempDir::new()?;
+    let collection = directory.path().join("collection.anki2");
+    let media = directory.path().join("media");
+    let state_path = directory.path().join("sync.json");
+    make_collection(&collection, (100, 100, 1))?;
+    fs::create_dir_all(&media)?;
+    fs::write(media.join("flag.png"), b"flag bytes")?;
+    write_state(
+        &state_path,
+        &SyncState {
+            host_key: fixture_key(&directory),
+            last_mod: Some(100),
+            last_scm: Some(100),
+            last_media_usn: 1,
+            media_scan_usn: 1,
+            ..SyncState::default()
+        },
+    )?;
+    let first = MockTransport::new()
+        .with_response(SyncMethod::MediaBegin, media_begin(3)?)
+        .with_response(
+            SyncMethod::MediaChanges,
+            MockResponse::ok_json(&json!({
+                "data": [["flag.png", 2, "b297e6188e634a5e3ec2d366d8ec7cf3564af58a"]],
+                "err": ""
+            }))?,
+        )
+        .with_response(
+            SyncMethod::MediaChanges,
+            MockResponse::ok_json(&json!({
+                "data": [["late.png", 3, "8ca7fb2f88e412618b0dc9caa9cabac52d27b0bf"]],
+                "err": ""
+            }))?,
+        )
+        .with_failure(SyncMethod::MediaDownload, SyncError::Timeout);
+    let mut client = SyncClient::new(first, &collection, &media, &state_path)?;
+
+    assert_eq!(client.sync_media(), Err(SyncError::Timeout));
+    assert_eq!(SyncState::load(&state_path)?.media_scan_usn, 2);
+    assert_eq!(SyncState::load(&state_path)?.last_media_usn, 1);
+
+    let second = MockTransport::new()
+        .with_response(SyncMethod::MediaBegin, media_begin(3)?)
+        .with_response(
+            SyncMethod::MediaChanges,
+            MockResponse::ok_json(&json!({
+                "data": [["late.png", 3, "8ca7fb2f88e412618b0dc9caa9cabac52d27b0bf"]],
+                "err": ""
+            }))?,
+        )
+        .with_response(
+            SyncMethod::MediaDownload,
+            MockResponse::ok_bytes(media_zip("late.png", b"late bytes")?)?,
+        );
+    let mut client = SyncClient::new(second, &collection, &media, &state_path)?;
+
+    client.sync_media()?;
+
+    assert_eq!(fs::read(media.join("late.png"))?, b"late bytes");
+    assert_eq!(client.state().media_scan_usn, 3);
+    assert_eq!(client.state().last_media_usn, 3);
+    let cursors = client
+        .transport()
+        .requests()
+        .iter()
+        .filter(|request| request.method == SyncMethod::MediaChanges)
+        .map(changes_last_usn)
+        .collect::<TestResult<Vec<_>>>()?;
+    assert_eq!(cursors, [2]);
     Ok(())
 }
 
