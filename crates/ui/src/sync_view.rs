@@ -770,6 +770,8 @@ impl Root {
             let mut detail = div()
                 .flex()
                 .flex_col()
+                .flex_1()
+                .min_w(px(160.))
                 .gap(px(SPACE_GROUP))
                 .child(status_line(note, colors));
             if let Some(timestamp) = last_sync {
@@ -780,6 +782,7 @@ impl Root {
             }
             div()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
                 .gap(px(SPACE_SECTION))
