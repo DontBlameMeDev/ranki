@@ -1080,73 +1080,146 @@ impl Root {
                     .into_any_element(),
             );
         }
-        let toast_width = (viewport_width - 2.0 * (nav_width + 32.0)).max(0.0);
-        if let Some(toast) = self.live_toast() {
-            let (hue, icon_name, prefix) = match toast.kind {
-                crate::app::ToastKind::Success => {
-                    (colors.green, "icon-check", "Done")
-                }
-                crate::app::ToastKind::Error => {
-                    (colors.red, "icon-bell", "Error")
-                }
+        let toasts = self.live_toasts();
+        if !toasts.is_empty() {
+            let toast_width = (viewport_width - 32.0).clamp(0.0, 320.0);
+            let progress_width = (toast_width - 28.0).max(0.0);
+            let bottom = if is_mobile_width(viewport_width) {
+                MOBILE_NAV_HEIGHT + 16.0
+            } else {
+                16.0
             };
-            let dismiss = cx.listener(|root, _: &ClickEvent, _, cx| {
-                root.clear_toast();
-                cx.notify();
-            });
-            let body = div()
-                .flex()
-                .w_full()
-                .min_w(px(0.))
-                .items_center()
-                .gap(px(SPACE_GROUP))
-                .px(px(SPACE_RELATED))
-                .py(px(SPACE_RELATED))
-                .rounded(px(12.))
-                .bg(crate::theme::alpha(hue, 0.16))
-                .border_1()
-                .border_color(crate::theme::alpha(hue, 0.4))
-                .text_size(px(13.))
-                .text_color(colors.text)
-                .child(icon(icon_name, 16., hue))
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(hue)
-                        .child(prefix),
-                )
-                .child(div().flex_1().min_w(px(0.)).child(toast.text.clone()))
-                .child(
-                    Interaction::surface(colors)
-                        .apply(
+            let progress_ms = self.motion_ms(
+                u64::try_from(crate::app::TOAST_LIFETIME.as_millis())
+                    .unwrap_or(5_000),
+            );
+            let cards: Vec<AnyElement> = toasts
+                .into_iter()
+                .map(|toast| {
+                    let (hue, icon_name) = match toast.kind {
+                        crate::app::ToastKind::Success => {
+                            (colors.green, "icon-check")
+                        }
+                        crate::app::ToastKind::Warning => {
+                            (colors.peach, "icon-warning")
+                        }
+                        crate::app::ToastKind::Error => {
+                            (colors.red, "icon-error")
+                        }
+                    };
+                    let seq = toast.seq;
+                    let key = usize::try_from(seq).unwrap_or(0);
+                    let dismiss_id =
+                        SharedString::from(format!("toast-dismiss-{seq}"));
+                    let dismiss =
+                        cx.listener(move |root, _: &ClickEvent, _, cx| {
+                            root.clear_toast_if(Some(seq));
+                            cx.notify();
+                        });
+                    let progress = if progress_ms == 0 {
+                        div().w(px(0.)).h(px(3.)).bg(hue).into_any_element()
+                    } else {
+                        use gpui::AnimationExt as _;
+                        div()
+                            .h(px(3.))
+                            .bg(hue)
+                            .with_animation(
+                                ("toast-progress", key),
+                                gpui::Animation::new(
+                                    std::time::Duration::from_millis(
+                                        progress_ms,
+                                    ),
+                                ),
+                                move |fill, delta| {
+                                    fill.w(px(progress_width * (1.0 - delta)))
+                                },
+                            )
+                            .into_any_element()
+                    };
+                    let body = div()
+                        .w_full()
+                        .min_h(px(64.))
+                        .flex()
+                        .flex_col()
+                        .rounded(px(10.))
+                        .bg(colors.surface0)
+                        .border_1()
+                        .border_color(colors.surface1)
+                        .debug_selector(|| String::from("toast-card"))
+                        .child(
                             div()
-                                .id("toast-dismiss")
                                 .flex()
-                                .items_center()
-                                .justify_center()
-                                .w(px(24.))
-                                .h(px(24.))
-                                .flex_none()
-                                .rounded(px(6.))
-                                .cursor_pointer(),
+                                .w_full()
+                                .items_start()
+                                .gap(px(10.))
+                                .px(px(14.))
+                                .pt(px(13.))
+                                .pb(px(9.))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .pt(px(2.))
+                                        .child(icon(icon_name, 20., hue)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .text_size(px(13.))
+                                        .line_height(px(18.))
+                                        .text_color(colors.text)
+                                        .child(toast.text.clone()),
+                                )
+                                .child(
+                                    Interaction::surface(colors)
+                                        .apply(
+                                            div()
+                                                .id(dismiss_id)
+                                                .flex()
+                                                .flex_none()
+                                                .items_center()
+                                                .justify_center()
+                                                .w(px(22.))
+                                                .h(px(22.))
+                                                .rounded(px(6.))
+                                                .cursor_pointer(),
+                                        )
+                                        .on_click(dismiss)
+                                        .tooltip(label_tooltip(
+                                            "Dismiss", colors,
+                                        ))
+                                        .child(icon(
+                                            "icon-x",
+                                            14.,
+                                            colors.subtext,
+                                        )),
+                                ),
                         )
-                        .on_click(dismiss)
-                        .tooltip(label_tooltip("Dismiss", colors))
-                        .child(icon("icon-x", 14., colors.subtext)),
-                );
+                        .child(
+                            div()
+                                .w_full()
+                                .h(px(3.))
+                                .bg(crate::theme::alpha(hue, 0.18))
+                                .child(progress),
+                        );
+                    crate::components::fade_in(
+                        body,
+                        ("toast", key),
+                        self.motion_ms(crate::theme::MOTION_QUICK_MS),
+                    )
+                })
+                .collect();
             layers.push(
                 div()
                     .absolute()
-                    .bottom(px(72.))
-                    .left(px(nav_width + 32.))
-                    .right(px(nav_width + 32.))
+                    .bottom(px(bottom))
+                    .right(px(16.))
                     .w(px(toast_width))
-                    .child(crate::components::fade_in(
-                        body,
-                        ("toast", usize::try_from(toast.seq).unwrap_or(0)),
-                        self.motion_ms(crate::theme::MOTION_QUICK_MS),
-                    ))
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .gap(px(16.))
+                    .children(cards)
                     .into_any_element(),
             );
         }

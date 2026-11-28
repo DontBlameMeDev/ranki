@@ -103,7 +103,7 @@ fn login_and_sync<T: SyncTransport>(
 fn sync_message(outcome: &SyncOutcome) -> (ToastKind, String) {
     match outcome {
         SyncOutcome::Disabled => (
-            ToastKind::Error,
+            ToastKind::Warning,
             String::from("Signed in, but sync did not start"),
         ),
         SyncOutcome::NoChanges => (
@@ -119,11 +119,11 @@ fn sync_message(outcome: &SyncOutcome) -> (ToastKind, String) {
             String::from("Signed in. Collection downloaded"),
         ),
         SyncOutcome::Conflict { reason } => (
-            ToastKind::Error,
+            ToastKind::Warning,
             format!("Signed in. Sync needs a manual choice: {reason}"),
         ),
         SyncOutcome::RetryLater { reason } => (
-            ToastKind::Error,
+            ToastKind::Warning,
             format!("Signed in. Sync failed: {reason}. Use Sync now to retry"),
         ),
     }
@@ -143,7 +143,7 @@ fn media_sync_error(error: &str) -> String {
 fn refresh_message(outcome: &SyncOutcome) -> (ToastKind, String) {
     match outcome {
         SyncOutcome::Disabled => {
-            (ToastKind::Error, String::from("Sync did not start"))
+            (ToastKind::Warning, String::from("Sync did not start"))
         }
         SyncOutcome::NoChanges => {
             (ToastKind::Success, String::from("Already up to date"))
@@ -155,11 +155,11 @@ fn refresh_message(outcome: &SyncOutcome) -> (ToastKind, String) {
             (ToastKind::Success, String::from("Collection downloaded"))
         }
         SyncOutcome::Conflict { reason } => (
-            ToastKind::Error,
+            ToastKind::Warning,
             format!("Sync needs a manual choice: {reason}"),
         ),
         SyncOutcome::RetryLater { reason } => (
-            ToastKind::Error,
+            ToastKind::Warning,
             format!("Sync failed: {reason}. Use Sync now to retry"),
         ),
     }
@@ -1075,7 +1075,7 @@ mod tests {
         let (kind, text) = refresh_message(&SyncOutcome::RetryLater {
             reason: reason.clone(),
         });
-        assert_eq!(kind, crate::app::ToastKind::Error);
+        assert_eq!(kind, crate::app::ToastKind::Warning);
         assert_eq!(text, "Sync failed: offline. Use Sync now to retry");
         let (_, signed_in) = sync_message(&SyncOutcome::RetryLater { reason });
         assert_eq!(
@@ -1119,7 +1119,7 @@ mod tests {
         let (error, toast) = cx.read_entity(&root, |root, _| {
             (
                 root.sync.error.clone(),
-                root.toast.clone().map(|toast| toast.text),
+                root.latest_toast().cloned().map(|toast| toast.text),
             )
         });
         let expected =
@@ -1213,7 +1213,7 @@ mod tests {
         let (kind, text) = refresh_message(&SyncOutcome::Conflict {
             reason: String::from("both collections changed"),
         });
-        assert_eq!(kind, crate::app::ToastKind::Error);
+        assert_eq!(kind, crate::app::ToastKind::Warning);
         assert_eq!(
             text,
             "Sync needs a manual choice: both collections changed"

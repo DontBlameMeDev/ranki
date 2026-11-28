@@ -44,7 +44,8 @@ use crate::{
 pub const LEARN_AHEAD_SECS: i64 = 20 * 60;
 pub const DEBOUNCE: Duration = Duration::from_millis(120);
 pub const FORECAST_DAYS: usize = 7;
-const TOAST_LIFETIME: Duration = Duration::from_secs(5);
+pub const TOAST_LIFETIME: Duration = Duration::from_secs(5);
+const MAX_TOASTS: usize = 4;
 const MAX_REVIEW_TIME: Duration = Duration::from_secs(60);
 pub const DECK_SUMMARY_LABEL: &str = "Due today (all decks)";
 const TAG_SUGGESTION_LIMIT: usize = 6;
@@ -164,14 +165,13 @@ pub enum Confirmation {
     Reload,
 }
 
-/// Tone of a toast. Errors keep the red role, everything else reports a
-/// completed action and must not look like a failure.
+/// Tone of a toast. The icon carries the tone; the message carries the reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToastKind {
     Success,
+    Warning,
     Error,
 }
-
 #[derive(Clone, Debug)]
 pub struct Toast {
     pub kind: ToastKind,
@@ -645,7 +645,7 @@ pub struct Root {
     pub(crate) review: ReviewState,
     pub(crate) add: AddState,
     pub(crate) scheduler: FsrsScheduler,
-    pub(crate) toast: Option<Toast>,
+    pub(crate) toasts: Vec<Toast>,
     pub(crate) help_open: bool,
     pub(crate) dev_reveal: bool,
     pub(crate) external_change: bool,
@@ -1205,7 +1205,7 @@ impl Root {
                 color_picker_dismissed_target: None,
                 occlusion: OcclusionState::default(),
             },
-            toast: None,
+            toasts: Vec::new(),
             help_open: false,
             dev_reveal: env::var("RANKI_UI_DEV_REVEAL")
                 .is_ok_and(|value| value == "1"),
@@ -1668,18 +1668,20 @@ impl Root {
             });
         }
         if let Ok(spec) = env::var("RANKI_UI_DEV_TOAST") {
-            let (kind, text) = spec.split_once(':').map_or(
-                (ToastKind::Error, spec.as_str()),
-                |(kind, text)| {
-                    let kind = if kind.eq_ignore_ascii_case("success") {
-                        ToastKind::Success
-                    } else {
-                        ToastKind::Error
-                    };
-                    (kind, text)
-                },
-            );
-            root.show_toast(kind, text, cx);
+            for spec in spec.split('|') {
+                let (kind, text) = spec.split_once(':').map_or(
+                    (ToastKind::Error, spec),
+                    |(kind, text)| {
+                        let kind = match kind.to_ascii_lowercase().as_str() {
+                            "success" => ToastKind::Success,
+                            "warning" | "warn" => ToastKind::Warning,
+                            _ => ToastKind::Error,
+                        };
+                        (kind, text)
+                    },
+                );
+                root.show_toast(kind, text, cx);
+            }
         }
         if env::var("RANKI_UI_DEV_SAVE").is_ok_and(|value| value == "1") {
             root.view = View::AddCard;
@@ -2221,46 +2223,42 @@ impl Root {
         .detach();
     }
 
-    /// Reports a completed action. The toast retires on its own after
-    /// [`TOAST_LIFETIME`], or sooner when dismissed.
+    /// Adds a toast to the bottom-right stack and returns its identity, so a
+    /// caller can remove only this message later.
     pub(crate) fn set_toast(
         &mut self,
         kind: ToastKind,
         text: impl Into<String>,
-    ) {
+    ) -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1);
-        self.toast = Some(Toast {
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.toasts.push(Toast {
             kind,
             text: text.into(),
             created_at: Instant::now(),
-            seq: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            seq,
         });
+        if self.toasts.len() > MAX_TOASTS {
+            self.toasts.drain(..self.toasts.len() - MAX_TOASTS);
+        }
+        seq
     }
 
-    /// Clears the toast and arms its dismissal, so the window redraws even
-    /// when the pointer and keyboard stay idle.
+    /// Shows a toast and retires only that toast after [`TOAST_LIFETIME`].
     pub(crate) fn show_toast(
         &mut self,
         kind: ToastKind,
         text: impl Into<String>,
         cx: &mut Context<Self>,
     ) {
-        self.set_toast(kind, text);
-        let created_at = self.toast.as_ref().map(|toast| toast.created_at);
-        let Some(created_at) = created_at else {
-            return;
-        };
+        let seq = self.set_toast(kind, text);
         let timer = cx.background_executor().timer(TOAST_LIFETIME);
         cx.spawn(async move |this, cx| {
             timer.await;
             let _ = this.update(cx, |root, cx| {
-                let same = root
-                    .toast
-                    .as_ref()
-                    .is_some_and(|toast| toast.created_at == created_at);
-                if same {
-                    root.clear_toast();
+                if root.toasts.iter().any(|toast| toast.seq == seq) {
+                    root.clear_toast_if(Some(seq));
                     cx.notify();
                 }
             });
@@ -2268,37 +2266,36 @@ impl Root {
         .detach();
     }
 
-    pub(crate) fn clear_toast(&mut self) {
-        self.toast = None;
-    }
-
     /// Clears a toast only when the message still belongs to this task.
     pub(crate) fn clear_toast_if(&mut self, seq: Option<u64>) {
-        if self
-            .toast
-            .as_ref()
-            .is_some_and(|toast| Some(toast.seq) == seq)
-        {
-            self.toast = None;
+        if let Some(seq) = seq {
+            self.toasts.retain(|toast| toast.seq != seq);
         }
     }
 
-    /// Errors from the create-deck dialog belong next to its input, not in a
-    /// toast behind the modal.
+    /// The newest toast in the stack.
+    #[cfg(test)]
+    pub(crate) fn latest_toast(&self) -> Option<&Toast> {
+        self.toasts.last()
+    }
+
+    /// Toasts that have not reached their auto-close deadline.
+    pub(crate) fn live_toasts(&self) -> Vec<&Toast> {
+        let now = Instant::now();
+        self.toasts
+            .iter()
+            .filter(|toast| !toast.expired(now))
+            .collect()
+    }
+
+    /// Errors from the create-deck dialog belong next to its input.
     pub(crate) fn set_create_error(
         &mut self,
         message: impl Into<String>,
         cx: &mut Context<Self>,
     ) {
         self.create_error = Some(message.into());
-        self.clear_toast();
         cx.notify();
-    }
-
-    pub(crate) fn live_toast(&self) -> Option<&Toast> {
-        self.toast
-            .as_ref()
-            .filter(|toast| !toast.expired(Instant::now()))
     }
 
     /// Motion is on unless the setting or the desktop preference disables it.
@@ -2365,7 +2362,6 @@ impl Root {
                         self.add.model_index = found;
                     }
                     self.reset_fields(cx);
-                    self.clear_toast();
                 }
                 Err(error) => {
                     self.add.errors.insert(
@@ -2486,7 +2482,7 @@ impl Root {
                         "Importing package...",
                         cx,
                     );
-                    root.toast.as_ref().map(|toast| toast.seq)
+                    root.toasts.last().map(|toast| toast.seq)
                 })
                 .ok()
                 .flatten();
@@ -2597,7 +2593,7 @@ impl Root {
             format!("Exporting {deck_name}..."),
             cx,
         );
-        let seq = self.toast.as_ref().map(|toast| toast.seq);
+        let seq = self.toasts.last().map(|toast| toast.seq);
         let suggested = Self::export_file_name(&deck.name);
         let directory = collection
             .parent()
@@ -3562,7 +3558,6 @@ impl Root {
             Confirmation::RemoveCard { id, .. } => {
                 match self.store.remove_card(*id) {
                     Ok(()) => {
-                        self.clear_toast();
                         self.forget_card(*id, cx);
                         if self
                             .card_edit
@@ -3624,7 +3619,6 @@ impl Root {
                     .update(cx, super::text_field::TextField::clear);
                 self.create_error = None;
                 self.create_modal = false;
-                self.clear_toast();
                 self.reload(cx, false);
                 self.selected =
                     self.decks.iter().position(|item| item.id == deck.id);
@@ -3693,7 +3687,6 @@ impl Root {
                 if let Some(old) = old_name.as_deref() {
                     self.rename_expanded_paths(old, &name);
                 }
-                self.clear_toast();
                 self.reload(cx, false);
                 self.show_toast(ToastKind::Success, "Deck renamed", cx);
                 self.persist_state(cx);
@@ -3962,7 +3955,6 @@ impl Root {
             saved.tags = tags;
             match self.store.update_note(&saved, deck.id) {
                 Ok(()) => {
-                    self.clear_toast();
                     self.card_edit = None;
                     self.add.tag_chips.clear();
                     self.add.tags.update(cx, TextField::clear);
@@ -3992,7 +3984,6 @@ impl Root {
             match self.store.add_note(&note) {
                 Ok(ids) => {
                     let count = ids.len();
-                    self.clear_toast();
                     for field in &self.add.fields {
                         field.update(cx, |field, cx| {
                             field.seed("", cx);
