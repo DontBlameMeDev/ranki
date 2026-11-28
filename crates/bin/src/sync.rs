@@ -8,11 +8,13 @@
 //! never stored in config, printed, or included in a `Debug` implementation.
 
 use std::env;
+use std::fmt;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
+use thiserror::Error;
 
 use ranki_model::Config;
 use ranki_model::Settings;
@@ -298,6 +300,38 @@ pub(super) enum SyncMode {
     FullDownload,
 }
 
+/// Errors from an explicit `ranki sync` command.
+#[derive(Debug, Error)]
+pub(super) enum ManualSyncError {
+    #[error(
+        "no sync credentials are available. Set RANKI_SYNC_HKEY, set RANKI_SYNC_USERNAME and RANKI_SYNC_PASSWORD, or pass --sync-hkey-file <path>"
+    )]
+    NoCredentials,
+    #[error("sync conflict: {0}")]
+    Conflict(String),
+    #[error("sync will retry later: {0}")]
+    RetryLater(String),
+    #[error(transparent)]
+    Sync(#[from] SyncError),
+}
+
+/// Collection result from an explicit sync, with any later media failure.
+#[derive(Debug)]
+pub(super) struct ManualSyncReport {
+    pub text: String,
+    pub media_error: Option<SyncError>,
+}
+
+impl fmt::Display for ManualSyncReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.text)?;
+        if let Some(error) = &self.media_error {
+            write!(formatter, "\nwarning: media sync failed: {error}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Runs one automatic collection sync. Media is left to explicit `ranki sync`
 /// and the window's background refresh, so ordinary commands never wait on a
 /// large media library. A missing credential is a silent no-op in the sync
@@ -327,8 +361,12 @@ fn refresh_media<T: SyncTransport>(
 
 /// Performs the explicit `ranki sync` operation and returns its display text.
 ///
+/// Explicit sync needs credentials or a stored host key, even for status.
+/// Safe sync conflicts and retries are errors so the command exits nonzero.
+///
 /// # Errors
-/// Returns sync errors for failed requests or local file operations.
+/// Returns an error when credentials are missing, a safe sync needs a user
+/// decision or retry, or a request or local file operation fails.
 #[expect(
     clippy::too_many_arguments,
     reason = "transport, settings, credentials and mode are distinct inputs"
@@ -338,31 +376,55 @@ pub(super) fn manual_sync<T: SyncTransport>(
     settings: &Settings,
     auth: Option<&SyncAuth>,
     mode: SyncMode,
-) -> Result<String, SyncError> {
+) -> Result<ManualSyncReport, ManualSyncError> {
+    if auth.is_none() && !has_stored_key(settings) {
+        return Err(ManualSyncError::NoCredentials);
+    }
     let mut client = build_client(transport, settings, auth)?;
     match mode {
         SyncMode::Status => {
             let info = client.status()?;
-            Ok(format!(
-                "remote mod={} scm={} usn={} empty={}",
-                info.mod_time, info.schema_mod_time, info.usn, info.empty
-            ))
+            Ok(ManualSyncReport {
+                text: format!(
+                    "remote mod={} scm={} usn={} empty={}",
+                    info.mod_time, info.schema_mod_time, info.usn, info.empty
+                ),
+                media_error: None,
+            })
         }
         SyncMode::FullUpload => {
             client.full_upload()?;
-            client.sync_media()?;
-            Ok(String::from("uploaded"))
+            Ok(ManualSyncReport {
+                text: String::from("uploaded"),
+                media_error: client.sync_media().err(),
+            })
         }
         SyncMode::FullDownload => {
             client.full_download()?;
-            client.sync_media()?;
-            Ok(String::from("downloaded"))
+            Ok(ManualSyncReport {
+                text: String::from("downloaded"),
+                media_error: client.sync_media().err(),
+            })
         }
         SyncMode::Safe => {
             let outcome = client
                 .sync(auth.and_then(|credentials| credentials.login.clone()))?;
-            refresh_media(&mut client, &outcome)?;
-            Ok(outcome_text(&outcome))
+            match &outcome {
+                SyncOutcome::Conflict { reason } => {
+                    return Err(ManualSyncError::Conflict(reason.clone()));
+                }
+                SyncOutcome::RetryLater { reason } => {
+                    return Err(ManualSyncError::RetryLater(reason.clone()));
+                }
+                SyncOutcome::Disabled
+                | SyncOutcome::NoChanges
+                | SyncOutcome::Uploaded
+                | SyncOutcome::Downloaded => {}
+            }
+            Ok(ManualSyncReport {
+                text: outcome_text(&outcome),
+                media_error: refresh_media(&mut client, &outcome).err(),
+            })
         }
     }
 }
@@ -513,6 +575,7 @@ mod tests {
     use ranki_sync::SyncTransport;
 
     use super::LazyTransport;
+    use super::ManualSyncError;
     use super::SharedMock;
     use super::SyncAuth;
     use super::SyncEnv;
@@ -802,14 +865,14 @@ mod tests {
         let settings = settings(directory.path());
         let mut transport =
             MockTransport::new().with_response(SyncMethod::Meta, meta(false));
-        let text = manual_sync(
+        let report = manual_sync(
             TransportRef(&mut transport),
             &settings,
             Some(&host_key_auth()),
             SyncMode::Status,
         )
         .unwrap();
-        assert!(text.starts_with("remote mod=1700000000000"));
+        assert!(report.text.starts_with("remote mod=1700000000000"));
         assert_eq!(transport.request_count(), 1);
     }
 
@@ -842,14 +905,15 @@ mod tests {
             )
             .with_response(SyncMethod::Meta, meta(false))
             .with_response(SyncMethod::MediaBegin, media_begin());
-        let text = manual_sync(
+        let report = manual_sync(
             TransportRef(&mut transport),
             &settings,
             Some(&host_key_auth()),
             SyncMode::Safe,
         )
         .unwrap();
-        assert_eq!(text, "uploaded");
+        assert_eq!(report.text, "uploaded");
+        assert!(report.media_error.is_none());
         let methods: Vec<SyncMethod> = transport
             .requests()
             .iter()
@@ -878,14 +942,15 @@ mod tests {
             )
             .with_response(SyncMethod::Meta, meta(false))
             .with_response(SyncMethod::MediaBegin, media_begin());
-        let text = manual_sync(
+        let report = manual_sync(
             TransportRef(&mut transport),
             &settings,
             Some(&host_key_auth()),
             SyncMode::FullUpload,
         )
         .unwrap();
-        assert_eq!(text, "uploaded");
+        assert_eq!(report.text, "uploaded");
+        assert!(report.media_error.is_none());
         assert_eq!(transport.requests()[0].method, SyncMethod::Upload);
         assert_eq!(transport.requests()[1].method, SyncMethod::Meta);
     }
@@ -1073,5 +1138,118 @@ mod tests {
         assert!(auth.is_some());
         assert!(!automatic);
         assert_eq!(state_reads.get(), 0);
+    }
+    #[test]
+    fn manual_sync_without_credentials_has_a_setup_hint() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = settings(directory.path());
+        let mut transport = MockTransport::new();
+        for mode in [SyncMode::Safe, SyncMode::Status] {
+            let error = manual_sync(
+                TransportRef(&mut transport),
+                &settings,
+                None,
+                mode,
+            )
+            .unwrap_err();
+            let message = error.to_string();
+            assert!(
+                [
+                    "RANKI_SYNC_HKEY",
+                    "RANKI_SYNC_USERNAME",
+                    "RANKI_SYNC_PASSWORD",
+                    "--sync-hkey-file",
+                ]
+                .iter()
+                .all(|hint| message.contains(hint)),
+                "{message}"
+            );
+        }
+        assert_eq!(transport.request_count(), 0);
+    }
+
+    #[test]
+    fn stored_host_key_allows_explicit_sync_without_new_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = settings(directory.path());
+        seed_state(&settings);
+        let mut transport =
+            MockTransport::new().with_response(SyncMethod::Meta, meta(false));
+        let report = manual_sync(
+            TransportRef(&mut transport),
+            &settings,
+            None,
+            SyncMode::Status,
+        )
+        .unwrap();
+        assert!(report.text.starts_with("remote mod=1700000000000"));
+        assert!(report.media_error.is_none());
+    }
+
+    #[test]
+    fn manual_safe_conflict_is_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        collection_with_cards(directory.path());
+        let settings = settings(directory.path());
+        let mut transport =
+            MockTransport::new().with_response(SyncMethod::Meta, meta(false));
+        let error = manual_sync(
+            TransportRef(&mut transport),
+            &settings,
+            Some(&host_key_auth()),
+            SyncMode::Safe,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ManualSyncError::Conflict(_)));
+        assert!(error.to_string().contains("sync conflict"));
+    }
+
+    #[test]
+    fn manual_safe_retry_later_is_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = settings(directory.path());
+        let mut transport = MockTransport::new()
+            .with_failure(SyncMethod::Meta, ranki_sync::SyncError::Timeout);
+        let error = manual_sync(
+            TransportRef(&mut transport),
+            &settings,
+            Some(&host_key_auth()),
+            SyncMode::Safe,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ManualSyncError::RetryLater(_)));
+        assert!(error.to_string().contains("retry later"));
+    }
+
+    #[test]
+    fn media_failure_keeps_the_collection_success_visible() {
+        let directory = tempfile::tempdir().unwrap();
+        collection_with_cards(directory.path());
+        let settings = settings(directory.path());
+        let mut transport = MockTransport::new()
+            .with_response(
+                SyncMethod::Upload,
+                MockResponse::ok_bytes(b"OK".to_vec()).unwrap(),
+            )
+            .with_response(SyncMethod::Meta, meta(false))
+            .with_failure(
+                SyncMethod::MediaBegin,
+                ranki_sync::SyncError::Network(String::from(
+                    "media unavailable",
+                )),
+            );
+        let report = manual_sync(
+            TransportRef(&mut transport),
+            &settings,
+            Some(&host_key_auth()),
+            SyncMode::FullUpload,
+        )
+        .unwrap();
+        assert_eq!(report.text, "uploaded");
+        assert!(report.media_error.is_some());
+        let shown = report.to_string();
+        assert!(shown.contains("uploaded"), "{shown}");
+        assert!(shown.contains("warning: media sync failed"), "{shown}");
+        assert!(shown.contains("media unavailable"), "{shown}");
     }
 }

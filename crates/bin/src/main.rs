@@ -38,8 +38,10 @@ use std::fmt;
 use std::fmt::Display;
 use std::fs;
 use std::io;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process;
 use std::process::ExitCode;
 use std::str::FromStr;
 #[cfg(feature = "desktop")]
@@ -106,6 +108,34 @@ impl Display for ModelRef {
         }
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DeckRef {
+    Id(Id),
+    Name(String),
+}
+
+impl FromStr for DeckRef {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.trim().is_empty() {
+            return Err("deck cannot be empty".to_owned());
+        }
+        Ok(value
+            .parse::<Id>()
+            .map_or_else(|_| Self::Name(value.to_owned()), Self::Id))
+    }
+}
+
+impl Display for DeckRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Id(id) => write!(formatter, "{id}"),
+            Self::Name(name) => write!(formatter, "{name}"),
+        }
+    }
+}
 #[derive(Debug, Parser)]
 #[command(name = "ranki", version, about = "An Anki-compatible flashcard app")]
 #[expect(
@@ -125,16 +155,22 @@ struct Cli {
     bench_collection: Option<PathBuf>,
     #[arg(long, global = true)]
     mobile: bool,
+    /// Turn syncing with `AnkiWeb` on for this command.
     #[arg(long, global = true, conflicts_with = "no_sync")]
     sync: bool,
+    /// Turn syncing with `AnkiWeb` off for this command.
     #[arg(long, global = true, conflicts_with = "sync")]
     no_sync: bool,
+    /// Sync at startup and shutdown when sync is enabled.
     #[arg(long, global = true, conflicts_with = "no_sync_auto")]
     sync_auto: bool,
+    /// Skip the automatic startup and shutdown sync.
     #[arg(long, global = true, conflicts_with = "sync_auto")]
     no_sync_auto: bool,
+    /// Use this `AnkiWeb` username instead of the configured one.
     #[arg(long, global = true, value_name = "USER")]
     sync_username: Option<String>,
+    /// Read the `AnkiWeb` host key from this file.
     #[arg(long, global = true, value_name = "PATH")]
     sync_hkey_file: Option<PathBuf>,
     #[command(subcommand)]
@@ -155,19 +191,27 @@ enum Command {
     /// Remove a deck and its subdecks.
     DeckRemove {
         id: Id,
-        /// Remove non-empty decks without asking again.
+        /// Remove decks that contain cards.
         #[arg(long)]
         force: bool,
     },
     /// Show cards that are due.
     Due {
-        #[arg(long, value_name = "ID")]
-        deck: Option<Id>,
+        #[arg(long, value_name = "ID_OR_NAME")]
+        deck: Option<DeckRef>,
+        /// Maximum number of cards to show (default: 20).
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
     },
     /// Find cards with an Anki-style query.
-    Search { query: String },
+    Search {
+        /// Supports `deck:`, `tag:`, `note:`, `is:`, quoted text, and `*`.
+        ///
+        /// Prints one card id per line in search order.
+        query: String,
+    },
+    /// Inspect a card, its note, and its field values.
+    Show { card_id: Id },
     /// Add a note and its cards.
     AddNote {
         #[arg(
@@ -176,12 +220,37 @@ enum Command {
             value_name = "ID_OR_NAME"
         )]
         model: ModelRef,
-        #[arg(long = "deck", visible_alias = "deck-id", value_name = "ID")]
-        deck_id: Id,
+        #[arg(
+            long = "deck",
+            visible_alias = "deck-id",
+            value_name = "ID_OR_NAME"
+        )]
+        deck: DeckRef,
+        /// Note fields in the model's field order; repeat once per field.
         #[arg(long = "field", value_name = "TEXT")]
         fields: Vec<String>,
         #[arg(long = "tag", value_name = "TAG")]
         tags: Vec<String>,
+    },
+
+    /// Edit a note's fields, tags, and deck in place.
+    NoteEdit {
+        note_id: Id,
+        /// Note fields in the model's field order; repeat once per field.
+        #[arg(long = "field", value_name = "TEXT", required = true)]
+        fields: Vec<String>,
+        /// Replace all tags; repeat once per tag.
+        #[arg(long = "tag", value_name = "TAG", conflicts_with = "clear_tags")]
+        tags: Vec<String>,
+        /// Remove all tags.
+        #[arg(long)]
+        clear_tags: bool,
+        /// Move the note's cards to this deck.
+        #[arg(long, visible_alias = "deck-id", value_name = "ID_OR_NAME")]
+        deck: Option<DeckRef>,
+        /// Reject the edit if the note changed since this modification time.
+        #[arg(long, value_name = "SECONDS")]
+        expected_modified: Option<i64>,
     },
     /// Add a built-in Image Occlusion note from an image and cloze markers.
     AddImageOcclusion {
@@ -192,7 +261,8 @@ enum Command {
         #[arg(
             long = "occlusion",
             value_name = "MARKER",
-            required_unless_present_any = ["rects", "ellipses"]
+            required_unless_present_any = ["rects", "ellipses"],
+            conflicts_with_all = ["rects", "ellipses"],
         )]
         occlusions: Vec<String>,
         #[arg(
@@ -218,7 +288,7 @@ enum Command {
     },
     /// List note models available in the collection, including stock types.
     Models,
-    /// Answer a card with an ease rating from 1 to 4.
+    /// Answer a card with 1-4 or again, hard, good, or easy.
     Answer {
         card_id: Id,
         #[arg(value_parser = parse_rating)]
@@ -226,8 +296,8 @@ enum Command {
     },
     /// Show card counts for a deck.
     Stats {
-        #[arg(long, value_name = "ID")]
-        deck: Option<Id>,
+        #[arg(long, value_name = "ID_OR_NAME")]
+        deck: Option<DeckRef>,
     },
     /// Import an Anki package into the collection.
     Import { package: PathBuf },
@@ -246,6 +316,9 @@ enum Command {
         /// Do not include media files.
         #[arg(long)]
         no_media: bool,
+        /// Overwrite an existing package.
+        #[arg(long)]
+        force: bool,
     },
     /// Export the collection as an Anki colpkg.
     ExportColpkg {
@@ -262,6 +335,9 @@ enum Command {
         /// Do not include media files.
         #[arg(long)]
         no_media: bool,
+        /// Overwrite an existing package.
+        #[arg(long)]
+        force: bool,
     },
     /// Check that the collection can be read.
     Check,
@@ -281,18 +357,30 @@ enum Command {
         /// Replace the local collection with the remote one.
         #[arg(long, conflicts_with_all = ["status", "full_upload"])]
         full_download: bool,
+        /// Confirm a full upload or full download.
+        #[arg(long)]
+        yes: bool,
     },
     /// Serve the Model Context Protocol over stdio.
     Mcp,
 }
 
 fn parse_rating(value: &str) -> Result<Rating, String> {
-    let code = value.parse::<u8>().map_err(|_| {
-        format!("invalid rating '{value}', expected 1, 2, 3, or 4")
-    })?;
-    Rating::from_code(code).ok_or_else(|| {
-        format!("invalid rating '{value}', expected 1, 2, 3, or 4")
-    })
+    match value.trim().to_ascii_lowercase().as_str() {
+        "again" => return Ok(Rating::Again),
+        "hard" => return Ok(Rating::Hard),
+        "good" => return Ok(Rating::Good),
+        "easy" => return Ok(Rating::Easy),
+        _ => {}
+    }
+    let code = value.parse::<u8>().map_err(|_| invalid_rating(value))?;
+    Rating::from_code(code).ok_or_else(|| invalid_rating(value))
+}
+
+fn invalid_rating(value: &str) -> String {
+    format!(
+        "invalid rating '{value}', expected 1, 2, 3, 4, again, hard, good, or easy"
+    )
 }
 
 fn main() -> ExitCode {
@@ -348,9 +436,29 @@ fn run_with_sync(
     transport: &mut dyn SyncTransport,
     paths: ranki_model::DataPaths,
 ) -> CliResult<()> {
+    if matches!(
+        &cli.command,
+        Some(
+            Command::Sync {
+                full_upload: true,
+                ..
+            } | Command::Sync {
+                full_download: true,
+                ..
+            },
+        )
+    ) && !matches!(&cli.command, Some(Command::Sync { yes: true, .. }))
+    {
+        return Err(CliError::Message(String::from(
+            "sync: --full-upload and --full-download require --yes",
+        )));
+    }
     let settings = config::resolve_settings(&cli, config, paths);
     let manual_sync = matches!(cli.command, Some(Command::Sync { .. }));
-    let (auth, auto_sync) = sync::startup_credentials(&settings, manual_sync);
+    let (auth, auto_sync_enabled) =
+        sync::startup_credentials(&settings, manual_sync);
+    let auto_sync =
+        auto_sync_enabled && automatic_sync_allowed(cli.command.as_ref());
 
     let startup_sync = if auto_sync {
         sync_once_and_warn(transport, &settings, auth.as_ref(), true)
@@ -412,6 +520,7 @@ fn run_with_sync(
             no_scheduling,
             no_deck_configs,
             no_media,
+            force,
         } => export_package(
             collection_path,
             media_dir,
@@ -421,6 +530,7 @@ fn run_with_sync(
                 with_scheduling: !no_scheduling,
                 with_deck_configs: !no_deck_configs,
                 with_media: !no_media,
+                overwrite: force,
             },
         ),
         Command::ExportColpkg {
@@ -429,6 +539,7 @@ fn run_with_sync(
             no_scheduling,
             no_deck_configs,
             no_media,
+            force,
         } => export_colpkg_package(
             collection_path,
             media_dir,
@@ -438,16 +549,21 @@ fn run_with_sync(
                 with_scheduling: !no_scheduling,
                 with_deck_configs: !no_deck_configs,
                 with_media: !no_media,
+                overwrite: force,
             },
         ),
         Command::Check => check(collection_path),
         Command::Connect { port } => {
+            let collection = open_or_create(collection_path)?;
+            drop(collection);
+            eprintln!("listening on 127.0.0.1:{port}");
             connect::serve(collection_path, port, media_dir, &scheduler)
         }
         Command::Sync {
             status,
             full_upload,
             full_download,
+            ..
         } => {
             let mode = if status {
                 sync::SyncMode::Status
@@ -477,7 +593,9 @@ fn run_with_sync(
         | Command::DeckRemove { .. }
         | Command::Due { .. }
         | Command::Search { .. }
+        | Command::Show { .. }
         | Command::AddNote { .. }
+        | Command::NoteEdit { .. }
         | Command::AddImageOcclusion { .. }
         | Command::Models
         | Command::Answer { .. }
@@ -507,6 +625,10 @@ fn run_with_sync(
         );
     }
     result
+}
+
+const fn automatic_sync_allowed(command: Option<&Command>) -> bool {
+    !matches!(command, Some(Command::Mcp))
 }
 
 #[expect(
@@ -564,7 +686,8 @@ fn maybe_optimize(config: &mut config::Config, settings: &config::Settings) {
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "store dispatch needs the collection, command, scheduler, and media paths"
+    clippy::too_many_lines,
+    reason = "store dispatch maps each subcommand once and takes injected test seams"
 )]
 fn run_store_command(
     collection: &mut Collection,
@@ -582,15 +705,35 @@ fn run_store_command(
         Command::DeckCreate { .. }
         | Command::DeckRename { .. }
         | Command::DeckRemove { .. } => run_deck_command(collection, command),
-        Command::Due { deck, limit } => print_due(collection, deck, limit),
+        Command::Due { deck, limit } => {
+            print_due(collection, deck.as_ref(), limit)
+        }
         Command::Search { query } => print_search(collection, &query),
+        Command::Show { card_id } => print_card(collection, card_id),
         Command::AddNote {
             model,
-            deck_id,
+            deck,
             fields,
             tags,
         } => {
             let model_id = resolve_model(collection, &model)?;
+            let deck_id = resolve_deck(collection, &deck)?;
+            let model = collection
+                .models()?
+                .into_iter()
+                .find(|entry| entry.id == model_id)
+                .ok_or_else(|| {
+                    CliError::Message(format!("model not found: {model_id}"))
+                })?;
+            if fields.len() != model.fields.len() {
+                return Err(CliError::Message(format!(
+                    "{} fields for {}; expected {} in order: {}",
+                    fields.len(),
+                    model.name,
+                    model.fields.len(),
+                    model.fields.join(", ")
+                )));
+            }
             let note = NewNote {
                 model_id,
                 deck_id,
@@ -602,6 +745,22 @@ fn run_store_command(
             }
             Ok(())
         }
+        Command::NoteEdit {
+            note_id,
+            fields,
+            tags,
+            clear_tags,
+            deck,
+            expected_modified,
+        } => print_note_edit(
+            collection,
+            note_id,
+            fields,
+            tags,
+            clear_tags,
+            deck.as_ref(),
+            expected_modified,
+        ),
         Command::AddImageOcclusion {
             deck_id,
             image,
@@ -628,7 +787,7 @@ fn run_store_command(
         Command::Answer { card_id, rating } => {
             print_answer(collection, card_id, rating, scheduler)
         }
-        Command::Stats { deck } => print_stats(collection, deck),
+        Command::Stats { deck } => print_stats(collection, deck.as_ref()),
         #[cfg(feature = "desktop")]
         Command::Gui => Ok(()),
         Command::Import { .. }
@@ -643,10 +802,14 @@ fn run_store_command(
 
 fn print_due(
     collection: &Collection,
-    deck: Option<Id>,
+    deck: Option<&DeckRef>,
     limit: Option<usize>,
 ) -> CliResult<()> {
-    let cards = collection.due_cards(deck, limit.unwrap_or(20), now_secs()?)?;
+    let deck_id = deck
+        .map(|selected| resolve_deck(collection, selected))
+        .transpose()?;
+    let cards =
+        collection.due_cards(deck_id, limit.unwrap_or(20), now_secs()?)?;
     for card in cards {
         println!("{}\t{}\t{}", card.id, card.deck_id, card.due);
     }
@@ -660,25 +823,144 @@ fn print_search(collection: &Collection, query: &str) -> CliResult<()> {
     Ok(())
 }
 
-fn print_models(collection: &Collection) -> CliResult<()> {
-    for model in collection.models()? {
-        println!(
-            "{}\t{}\t{}\t{}",
-            model.id,
-            model.name,
-            model.fields.len(),
-            model.templates.len()
-        );
-    }
-    for model in ranki_model::stock_models() {
-        println!(
-            "stock\t{}\t{}\t{}",
-            model.name,
-            model.fields.len(),
-            model.templates.len()
-        );
+fn print_card(collection: &Collection, card_id: Id) -> CliResult<()> {
+    let card = collection.card(card_id)?.ok_or_else(|| {
+        CliError::Message(format!("card not found: {card_id}"))
+    })?;
+    let note = collection.note(card.note_id)?.ok_or_else(|| {
+        CliError::Message(format!("note not found: {}", card.note_id))
+    })?;
+    let deck = deck_by_id(collection, card.deck_id)?;
+    let model = collection
+        .models()?
+        .into_iter()
+        .find(|model| model.id == note.model_id)
+        .ok_or_else(|| {
+            CliError::Message(format!("model not found: {}", note.model_id))
+        })?;
+    println!(
+        "card\t{}\tnote\t{}\tdeck\t{}\tordinal\t{}\tdue\t{}",
+        card.id, card.note_id, card.deck_id, card.ordinal, card.due
+    );
+    println!("deck\t{}\t{}", deck.id, deck.name);
+    println!(
+        "note\t{}\tmodel\t{}\t{}\tmodified\t{}",
+        note.id, model.id, model.name, note.modified
+    );
+    for (name, value) in model.fields.iter().zip(&note.fields) {
+        println!("field\t{name}\t{value}");
     }
     Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "editing maps one argument per note-edit option"
+)]
+fn print_note_edit(
+    collection: &mut Collection,
+    note_id: Id,
+    fields: Vec<String>,
+    tags: Vec<String>,
+    clear_tags: bool,
+    deck: Option<&DeckRef>,
+    expected_modified: Option<i64>,
+) -> CliResult<()> {
+    let mut note = collection.note(note_id)?.ok_or_else(|| {
+        CliError::Message(format!("note not found: {note_id}"))
+    })?;
+    if expected_modified.is_some_and(|expected| expected != note.modified) {
+        return Err(CliError::Message(String::from(
+            "note changed; read it again",
+        )));
+    }
+    let Some(model) = collection
+        .models()?
+        .into_iter()
+        .find(|model| model.id == note.model_id)
+    else {
+        return Err(CliError::Message(format!(
+            "model not found: {}",
+            note.model_id
+        )));
+    };
+    if fields.len() != model.fields.len() {
+        return Err(CliError::Message(format!(
+            "{} fields for {}; expected {} in order: {}",
+            fields.len(),
+            model.name,
+            model.fields.len(),
+            model.fields.join(", ")
+        )));
+    }
+    if fields.first().is_none_or(|field| field.trim().is_empty()) {
+        return Err(CliError::Message(String::from(
+            "first field must not be empty",
+        )));
+    }
+    note.fields = fields;
+    if clear_tags {
+        note.tags.clear();
+    } else if !tags.is_empty() {
+        note.tags = tags;
+    }
+    match deck {
+        Some(selected) => {
+            let deck_id = resolve_deck(collection, selected)?;
+            collection.update_note(&note, deck_id)?;
+        }
+        None => collection.update_note_checked(&note, None, None)?,
+    }
+    let modified = collection
+        .note(note_id)?
+        .map(|saved| saved.modified)
+        .ok_or_else(|| {
+            CliError::Message(format!("note not found: {note_id}"))
+        })?;
+    println!("edited\t{note_id}\t{modified}");
+    Ok(())
+}
+
+fn print_models(collection: &Collection) -> CliResult<()> {
+    let models = collection.models()?;
+    for model in &models {
+        print_model_line(&model.id.to_string(), model);
+    }
+    let installed_names: Vec<String> = models
+        .iter()
+        .map(|model| model.name.to_ascii_lowercase())
+        .collect();
+    let installed_kinds: Vec<StockModelKind> =
+        models.iter().filter_map(StockModelKind::of).collect();
+    for kind in StockModelKind::ALL {
+        let name = kind.name();
+        if installed_names
+            .iter()
+            .any(|installed| installed == &name.to_ascii_lowercase())
+            || installed_kinds.contains(&kind)
+        {
+            continue;
+        }
+        let model = kind.definition();
+        print_model_line("stock", &model);
+    }
+    Ok(())
+}
+
+fn print_model_line(id: &str, model: &ranki_model::NoteModel) {
+    print!(
+        "{id}\t{}\t{}\t{}",
+        model.name,
+        model.fields.len(),
+        model.templates.len()
+    );
+    for field in &model.fields {
+        print!("\t{field}");
+    }
+    for template in &model.templates {
+        print!("\t{}", template.name);
+    }
+    println!();
 }
 
 #[expect(
@@ -697,8 +979,14 @@ fn print_answer(
     Ok(())
 }
 
-fn print_stats(collection: &Collection, deck: Option<Id>) -> CliResult<()> {
-    let stats = collection.stats(deck, now_secs()?)?;
+fn print_stats(
+    collection: &Collection,
+    deck: Option<&DeckRef>,
+) -> CliResult<()> {
+    let deck_id = deck
+        .map(|selected| resolve_deck(collection, selected))
+        .transpose()?;
+    let stats = collection.stats(deck_id, now_secs()?)?;
     println!(
         "new={} learning={} review={} total={}",
         stats.new_cards,
@@ -864,11 +1152,66 @@ fn export_with_checkpoint(
     options: ExportOptions,
     exporter: Exporter,
 ) -> CliResult<()> {
+    if resolved_path(package) == resolved_path(path) {
+        return Err(CliError::Message(format!(
+            "export destination is the active collection: {}",
+            package.display()
+        )));
+    }
+    if fs::symlink_metadata(package).is_ok() && !options.overwrite {
+        return Err(existing_export_error(package));
+    }
     let collection = open_or_create(path)?;
     collection.checkpoint()?;
     collection.close()?;
-    exporter(path, media_dir, package, options)?;
+    if let Err(error) = exporter(path, media_dir, package, options) {
+        if !options.overwrite && fs::symlink_metadata(package).is_ok() {
+            return Err(existing_export_error(package));
+        }
+        return Err(CliError::Message(error.to_string()));
+    }
+    println!("exported\t{}", package.display());
     Ok(())
+}
+
+fn existing_export_error(package: &Path) -> CliError {
+    CliError::Message(format!(
+        "export destination already exists: {}; pass --force to overwrite",
+        package.display()
+    ))
+}
+
+fn resolved_path(path: &Path) -> PathBuf {
+    if let Ok(resolved) = fs::canonicalize(path) {
+        return resolved;
+    }
+    let ancestor = path
+        .ancestors()
+        .find(|candidate| {
+            candidate.as_os_str().is_empty()
+                || fs::canonicalize(candidate).is_ok()
+        })
+        .unwrap_or_else(|| Path::new("."));
+    let base = if ancestor.as_os_str().is_empty() {
+        env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    } else {
+        fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf())
+    };
+    let suffix = path.strip_prefix(ancestor).unwrap_or(path);
+    let mut resolved = base;
+    for component in suffix.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(part) => resolved.push(part),
+            Component::RootDir | Component::Prefix(_) => {
+                resolved.push(component.as_os_str());
+            }
+        }
+    }
+    resolved
 }
 
 #[expect(
@@ -933,7 +1276,9 @@ fn run_deck_command(
         Command::Decks
         | Command::Due { .. }
         | Command::Search { .. }
+        | Command::Show { .. }
         | Command::AddNote { .. }
+        | Command::NoteEdit { .. }
         | Command::AddImageOcclusion { .. }
         | Command::Models
         | Command::Answer { .. }
@@ -968,10 +1313,28 @@ fn require_force(
 }
 fn deck_by_id(collection: &Collection, id: Id) -> CliResult<ranki_model::Deck> {
     collection
-        .decks()?
+        .deck_list()?
         .into_iter()
         .find(|deck| deck.id == id)
         .ok_or_else(|| CliError::Message(format!("deck not found: {id}")))
+}
+
+fn resolve_deck(collection: &Collection, deck: &DeckRef) -> CliResult<Id> {
+    let id = match deck {
+        DeckRef::Id(id) => *id,
+        DeckRef::Name(name) => collection
+            .deck_list()?
+            .into_iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(name))
+            .map(|entry| entry.id)
+            .ok_or_else(|| {
+                CliError::Message(format!("deck not found: {deck}"))
+            })?,
+    };
+    if collection.deck_subtree(id)?.is_empty() {
+        return Err(CliError::Message(format!("deck not found: {deck}")));
+    }
+    Ok(id)
 }
 
 fn resolve_model(
@@ -1106,14 +1469,57 @@ fn safe_media_name(image: &Path) -> CliResult<&str> {
     Ok(name)
 }
 
-fn stage_image(
+fn stage_image_temp(media_dir: &Path, image: &Path) -> CliResult<PathBuf> {
+    let mut source = fs::File::open(image)?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| CliError::Message(error.to_string()))?
+        .as_nanos();
+    for attempt in 0..100_u32 {
+        let candidate = media_dir.join(format!(
+            ".ranki-media-{}-{stamp}-{attempt}.tmp",
+            process::id()
+        ));
+        let mut staged = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Err(error) = io::copy(&mut source, &mut staged) {
+            let _ = fs::remove_file(&candidate);
+            return Err(error.into());
+        }
+        return Ok(candidate);
+    }
+    Err(CliError::Message(
+        "cannot allocate a temporary media file".into(),
+    ))
+}
+
+fn reserve_media_name(
     media_dir: &Path,
-    image: &Path,
     media_name: &str,
-) -> CliResult<()> {
-    fs::create_dir_all(media_dir)?;
-    fs::copy(image, media_dir.join(media_name))?;
-    Ok(())
+) -> CliResult<PathBuf> {
+    let destination = media_dir.join(media_name);
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+    {
+        Ok(_) => Ok(destination),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            Err(CliError::Message(format!(
+                "media file already exists: {media_name}"
+            )))
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[expect(
@@ -1135,29 +1541,52 @@ fn add_image_occlusion(
     let occlusion = occlusion_text(occlusions, masks)?;
     let model_id = image_occlusion_model(collection)?;
     let media_name = safe_media_name(image)?;
-    stage_image(media_dir, image, media_name)?;
-    let fields = vec![
-        occlusion,
-        format!("<img src=\"{media_name}\">"),
-        header.unwrap_or_default().to_owned(),
-        back_extra.unwrap_or_default().to_owned(),
-        comments.unwrap_or_default().to_owned(),
-    ];
-    let note = NewNote {
-        model_id,
-        deck_id,
-        fields,
-        tags: tags.to_vec(),
+    fs::create_dir_all(media_dir)?;
+    let reserved = reserve_media_name(media_dir, media_name)?;
+    let staged = match stage_image_temp(media_dir, image) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = fs::remove_file(&reserved);
+            return Err(error);
+        }
     };
-    for id in collection.add_note(&note)? {
-        println!("{id}");
+    let result = (|| {
+        let fields = vec![
+            occlusion,
+            format!("<img src=\"{media_name}\">"),
+            header.unwrap_or_default().to_owned(),
+            back_extra.unwrap_or_default().to_owned(),
+            comments.unwrap_or_default().to_owned(),
+        ];
+        let note = NewNote {
+            model_id,
+            deck_id,
+            fields,
+            tags: tags.to_vec(),
+        };
+        fs::copy(&staged, &reserved)?;
+        let ids = collection.add_note(&note)?;
+        let _ = fs::remove_file(&staged);
+        for id in ids {
+            println!("{id}");
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&staged);
+        let _ = fs::remove_file(&reserved);
     }
-    Ok(())
+    result
 }
 
 pub(crate) fn open_or_create(path: &Path) -> CliResult<Collection> {
     if path.exists() {
-        return Ok(Collection::open(path)?);
+        return Collection::open(path).map_err(|error| {
+            CliError::Message(format!(
+                "cannot open collection {}: {error}",
+                path.display()
+            ))
+        });
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1564,7 +1993,7 @@ mod tests {
         ]);
         let Some(Command::AddNote {
             model,
-            deck_id,
+            deck,
             fields,
             tags,
         }) = cli.command
@@ -1572,7 +2001,7 @@ mod tests {
             panic!("wrong command");
         };
         assert_eq!(model, 1);
-        assert_eq!(deck_id, 2);
+        assert_eq!(deck, super::DeckRef::Id(2));
         assert_eq!(fields, ["front", "back"]);
         assert_eq!(tags, ["one", "two"]);
     }
@@ -1729,25 +2158,55 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Due {
-                deck: Some(7),
+                deck: Some(super::DeckRef::Id(7)),
                 limit: Some(5)
             })
         ));
     }
 
     #[test]
-    fn answer_only_accepts_ratings_one_to_four() {
+    fn deck_flags_accept_names_as_well_as_ids() {
+        let cli = parse(&[
+            "ranki",
+            "add-note",
+            "--model",
+            "1",
+            "--deck",
+            "Study::Languages",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::AddNote {
+                deck: super::DeckRef::Name(ref name),
+                ..
+            }) if name == "Study::Languages"
+        ));
+        let cli = parse(&["ranki", "stats", "--deck", "languages"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Stats {
+                deck: Some(super::DeckRef::Name(ref name)),
+            }) if name == "languages"
+        ));
+    }
+
+    #[test]
+    fn answer_accepts_digits_and_rating_words() {
         for (input, expected) in [
             ("1", Rating::Again),
             ("2", Rating::Hard),
             ("3", Rating::Good),
             ("4", Rating::Easy),
+            ("again", Rating::Again),
+            ("hard", Rating::Hard),
+            ("GOOD", Rating::Good),
+            (" easy ", Rating::Easy),
         ] {
             assert_eq!(parse_rating(input).unwrap(), expected);
         }
         assert!(parse_rating("0").is_err());
         assert!(parse_rating("5").is_err());
-        assert!(parse_rating("good").is_err());
+        assert!(parse_rating("nope").is_err());
     }
 
     #[test]
@@ -1779,6 +2238,7 @@ mod tests {
                 status: false,
                 full_upload: false,
                 full_download: false,
+                yes: false,
             })
         ));
         assert!(matches!(
@@ -1799,6 +2259,47 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn sync_full_commands_require_yes() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = ranki_model::DataPaths::new(directory.path());
+        let mut config = ranki_model::Config::default();
+        let mut transport = MockTransport::new();
+        for args in [
+            ["ranki", "sync", "--full-upload"],
+            ["ranki", "sync", "--full-download"],
+        ] {
+            let cli = parse(&args);
+            let error =
+                run_with_sync(cli, &mut config, &mut transport, paths.clone())
+                    .unwrap_err();
+            assert!(error.to_string().contains("--yes"), "{error}");
+        }
+        assert_eq!(transport.request_count(), 0);
+        let cli = parse(&["ranki", "sync", "--full-upload", "--yes"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sync {
+                full_upload: true,
+                yes: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn mcp_is_excluded_from_automatic_sync() {
+        assert!(!super::automatic_sync_allowed(Some(&Command::Mcp)));
+        assert!(super::automatic_sync_allowed(Some(&Command::Decks)));
+        assert!(super::automatic_sync_allowed(Some(&Command::Sync {
+            status: false,
+            full_upload: false,
+            full_download: false,
+            yes: false,
+        })));
+        assert!(super::automatic_sync_allowed(None));
     }
 
     #[cfg(unix)]
