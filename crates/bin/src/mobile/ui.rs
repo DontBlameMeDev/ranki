@@ -282,6 +282,7 @@ pub fn render(app: &mut AppState, ctx: &egui::Context) {
         .show(ctx, |ui| {
             show_toast(app, ui, &p);
             let size = ui.available_size();
+            let short = size.y < 420.0;
             let reviewing = app.screen == Screen::Review;
             let show_tabs = !reviewing;
             let compact = size.y < COMPACT_HEIGHT || size.x < NARROW_WIDTH;
@@ -289,7 +290,7 @@ pub fn render(app: &mut AppState, ctx: &egui::Context) {
             let chrome = if show_tabs {
                 tab_height(size.x) + spacing
             } else if reviewing {
-                review_actions_height(app, compact) + spacing
+                review_actions_height(app, compact, short) + spacing
             } else {
                 0.0
             };
@@ -309,7 +310,7 @@ pub fn render(app: &mut AppState, ctx: &egui::Context) {
                             match app.screen {
                                 Screen::Decks => render_decks(app, ui, &p),
                                 Screen::Review => {
-                                    render_review_content(app, ui, &p);
+                                    render_review_content(app, ui, &p, short);
                                 }
                                 Screen::Add => render_add(app, ui, &p),
                                 Screen::Browse => render_browse(app, ui, &p),
@@ -324,12 +325,12 @@ pub fn render(app: &mut AppState, ctx: &egui::Context) {
                 },
             );
             if reviewing {
-                let height = review_actions_height(app, compact);
+                let height = review_actions_height(app, compact, short);
                 ui.allocate_ui_with_layout(
                     vec2(size.x, height),
                     Layout::top_down(Align::Min),
                     |ui| {
-                        render_review_actions(app, ui, &p, compact);
+                        render_review_actions(app, ui, &p, compact, short);
                     },
                 );
             } else if show_tabs {
@@ -695,8 +696,17 @@ fn stat(ui: &mut Ui, label: &str, value: usize, p: &Palette) {
     metric(ui, label, value.to_string(), p);
 }
 
-fn render_review_content(app: &AppState, ui: &mut Ui, p: &Palette) {
-    title(ui, "Review", p);
+fn render_review_content(
+    app: &mut AppState,
+    ui: &mut Ui,
+    p: &Palette,
+    short: bool,
+) {
+    if short {
+        ui.add_space(4.0);
+    } else {
+        title(ui, "Review", p);
+    }
     let review = app.review.clone();
     let remaining = review.queue.len()
         + review.pending.len()
@@ -713,20 +723,25 @@ fn render_review_content(app: &AppState, ui: &mut Ui, p: &Palette) {
             .desired_height(8.0)
             .fill(p.accent),
     );
-    ui.add_space(8.0);
+    ui.add_space(if short { 4.0 } else { 8.0 });
     ui.label(
         RichText::new(format!("{} / {} reviewed", review.answered, total))
             .color(p.muted),
     );
-    let counts =
-        review_counts(&review.queue, &review.pending, review.current.as_ref());
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        stat(ui, "New", counts[0], p);
-        stat(ui, "Learning", counts[1], p);
-        stat(ui, "Review", counts[2], p);
-    });
-    ui.add_space(12.0);
+    if !short {
+        let counts = review_counts(
+            &review.queue,
+            &review.pending,
+            review.current.as_ref(),
+        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            stat(ui, "New", counts[0], p);
+            stat(ui, "Learning", counts[1], p);
+            stat(ui, "Review", counts[2], p);
+        });
+    }
+    ui.add_space(if short { 6.0 } else { 12.0 });
 
     if matches!(review.phase, ReviewPhase::Summary | ReviewPhase::Waiting) {
         let waiting = review.phase == ReviewPhase::Waiting;
@@ -779,9 +794,34 @@ fn render_review_content(app: &AppState, ui: &mut Ui, p: &Palette) {
     } else {
         ui.label(RichText::new("No card loaded.").color(p.muted));
     }
+    if short {
+        ui.add_space(8.0);
+        if app.review.last.is_some() {
+            let undo = secondary_button(RichText::new("Undo"), TAP_HEIGHT, p)
+                .min_size(vec2(ui.available_width(), TAP_HEIGHT));
+            if ui.add(undo).clicked() {
+                let _ = app.undo();
+            }
+            ui.add_space(6.0);
+        }
+        let end = secondary_button(RichText::new("End session"), TAP_HEIGHT, p)
+            .min_size(vec2(ui.available_width(), TAP_HEIGHT));
+        if ui.add(end).clicked() {
+            app.end_review();
+        }
+    }
 }
 
-fn review_actions_height(app: &AppState, compact: bool) -> f32 {
+fn review_actions_height(app: &AppState, compact: bool, short: bool) -> f32 {
+    if short {
+        let primary = match app.review.phase {
+            ReviewPhase::Waiting => 0.0,
+            ReviewPhase::Answer if compact => TAP_HEIGHT,
+            ReviewPhase::Answer => RATING_HEIGHT,
+            ReviewPhase::Question | ReviewPhase::Summary => TAP_HEIGHT,
+        };
+        return REVIEW_GAP + primary + REVIEW_GAP;
+    }
     let primary = match app.review.phase {
         ReviewPhase::Question | ReviewPhase::Summary => TAP_HEIGHT,
         ReviewPhase::Answer if compact => TAP_HEIGHT,
@@ -802,6 +842,7 @@ fn render_review_actions(
     ui: &mut Ui,
     p: &Palette,
     compact: bool,
+    short: bool,
 ) {
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
@@ -874,6 +915,9 @@ fn render_review_actions(
                 }
             }
             ReviewPhase::Waiting => {}
+        }
+        if short {
+            return;
         }
         if phase != ReviewPhase::Waiting {
             ui.add_space(REVIEW_GAP);
