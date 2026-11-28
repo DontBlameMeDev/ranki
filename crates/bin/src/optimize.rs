@@ -16,7 +16,6 @@ use ranki_model::RevLog;
 use ranki_model::RevLogKind;
 use ranki_model::Store;
 
-#[cfg(test)]
 const SECONDS_PER_DAY: i64 = 86_400;
 const MILLIS_PER_DAY: i64 = 86_400_000;
 
@@ -39,9 +38,7 @@ pub(super) fn maybe_auto_optimize(
     if !day_gate(u64::from(today), u64::from(config.scheduler.last_optimized)) {
         return;
     }
-    let cutoff = u64::from(config.scheduler.last_optimized)
-        .saturating_mul(u64::try_from(MILLIS_PER_DAY).unwrap_or(u64::MAX));
-    let cutoff_ms = i64::try_from(cutoff).unwrap_or(i64::MAX);
+    let cutoff_ms = review_cutoff_ms(timing, config.scheduler.last_optimized);
     let reviews_since = match store.review_count_since(cutoff_ms) {
         Ok(count) => count,
         Err(error) => {
@@ -102,6 +99,14 @@ fn day_number(now_secs: i64) -> u32 {
     u32::try_from(now_secs.div_euclid(SECONDS_PER_DAY)).unwrap_or(u32::MAX)
 }
 
+/// Milliseconds since the last optimization day, on the collection clock.
+fn review_cutoff_ms(timing: &ranki_model::Timing, last_optimized: u32) -> i64 {
+    let days = timing.days_elapsed.saturating_sub(last_optimized);
+    timing
+        .now
+        .saturating_sub(i64::from(days).saturating_mul(SECONDS_PER_DAY))
+        .saturating_mul(1_000)
+}
 fn review_records(history: &[RevLog]) -> Vec<ReviewRecord> {
     let mut records = Vec::with_capacity(history.len());
     let mut previous: Option<(i64, i64)> = None;
@@ -186,6 +191,20 @@ mod tests {
             .collect::<Vec<_>>();
         collection.apply_reviews(&decisions).unwrap();
         collection
+    }
+
+    #[test]
+    fn review_cutoff_uses_the_collection_clock() {
+        let created =
+            NOW.saturating_sub(10_i64.saturating_mul(super::SECONDS_PER_DAY));
+        let timing = ranki_model::Timing::v1(NOW, created);
+
+        assert_eq!(timing.days_elapsed, 10);
+        assert_eq!(
+            super::review_cutoff_ms(&timing, 5),
+            NOW.saturating_sub(5_i64.saturating_mul(super::SECONDS_PER_DAY))
+                .saturating_mul(1_000)
+        );
     }
 
     #[test]

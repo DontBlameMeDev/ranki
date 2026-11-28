@@ -1,13 +1,20 @@
 //! AnkiConnect-compatible JSON-RPC server.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::thread;
 use unicode_normalization::UnicodeNormalization;
 
 use ranki_core::FsrsScheduler;
@@ -38,6 +45,8 @@ use crate::CliResult;
 use crate::answer_card;
 use crate::error::{ErrorCode, InterfaceError};
 const API_VERSION: u32 = 6;
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+const WORKER_COUNT: usize = 4;
 static MEDIA_STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const EMPTY_PARAMS: Value = Value::Null;
 
@@ -138,20 +147,143 @@ pub fn serve(
     let server = Server::http(address).map_err(|error| {
         CliError::Message(format!("cannot listen on 127.0.0.1:{port}: {error}"))
     })?;
-    let mut store = Collection::open(path)?;
+    let store = Arc::new(Mutex::new(Collection::open(path)?));
+    serve_incoming(&server, &store, media_dir, scheduler)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the HTTP server shares the collection, media, and scheduler inputs"
+)]
+fn serve_incoming(
+    server: &Server,
+    store: &Arc<Mutex<Collection>>,
+    media_dir: &Path,
+    scheduler: &FsrsScheduler,
+) -> CliResult<()> {
     let header =
         Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
             .map_err(|()| {
                 CliError::Message(String::from("invalid HTTP header"))
             })?;
-    for mut request in server.incoming_requests() {
-        let response =
-            read_and_dispatch(&mut store, media_dir, &mut request, scheduler);
-        let body = serde_json::to_string(&response)?;
-        request
-            .respond(Response::from_string(body).with_header(header.clone()))?;
-    }
+    let queue = Arc::new(TaskQueue::default());
+    thread::scope(|scope| {
+        for _ in 0..WORKER_COUNT {
+            let worker_store = Arc::clone(store);
+            let worker_media_dir = media_dir.to_path_buf();
+            let worker_scheduler = scheduler.clone();
+            let worker_header = header.clone();
+            let worker_queue = Arc::clone(&queue);
+            let worker = Worker {
+                queue: worker_queue,
+                store: worker_store,
+                media_dir: worker_media_dir,
+                scheduler: worker_scheduler,
+                header: worker_header,
+            };
+            scope.spawn(move || worker.run());
+        }
+        for request in server.incoming_requests() {
+            queue.push(request);
+        }
+        queue.close();
+    });
     Ok(())
+}
+
+#[derive(Default)]
+struct TaskQueue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct QueueState {
+    tasks: VecDeque<Request>,
+    closed: bool,
+}
+
+struct Worker {
+    queue: Arc<TaskQueue>,
+    store: Arc<Mutex<Collection>>,
+    media_dir: PathBuf,
+    scheduler: FsrsScheduler,
+    header: Header,
+}
+
+impl Worker {
+    fn run(self) {
+        while let Some(request) = self.queue.pop() {
+            respond(
+                &self.store,
+                &self.media_dir,
+                request,
+                &self.scheduler,
+                &self.header,
+            );
+        }
+    }
+}
+
+impl TaskQueue {
+    fn push(&self, request: Request) {
+        let mut state =
+            self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.tasks.push_back(request);
+        drop(state);
+        self.ready.notify_one();
+    }
+
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "the queue wait loop keeps its lock guard in one place"
+    )]
+    fn pop(&self) -> Option<Request> {
+        let mut state =
+            self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            match state.tasks.pop_front() {
+                Some(request) => return Some(request),
+                None if state.closed => return None,
+                None => {}
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn close(&self) {
+        let mut state =
+            self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.closed = true;
+        drop(state);
+        self.ready.notify_all();
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "response dispatch shares the server's explicit inputs"
+)]
+fn respond(
+    store: &Arc<Mutex<Collection>>,
+    media_dir: &Path,
+    mut request: Request,
+    scheduler: &FsrsScheduler,
+    header: &Header,
+) {
+    let response = read_and_dispatch(store, media_dir, &mut request, scheduler);
+    let body = serde_json::to_string(&response).unwrap_or_else(|error| {
+        let fallback =
+            RpcResponse::error(format!("cannot encode response: {error}"));
+        serde_json::to_string(&fallback).unwrap_or_else(|_| {
+            String::from(r#"{"result":null,"error":"cannot encode response"}"#)
+        })
+    });
+    let _ = request
+        .respond(Response::from_string(body).with_header(header.clone()));
 }
 
 #[expect(
@@ -159,16 +291,29 @@ pub fn serve(
     reason = "request dispatch shares the server's explicit inputs"
 )]
 fn read_and_dispatch(
-    store: &mut Collection,
+    store: &Arc<Mutex<Collection>>,
     media_dir: &Path,
     request: &mut Request,
     scheduler: &FsrsScheduler,
 ) -> RpcResponse {
     let mut body = Vec::new();
-    if let Err(error) = request.as_reader().read_to_end(&mut body) {
+    let limit = u64::try_from(MAX_BODY_BYTES).unwrap_or(u64::MAX);
+    if let Err(error) = request
+        .as_reader()
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut body)
+    {
         return RpcResponse::error(format!("cannot read request: {error}"));
     }
-    handle_body(store, media_dir, &body, scheduler)
+    if body.len() > MAX_BODY_BYTES {
+        return RpcResponse::error(format!(
+            "request body too large (limit {MAX_BODY_BYTES} bytes)"
+        ));
+    }
+    let Ok(mut guard) = store.lock() else {
+        return RpcResponse::error("collection lock poisoned");
+    };
+    handle_body(&mut guard, media_dir, &body, scheduler)
 }
 
 #[expect(
@@ -325,7 +470,7 @@ fn add_note(
         .as_object()
         .ok_or("invalid parameter: fields")?;
 
-    let decks = store.decks()?;
+    let decks = store.deck_list()?;
     let models = store.models()?;
     let deck = find_deck(&decks, deck_name)
         .ok_or_else(|| format!("deck not found: {deck_name}"))?;
@@ -386,19 +531,17 @@ fn add_note(
             return Err(format!("{error}{rollback}").into());
         }
     };
+    let note_id = ids
+        .first()
+        .copied()
+        .map(|card_id| store.card(card_id))
+        .transpose()?
+        .flatten()
+        .map(|card| card.note_id);
     if let Err(error) = finish_media(&published) {
-        return Err(format!(
-            "{error}; note was created but media cleanup failed"
-        )
-        .into());
+        return Err(media_cleanup_error(error, note_id));
     }
-    let Some(card_id) = ids.first().copied() else {
-        return Ok(Value::Null);
-    };
-    let note_id = store
-        .card(card_id)?
-        .map_or(Value::Null, |card| json!(card.note_id));
-    Ok(note_id)
+    Ok(note_id.map_or(Value::Null, |id| json!(id)))
 }
 
 fn note_options(
@@ -433,11 +576,18 @@ fn note_options(
         let scoped_options = scoped
             .as_object()
             .ok_or("invalid parameter: duplicateScopeOptions")?;
-        if let Some(name) =
-            scoped_options.get("deckName").and_then(Value::as_str)
-        {
-            duplicate_scope.deck_id =
-                find_deck(decks, name).map(|deck| deck.id);
+        match scoped_options.get("deckName") {
+            Some(Value::String(name)) if !name.trim().is_empty() => {
+                let deck = find_deck(decks, name)
+                    .ok_or_else(|| format!("deck not found: {name}"))?;
+                duplicate_scope.deck_id = Some(deck.id);
+            }
+            Some(Value::String(_)) | None => {}
+            Some(_) => {
+                return Err(
+                    "invalid parameter: duplicateScopeOptions.deckName".into(),
+                );
+            }
         }
         match scoped_options.get("checkChildren") {
             Some(Value::Bool(value)) => duplicate_scope.check_children = *value,
@@ -683,6 +833,18 @@ fn rollback_media(published: &PublishedMedia) -> Result<(), String> {
     }
 }
 
+fn media_cleanup_error(
+    error: impl fmt::Display,
+    note_id: Option<Id>,
+) -> RpcError {
+    let note =
+        note_id.map_or_else(|| String::from("unknown"), |id| id.to_string());
+    format!(
+        "{error}; note was created but media cleanup failed (note id: {note})"
+    )
+    .into()
+}
+
 fn finish_media(published: &PublishedMedia) -> Result<(), RpcError> {
     cleanup_stage_result(&published.stage).map_err(RpcError::from)
 }
@@ -730,19 +892,33 @@ fn escape_html_attribute(value: &str) -> String {
     escaped
 }
 
+#[expect(
+    clippy::excessive_nesting,
+    reason = "base64 padding is checked inside the byte decoder"
+)]
 fn decode_base64(input: &str) -> Result<Vec<u8>, RpcError> {
     let mut output = Vec::new();
     let mut accumulator = 0u32;
     let mut bits = 0usize;
+    let mut padding = 0usize;
     for byte in input.bytes() {
+        if padding > 0 && !matches!(byte, b'=' | b' ' | b'\n' | b'\r' | b'\t') {
+            return Err("invalid base64 media data".into());
+        }
         let value = match byte {
+            b'=' => {
+                if padding >= 2 {
+                    return Err("invalid base64 media data".into());
+                }
+                padding = padding.saturating_add(1);
+                continue;
+            }
+            b' ' | b'\n' | b'\r' | b'\t' => continue,
             b'A'..=b'Z' => byte.saturating_sub(b'A'),
             b'a'..=b'z' => byte.saturating_sub(b'a').saturating_add(26),
             b'0'..=b'9' => byte.saturating_sub(b'0').saturating_add(52),
             b'+' => 62,
             b'/' => 63,
-            b'=' => break,
-            b' ' | b'\n' | b'\r' | b'\t' => continue,
             _ => return Err("invalid base64 media data".into()),
         };
         accumulator = accumulator
@@ -865,8 +1041,7 @@ fn answer_cards(
     let answers = member(params, "answers")?
         .as_array()
         .ok_or("invalid parameter: answers")?;
-    let now = crate::now_secs()?;
-    let mut result = Vec::with_capacity(answers.len());
+    let mut pending = Vec::with_capacity(answers.len());
     for answer in answers {
         let card_id = member(answer, "cardId")?
             .as_i64()
@@ -876,8 +1051,13 @@ fn answer_cards(
             .and_then(|ease| u8::try_from(ease).ok())
             .and_then(Rating::from_code)
             .ok_or("invalid parameter: ease")?;
-        let pending = store.card(card_id)?;
-        if pending.is_none_or(|card| !card.queue.is_due()) {
+        pending.push((card_id, ease));
+    }
+    let now = crate::now_secs()?;
+    let mut result = Vec::with_capacity(pending.len());
+    for (card_id, ease) in pending {
+        let card = store.card(card_id)?;
+        if card.is_none_or(|entry| !entry.queue.is_due()) {
             result.push(false);
             continue;
         }
@@ -1003,8 +1183,17 @@ mod tests {
     use serde_json::Value;
     use serde_json::json;
     use std::fs;
+    use std::io::Read;
+    use std::io::Write;
+    use std::net::TcpStream;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::thread;
+    use std::time::Duration;
     use tempfile::TempDir;
+    use tiny_http::Server;
+    use tiny_http::TestRequest;
 
     use super::FsrsScheduler;
     use super::dispatch;
@@ -1710,5 +1899,224 @@ mod tests {
         );
         assert_eq!(result, json!([false]));
         assert_eq!(store.review_history().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn duplicate_scope_unknown_deck_name_is_rejected_before_staging() {
+        let (dir, mut store) = fixture();
+        let mut payload = note("Default");
+        payload["options"] =
+            json!({"duplicateScopeOptions": {"deckName": "Missing"}});
+        payload["picture"] = json!({
+            "filename": "pic.png",
+            "fields": ["Front"],
+            "data": "cGl4ZWxz",
+        });
+        let response = call_media(&dir, &mut store, json!({"note": payload}));
+        assert!(
+            response
+                .error
+                .unwrap_or_default()
+                .contains("deck not found: Missing")
+        );
+        assert!(!dir.path().join("collection.media").exists());
+        assert_eq!(store.find_cards("").unwrap(), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn duplicate_scope_resolves_an_empty_default_deck() {
+        let (dir, mut store) = fixture();
+        store.create_deck("Study").unwrap();
+        let mut payload = note("Default");
+        payload["options"] = json!({
+            "duplicateScope": "deck",
+            "duplicateScopeOptions": {"deckName": "Default"}
+        });
+
+        let first = call_media(&dir, &mut store, json!({"note": payload}));
+        assert!(first.result.is_i64(), "{first:?}");
+        let second = call_media(&dir, &mut store, json!({"note": payload}));
+        assert!(
+            second
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("duplicate")),
+            "{second:?}"
+        );
+        payload["options"] = json!({
+            "duplicateScope": "deck",
+            "duplicateScopeOptions": {"deckName": " "}
+        });
+        let blank = call_media(&dir, &mut store, json!({"note": payload}));
+        assert!(
+            blank
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("duplicate")),
+            "{blank:?}"
+        );
+    }
+
+    #[test]
+    fn answer_cards_validates_all_answers_before_applying_any() {
+        let (_dir, mut store) = fixture();
+        add_card(&mut store);
+        let first = store.find_cards("").unwrap()[0];
+        let mut second = note("Default");
+        second["fields"]["Front"] = json!("Second question");
+        call(&mut store, "addNote", json!({"note": second}));
+        let second_id = store.find_cards("Second").unwrap()[0];
+
+        let invalid = [
+            json!({"answers": [
+                {"cardId": first, "ease": 3},
+                {"cardId": second_id, "ease": 9}
+            ]}),
+            json!({"answers": [
+                {"cardId": first, "ease": 3},
+                {"cardId": "x", "ease": 3}
+            ]}),
+        ];
+        for params in invalid {
+            let error = dispatch(
+                &mut store,
+                media(),
+                "answerCards",
+                &params,
+                &scheduler(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("invalid parameter"), "{error}");
+            assert_eq!(store.card(first).unwrap().unwrap().reps, 0);
+            assert_eq!(store.card(second_id).unwrap().unwrap().reps, 0);
+        }
+    }
+
+    #[test]
+    fn valid_answer_followed_by_bad_ease_commits_nothing() {
+        let (_dir, mut store) = fixture();
+        add_card(&mut store);
+        let card_id = store.find_cards("").unwrap()[0];
+        let error = dispatch(
+            &mut store,
+            media(),
+            "answerCards",
+            &json!({"answers": [
+                {"cardId": card_id, "ease": 3},
+                {"cardId": card_id, "ease": 9}
+            ]}),
+            &scheduler(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ease"), "{error}");
+        assert_eq!(store.card(card_id).unwrap().unwrap().reps, 0);
+    }
+    #[test]
+    fn base64_media_rejects_trailing_junk_after_padding() {
+        assert_eq!(super::decode_base64("YQ== \n").ok(), Some(b"a".to_vec()));
+        for input in ["YQ==junk", "YQ=Zg==", "YQ==="] {
+            assert!(super::decode_base64(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn media_cleanup_failure_reports_the_created_note_id() {
+        let error = super::media_cleanup_error("remove stage failed", Some(42));
+        let text = error.to_string();
+        assert!(text.contains("42"), "{text}");
+        assert!(
+            text.contains("note was created but media cleanup failed"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn oversized_request_bodies_are_rejected() {
+        let (_dir, raw_store) = fixture();
+        let body: &'static str = Box::leak(
+            "x".repeat(super::MAX_BODY_BYTES.saturating_add(1))
+                .into_boxed_str(),
+        );
+        let mut request: tiny_http::Request =
+            TestRequest::new().with_body(body).into();
+        let store = Arc::new(Mutex::new(raw_store));
+        let response = super::read_and_dispatch(
+            &store,
+            media(),
+            &mut request,
+            &scheduler(),
+        );
+        assert!(response.error.unwrap_or_default().contains("too large"));
+        assert_eq!(response.result, Value::Null);
+    }
+
+    struct StopServer<'a> {
+        server: &'a Server,
+        stalled: Option<TcpStream>,
+    }
+
+    impl Drop for StopServer<'_> {
+        fn drop(&mut self) {
+            drop(self.stalled.take());
+            self.server.unblock();
+        }
+    }
+
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "the concurrency test drives two clients inside a scoped server thread"
+    )]
+    #[test]
+    fn stalled_request_body_does_not_block_other_clients() {
+        let (_dir, raw_store) = fixture();
+        let store = Arc::new(Mutex::new(raw_store));
+        let server = Server::http(("127.0.0.1", 0)).unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let scheduler = scheduler();
+
+        thread::scope(|scope| {
+            let runner = scope.spawn(|| {
+                super::serve_incoming(&server, &store, media(), &scheduler)
+            });
+
+            let mut stop = StopServer {
+                server: &server,
+                stalled: None,
+            };
+            let mut stalled = TcpStream::connect(addr).unwrap();
+            stalled
+                .write_all(
+                    b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4096\r\n\r\n",
+                )
+                .unwrap();
+            stop.stalled = Some(stalled);
+            thread::sleep(Duration::from_millis(100));
+
+            let body = r#"{"action":"version","version":6}"#;
+            let request = format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            for _ in 0..6 {
+                let mut client = TcpStream::connect(addr).unwrap();
+                client
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                client.write_all(request.as_bytes()).unwrap();
+
+                let mut received = Vec::new();
+                let mut buffer = [0u8; 256];
+                while !String::from_utf8_lossy(&received)
+                    .contains("\"result\":6")
+                {
+                    let count = client.read(&mut buffer).unwrap();
+                    assert!(count > 0, "connection closed before a response");
+                    received.extend_from_slice(&buffer[..count]);
+                }
+            }
+
+            drop(stop);
+            assert!(runner.join().unwrap().is_ok());
+        });
     }
 }

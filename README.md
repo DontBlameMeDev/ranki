@@ -130,30 +130,54 @@ collection inside the data directory and cannot select storage. Ranki does not l
 or open an Anki profile on its own: it never touches `~/.local/share/Anki2` unless you
 point `RANKI_DATA_DIR` at it yourself. Its collection is filled by your own
 use, by AnkiWeb when sync is enabled, and by packages you import. Use `.apkg` or
-`.colpkg` packages to move data between apps. A missing collection is created by
-commands that need it.
+`.colpkg` packages to move data between apps. Both export commands write the same Anki
+package shape, and import merges a package into the destination collection. Neither
+file is a full replacement backup. Most commands create a missing collection. `ranki mcp`
+does not.
 
 ## Commands
 
 ```bash
 ranki gui                                      # review window
 ranki decks                                    # list deck IDs and names
-ranki due [--deck ID] [--limit N]              # cards due for review
-ranki search 'deck:Default tag:flags'          # Anki-style search
-ranki add-note --model ID --deck ID \
-  --field 'Front' --field 'Back' [--tag TAG]   # add a note and its cards
-ranki answer CARD_ID RATING                    # rate a card, 1 again to 4 easy
-ranki stats [--deck ID]                        # card counts
+ranki deck-create NAME
+ranki deck-rename ID NAME
+ranki deck-remove ID [--force]                 # --force allows non-empty decks
+ranki models                                   # ordered fields and templates
+ranki due [--deck ID_OR_NAME] [--limit N]      # default limit 20
+ranki search 'deck:Default tag:flags'          # prints one card id per line
+ranki show CARD_ID                             # card, deck, note, and field values
+ranki add-note --model ID_OR_NAME --deck ID_OR_NAME \
+  --field 'Front' --field 'Back' [--tag TAG]
+ranki note-edit NOTE_ID --field 'Front' --field 'Back' \
+  [--tag TAG | --clear-tags] [--deck ID_OR_NAME] [--expected-modified SECS]
+ranki add-image-occlusion --deck ID --image PATH --occlusion MARKER
+ranki answer CARD_ID RATING                    # 1-4 or again/hard/good/easy
+ranki stats [--deck ID_OR_NAME]                # card counts
 ranki import FILE.apkg                         # import .apkg or .colpkg package
-ranki export FILE.apkg                         # export an .apkg package
-ranki export-colpkg FILE.colpkg                # export a full collection backup
-ranki check                                    # verify the collection can be read
+ranki export FILE.apkg [--force]
+ranki export-colpkg FILE.colpkg [--force]
+ranki check                                    # create if missing, then verify
 ranki connect [--port 8765]                    # AnkiConnect JSON-RPC server
 ranki mcp                                      # MCP server over stdio
 ```
 
 Run `ranki COMMAND --help` for the full argument list.
 
+`add-note` and `search` print one card id per line so you can pipe them into
+`show` or `answer`. `due` prints card id, deck id, and due value as tab-separated
+columns. Use its first column for `show` or `answer`. `search` supports `deck:`,
+`tag:`, `note:`, `is:`, quoted text, and `*`, and prints card ids in search order.
+Deck selectors on `add-note`, `due`, and `stats` accept
+an id or a case-insensitive name. `--field` values are positional. `models` prints each
+note type's ordered field and template names as tab-separated columns.
+`show` prints the note id and modified seconds. Pass those to `note-edit` as the
+note id and `--expected-modified` to reject stale edits. `note-edit` replaces all
+field values in model order. Omitted tags and deck stay unchanged, supplied
+`--tag` values replace the tags, and `--clear-tags` removes them.
+`add-image-occlusion` accepts `--occlusion`, or one or more `--rect` and `--ellipse`
+masks. Those forms cannot be mixed. `export` and `export-colpkg` refuse an existing
+destination unless `--force` is set, and always refuse to write to the active collection.
 `ranki sync` also uploads, downloads, or checks the remote collection. Section
 [Sync](#sync) covers credentials and the optional window login.
 
@@ -166,6 +190,12 @@ directory, with mode `0600` on Unix. The password is discarded after login. Rank
 syncs after each completed study session, at launch, and at exit. The sidebar
 shows the age of the last successful sync.
 
+Sync flags are global, so they work on any command. `--sync` and `--no-sync` turn syncing
+on or off for one run. `--sync-auto` and `--no-sync-auto` control startup and shutdown
+sync. `--sync-username USER` overrides the configured username and `--sync-hkey-file PATH`
+reads the host key from a file. Persistent settings live in the `[sync]` section of
+`config.toml`: `enabled`, `auto`, `username`, `hkey_file`, `retries`, and `backoff_ms`.
+
 Command-line sync accepts a host key or a one-time login without putting a
 password in the process arguments:
 
@@ -173,14 +203,22 @@ password in the process arguments:
 export RANKI_SYNC_HKEY='your-host-key'  # or RANKI_SYNC_USERNAME + RANKI_SYNC_PASSWORD
 ranki sync --status                     # inspect remote metadata
 ranki sync                              # safe automatic direction
-ranki sync --full-upload                # explicit one-way choices
-ranki sync --full-download
+ranki sync --full-upload --yes          # replace the remote collection
+ranki sync --full-download --yes        # replace the local collection
 ```
+
+Explicit sync needs credentials or a stored host key, even for `--status`. Without them,
+`ranki sync` exits nonzero and names `RANKI_SYNC_HKEY`, `RANKI_SYNC_USERNAME` with
+`RANKI_SYNC_PASSWORD`, and `--sync-hkey-file`. Conflicts and retry-later outcomes also
+exit nonzero. `--full-upload` and `--full-download` require `--yes` because they replace
+one side. A media failure after a successful collection transfer prints a warning and
+keeps the successful exit status.
 
 `ranki sync` writes the same state file, so the window and the CLI share one
 sync status. Ordinary commands sync the collection only, so a large media
-library never delays them. `ranki sync` also refreshes media; the review
-window does that in the background.
+library never delays them. `ranki mcp` skips automatic startup and shutdown
+sync so AnkiWeb cannot delay session startup or exit. `ranki sync` also
+refreshes media. The review window does that in the background.
 
 ## Automation
 
@@ -195,8 +233,15 @@ stderr. Register the binary with an MCP client as a stdio server:
 ranki mcp
 ```
 
-It uses Ranki's app collection and takes no path flag. Its tools cover decks, due
-cards, search, notes, answers, and import/export. Write tools require `confirm: true`.
+It uses Ranki's app collection and takes no path flag. It does not create a missing
+collection, so run `ranki check` first. The server identifies as Ranki and publishes
+instructions, output schemas, tool titles, and read-only or destructive hints. Read
+tools cover decks, models, due cards with note text, search, cards, notes, and stats.
+Write tools cover deck changes, note edits, answers, and packages. Each requires
+`confirm: true`. Package paths are relative to the collection directory. `due_cards` and
+`find_cards` return bounded pages with `has_more` and `next_offset`. Pass `next_offset`
+as `offset` to continue. See [docs/mcp-design.md](docs/mcp-design.md) for the tool
+contracts.
 
 ## Keyboard shortcuts
 

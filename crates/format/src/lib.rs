@@ -62,6 +62,7 @@ pub struct ExportOptions {
     pub with_deck_configs: bool,
     pub with_media: bool,
     pub legacy: bool,
+    pub overwrite: bool,
 }
 
 impl Default for ExportOptions {
@@ -71,6 +72,7 @@ impl Default for ExportOptions {
             with_deck_configs: true,
             with_media: true,
             legacy: false,
+            overwrite: true,
         }
     }
 }
@@ -104,7 +106,7 @@ pub fn import_apkg(
     contents
         .media
         .retain(|entry| media_is_referenced(entry, &referenced));
-    let renames = copy_media_with_db(
+    let copied = copy_media_with_db(
         media_dir,
         &media_db_path(media_dir),
         &contents.media,
@@ -113,7 +115,7 @@ pub fn import_apkg(
     {
         let connection = Connection::open(contents.collection.path())
             .map_err(error::db_error("cannot open package collection"))?;
-        rewrite_note_media(&connection, &renames)?;
+        rewrite_note_media(&connection, copied.renames())?;
     }
 
     let mut connection = schema::open_or_create(collection, Some(source_crt))?;
@@ -127,6 +129,7 @@ pub fn import_apkg(
         .execute_batch("DETACH DATABASE incoming")
         .map_err(error::db_error("cannot close package collection"));
     let report = result?;
+    copied.keep();
     detach?;
     Ok(report)
 }
@@ -743,6 +746,7 @@ fn export_package(
         &media,
         destination,
         version,
+        options.overwrite,
     )
 }
 
@@ -1000,6 +1004,7 @@ pub fn export_colpkg_with_options(
         &media,
         destination,
         version,
+        options.overwrite,
     )
 }
 
@@ -1037,7 +1042,7 @@ pub fn restore_colpkg(
         .unwrap_or_else(|| Path::new("."));
     let contents = package::read_apkg(package, scratch_dir)?;
     validate_restored_collection(contents.collection.path())?;
-    let renames = copy_media_with_db(
+    let copied = copy_media_with_db(
         media_dir,
         &media_db_path(media_dir),
         &contents.media,
@@ -1045,7 +1050,7 @@ pub fn restore_colpkg(
     {
         let connection = Connection::open(contents.collection.path())
             .map_err(error::db_error("cannot open restored collection"))?;
-        rewrite_note_media(&connection, &renames)?;
+        rewrite_note_media(&connection, copied.renames())?;
     }
 
     let backup = if collection.is_file() {
@@ -1079,6 +1084,7 @@ pub fn restore_colpkg(
             error.error,
         )
     })?;
+    copied.keep();
     Ok(RestoreReport {
         media: contents.media.len(),
         backup,

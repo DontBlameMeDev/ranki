@@ -43,6 +43,31 @@ pub struct MediaRename {
     pub to: String,
 }
 
+/// Tracks media written during one import and removes it unless kept.
+#[derive(Debug, Default)]
+pub struct MediaCopy {
+    renames: Vec<MediaRename>,
+    created: Vec<PathBuf>,
+}
+
+impl MediaCopy {
+    pub fn renames(&self) -> &[MediaRename] {
+        &self.renames
+    }
+
+    pub fn keep(mut self) {
+        self.created.clear();
+    }
+}
+
+impl Drop for MediaCopy {
+    fn drop(&mut self) {
+        for path in &self.created {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 /// A media file found in a media directory during export.
 #[derive(Debug, Clone)]
 pub struct MediaFile {
@@ -198,7 +223,7 @@ pub fn copy_media_with_db(
     media_dir: &Path,
     media_db: &Path,
     entries: &[MediaEntry],
-) -> Result<Vec<MediaRename>, FormatError> {
+) -> Result<MediaCopy, FormatError> {
     fs::create_dir_all(media_dir).map_err(io_error(format!(
         "cannot create media directory {}",
         media_dir.display()
@@ -207,7 +232,7 @@ pub fn copy_media_with_db(
     let exact_names: HashSet<&str> =
         entries.iter().map(|entry| entry.name.as_str()).collect();
     let mut cache = MediaCache::new(media_dir);
-    let mut renames = Vec::new();
+    let mut copied = MediaCopy::default();
     let mut records = Vec::new();
     for entry in entries {
         let normalized = sanitize_filename(&entry.name);
@@ -228,6 +253,7 @@ pub fn copy_media_with_db(
                 &destination.display().to_string(),
             )?;
             cache.record(&final_name, hash);
+            copied.created.push(destination.clone());
         }
         records.push(MediaRecord {
             name: final_name.clone(),
@@ -244,7 +270,7 @@ pub fn copy_media_with_db(
         }
         for source in sources {
             if source != final_name {
-                renames.push(MediaRename {
+                copied.renames.push(MediaRename {
                     from: source.to_owned(),
                     to: final_name.clone(),
                 });
@@ -252,7 +278,7 @@ pub fn copy_media_with_db(
         }
     }
     record_media(media_db, &records)?;
-    Ok(renames)
+    Ok(copied)
 }
 
 fn file_mtime(path: &Path) -> Result<i64, FormatError> {
@@ -299,8 +325,11 @@ pub fn write_new_file(
         .create_new(true)
         .open(path)
         .map_err(io_error(format!("cannot create {context}")))?;
-    file.write_all(bytes)
-        .map_err(io_error(format!("cannot write {context}")))
+    if let Err(error) = file.write_all(bytes) {
+        let _ = fs::remove_file(path);
+        return Err(io_error(format!("cannot write {context}"))(error));
+    }
+    Ok(())
 }
 
 struct MediaCache {
@@ -548,6 +577,8 @@ mod tests {
         .unwrap();
 
         let hashed_name = format!("pic-{}.png", super::sha1_hex(b"new"));
+        let copied = renames;
+        let renames = copied.renames();
         assert_eq!(renames.len(), 1);
         assert_eq!(renames[0].from, "pic.png");
         assert_eq!(renames[0].to, hashed_name);
@@ -645,6 +676,8 @@ mod tests {
             &[MediaEntry::new("pic.png".to_owned(), incoming.to_vec())],
         )
         .unwrap();
+        let copied = renamed;
+        let renamed = copied.renames();
         let final_name = &renamed[0].to;
         assert_ne!(final_name, &hashed);
         assert_eq!(fs::read(media.join(final_name)).unwrap(), incoming);

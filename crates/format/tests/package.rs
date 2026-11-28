@@ -544,6 +544,7 @@ fn export_options_strip_graves_scheduling_and_filtered_state() {
             with_deck_configs: false,
             with_media: false,
             legacy: false,
+            overwrite: true,
         },
     )
     .unwrap();
@@ -1015,6 +1016,7 @@ fn colpkg_flags_reset_scheduling_and_presets_without_pruning() {
             with_deck_configs: false,
             with_media: true,
             legacy: false,
+            overwrite: true,
         },
     )
     .unwrap();
@@ -1201,6 +1203,7 @@ fn no_scheduling_exports_bounded_new_card_positions() {
             with_deck_configs: true,
             with_media: true,
             legacy: false,
+            overwrite: true,
         },
     )
     .unwrap();
@@ -1285,6 +1288,7 @@ fn no_scheduling_returns_filtered_cards_to_home_decks() {
             with_deck_configs: true,
             with_media: true,
             legacy: false,
+            overwrite: true,
         },
     )
     .unwrap();
@@ -1332,6 +1336,7 @@ fn preset_only_colpkg_preserves_filtered_card_state() {
             with_deck_configs: false,
             with_media: true,
             legacy: false,
+            overwrite: true,
         },
     )
     .unwrap();
@@ -1420,6 +1425,7 @@ fn selected_deck_export_keeps_deck_ids_inside_the_package() {
             with_deck_configs: true,
             with_media: true,
             legacy: false,
+            overwrite: true,
         },
     )
     .unwrap();

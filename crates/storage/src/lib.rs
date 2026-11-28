@@ -110,7 +110,6 @@ pub struct Collection {
     created: OnceCell<i64>,
     timing_config: OnceCell<TimingConfig>,
     timing_now: Cell<Option<(i64, Timing)>>,
-    due_index: OnceCell<()>,
     options_cache: RefCell<Option<OptionsCache>>,
 }
 
@@ -213,6 +212,44 @@ fn legacy_scheduler_v1(conn: &Connection) -> Result<bool, StoreError> {
             .get("schedVer")
             .and_then(Json::as_i64)
             .is_none_or(|version| version < 2))
+}
+
+fn ensure_due_indexes(conn: &Connection) -> Result<(), StoreError> {
+    if !records::table_exists(conn, "cards")? {
+        return Ok(());
+    }
+    let existing: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+             AND name IN ('idx_ranki_cards_queue_due', 'idx_ranki_cards_queue_ord', \
+                          'idx_ranki_cards_new_gather')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)?;
+    if existing == 3 {
+        return Ok(());
+    }
+    let mut statement = conn
+        .prepare("SELECT name FROM pragma_table_info('cards')")
+        .map_err(backend)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(backend)?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(backend)?;
+    if !["queue", "due", "id", "ord", "did"]
+        .into_iter()
+        .all(|name| columns.contains(name))
+    {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_ranki_cards_queue_due ON cards (queue, due, id); \
+         CREATE INDEX IF NOT EXISTS idx_ranki_cards_queue_ord ON cards (queue, ord, due); \
+         CREATE INDEX IF NOT EXISTS idx_ranki_cards_new_gather ON cards (queue, did, due, ord)",
+    )
+    .map_err(backend)
 }
 
 /// Upgrades the stored scheduler state from Anki's original scheduler.
@@ -354,13 +391,13 @@ impl Collection {
             return Err(invalid("not an Anki collection"));
         }
         let _ = upgrade_scheduler_v2(&mut conn)?;
+        ensure_due_indexes(&conn)?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
             created: OnceCell::new(),
             timing_config: OnceCell::new(),
             timing_now: Cell::new(None),
-            due_index: OnceCell::new(),
             options_cache: RefCell::new(None),
         })
     }
@@ -630,7 +667,11 @@ params![stamp.modified, stamp.scm, json],
         Ok(())
     }
 
-    fn deck_list(&self) -> Result<Vec<Deck>, StoreError> {
+    /// Lists every deck, including an empty Default deck.
+    ///
+    /// # Errors
+    /// Returns an error when the collection cannot be read.
+    pub fn deck_list(&self) -> Result<Vec<Deck>, StoreError> {
         deck_list_from(&self.conn)
     }
 
@@ -707,19 +748,187 @@ params![stamp.modified, stamp.scm, json],
         search::build(&tokens, &decks, &models, today, learn_cutoff)
     }
 
-    fn ensure_due_index(&self) -> Result<(), StoreError> {
-        if self.due_index.get().is_some() {
-            return Ok(());
+    /// Returns up to `limit` matching card ids starting at `offset`.
+    ///
+    /// # Errors
+    /// Returns an error when the query is invalid, a page bound is too large,
+    /// or the database cannot be read.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "page bounds stay explicit at the call site"
+    )]
+    pub fn find_cards_page(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Id>, StoreError> {
+        let limit_value =
+            i64::try_from(limit).map_err(|_| invalid("limit too large"))?;
+        let offset_value =
+            i64::try_from(offset).map_err(|_| invalid("offset too large"))?;
+        let search = self.search_query_timed(query)?;
+        let sql = format!(
+            "SELECT c.id FROM cards c JOIN notes n ON n.id = c.nid WHERE {} \
+             ORDER BY c.id LIMIT ? OFFSET ?",
+            search.clause
+        );
+        let mut parameters = search.params;
+        parameters.push(SqlValue::Integer(limit_value));
+        parameters.push(SqlValue::Integer(offset_value));
+        let mut statement = self.conn.prepare(&sql).map_err(backend)?;
+        let rows = statement
+            .query_map(params_from_iter(parameters), |row| row.get::<_, Id>(0))
+            .map_err(backend)?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row.map_err(backend)?);
         }
+        Ok(ids)
+    }
+    /// Returns the deck of the first card for a note, if it has one.
+    ///
+    /// # Errors
+    /// Returns an error when the database cannot be read.
+    pub fn note_deck_id(&self, note_id: Id) -> Result<Option<Id>, StoreError> {
         self.conn
-            .execute_batch(
-                "CREATE INDEX IF NOT EXISTS idx_ranki_cards_queue_due ON cards (queue, due, id); \
-                 CREATE INDEX IF NOT EXISTS idx_ranki_cards_queue_ord ON cards (queue, ord, due); \
-                 CREATE INDEX IF NOT EXISTS idx_ranki_cards_new_gather ON cards (queue, did, due, ord)"
+            .query_row(
+                "SELECT did FROM cards WHERE nid = ?1 LIMIT 1",
+                [note_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)
+    }
+
+    /// Replaces a note's fields, tags, and note type.
+    ///
+    /// Cards move only when `deck_id` is set. `expected_modified` rejects the
+    /// write inside the transaction when another writer changed the note.
+    ///
+    /// # Errors
+    /// Returns an error when the note or model is missing, the field count does
+    /// not match the model, the edit would change the card set, a supplied
+    /// revision is stale, or the write fails.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the revision and deck move are independent write guards"
+    )]
+    pub fn update_note_checked(
+        &mut self,
+        note: &Note,
+        deck_id: Option<Id>,
+        expected_modified: Option<i64>,
+    ) -> Result<(), StoreError> {
+        self.write_note(note, deck_id, expected_modified)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "note updates keep validation and writes in one transaction"
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the revision and deck move are independent write guards"
+    )]
+    fn write_note(
+        &mut self,
+        note: &Note,
+        deck_id: Option<Id>,
+        expected_modified: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let model = self
+            .model_list()?
+            .into_iter()
+            .find(|model| model.id == note.model_id)
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("model {}", note.model_id))
+            })?;
+        if note.fields.is_empty() || note.fields.len() != model.fields.len() {
+            return Err(invalid("field count does not match model"));
+        }
+        if let Some(target) = deck_id
+            && !self.deck_subtree(target)?.contains(&target)
+        {
+            return Err(StoreError::NotFound(format!("deck {target}")));
+        }
+        let normalize_text = normalize_note_text(&self.conn)?;
+        let mut fields = note.fields.clone();
+        for field in &mut fields {
+            anki::normalize_field(field, normalize_text);
+        }
+        let first = fields.first().map_or("", String::as_str);
+        let transaction = self.conn.transaction().map_err(backend)?;
+        let stored_modified: Option<i64> = transaction
+            .query_row(
+                "SELECT mod FROM notes WHERE id = ?1",
+                [note.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        let Some(current_modified) = stored_modified else {
+            return Err(StoreError::NotFound(format!("note {}", note.id)));
+        };
+        if expected_modified
+            .is_some_and(|expected| expected != current_modified)
+        {
+            return Err(invalid("note changed; read it again"));
+        }
+        let mut expected = model.card_ordinals(&fields);
+        expected.sort_unstable();
+        let mut statement = transaction
+            .prepare("SELECT ord FROM cards WHERE nid = ?1 ORDER BY ord")
+            .map_err(backend)?;
+        let rows = statement
+            .query_map([note.id], |row| row.get::<_, i64>(0))
+            .map_err(backend)?;
+        let mut stored = Vec::new();
+        for row in rows {
+            stored.push(
+                u16::try_from(row.map_err(backend)?)
+                    .map_err(|_| invalid("card ordinal out of range"))?,
+            );
+        }
+        if expected != stored {
+            return Err(invalid("editing would change the card set"));
+        }
+        drop(statement);
+        let usn = update_col(&transaction, false)?;
+        let tags = tags::canonify(&note.tags, &transaction, usn)?;
+        let modified =
+            anki::now_secs()?.max(current_modified.saturating_add(1));
+        let sort_field = anki::sort_field_with(
+            &fields,
+            usize::from(model.sort_field_index),
+            normalize_text,
+        );
+        let checksum = anki::checksum_with(first, normalize_text);
+        transaction
+            .execute(
+                "UPDATE notes SET mid = ?1, mod = ?2, usn = ?3, tags = ?4, flds = ?5, \
+                 sfld = ?6, csum = ?7 WHERE id = ?8",
+                params![
+                    note.model_id,
+                    modified,
+                    usn,
+                    anki::encode_tags(&tags),
+                    anki::encode_fields(&fields),
+                    sort_field,
+                    anki::csum_value(checksum),
+                    note.id,
+                ],
             )
             .map_err(backend)?;
-        let _ = self.due_index.set(());
-        Ok(())
+        if let Some(target) = deck_id {
+            transaction
+                .execute(
+                    "UPDATE cards SET did = ?1, mod = ?2, usn = ?3 WHERE nid = ?4",
+                    params![target, modified, usn, note.id],
+                )
+                .map_err(backend)?;
+        }
+        transaction.commit().map_err(backend)
     }
 }
 
@@ -981,7 +1190,6 @@ impl Store for Collection {
         limit: usize,
         now_secs: i64,
     ) -> Result<Vec<Card>, StoreError> {
-        self.ensure_due_index()?;
         let timing = self.timing(now_secs)?;
         let real_today = self.timing(anki::now_secs()?)?.days_elapsed;
         let (decks, presets) = self.queue_options()?;
@@ -1153,96 +1361,12 @@ impl Store for Collection {
         Ok(cards)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "note updates keep validation and writes in one transaction"
-    )]
     fn update_note(
         &mut self,
         note: &Note,
         deck_id: Id,
     ) -> Result<(), StoreError> {
-        let model = self
-            .model_list()?
-            .into_iter()
-            .find(|model| model.id == note.model_id)
-            .ok_or_else(|| {
-                StoreError::NotFound(format!("model {}", note.model_id))
-            })?;
-        if note.fields.is_empty() || note.fields.len() != model.fields.len() {
-            return Err(invalid("field count does not match model"));
-        }
-        if !self.deck_subtree(deck_id)?.contains(&deck_id) {
-            return Err(StoreError::NotFound(format!("deck {deck_id}")));
-        }
-        let normalize_text = normalize_note_text(&self.conn)?;
-        let mut fields = note.fields.clone();
-        for field in &mut fields {
-            anki::normalize_field(field, normalize_text);
-        }
-        let first = fields.first().map_or("", String::as_str);
-        let transaction = self.conn.transaction().map_err(backend)?;
-        let exists: bool = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM notes WHERE id = ?1)",
-                [note.id],
-                |row| row.get(0),
-            )
-            .map_err(backend)?;
-        if !exists {
-            return Err(StoreError::NotFound(format!("note {}", note.id)));
-        }
-        let mut expected = model.card_ordinals(&fields);
-        expected.sort_unstable();
-        let mut statement = transaction
-            .prepare("SELECT ord FROM cards WHERE nid = ?1 ORDER BY ord")
-            .map_err(backend)?;
-        let rows = statement
-            .query_map([note.id], |row| row.get::<_, i64>(0))
-            .map_err(backend)?;
-        let mut stored = Vec::new();
-        for row in rows {
-            stored.push(
-                u16::try_from(row.map_err(backend)?)
-                    .map_err(|_| invalid("card ordinal out of range"))?,
-            );
-        }
-        if expected != stored {
-            return Err(invalid("editing would change the card set"));
-        }
-        drop(statement);
-        let usn = update_col(&transaction, false)?;
-        let tags = tags::canonify(&note.tags, &transaction, usn)?;
-        let modified = anki::now_secs()?;
-        let sort_field = anki::sort_field_with(
-            &fields,
-            usize::from(model.sort_field_index),
-            normalize_text,
-        );
-        let checksum = anki::checksum_with(first, normalize_text);
-        transaction
-            .execute(
-                "UPDATE notes SET mid = ?1, mod = ?2, usn = ?3, tags = ?4, flds = ?5, \
-                 sfld = ?6, csum = ?7 WHERE id = ?8",
-                params![
-                    note.model_id,
-                    modified,
-                    usn,
-                    anki::encode_tags(&tags),
-                    anki::encode_fields(&fields),
-                    sort_field,
-                    anki::csum_value(checksum),
-                    note.id,
-                ],
-            )
-            .map_err(backend)?;
-        transaction
-            .execute(
-                "UPDATE cards SET did = ?1, mod = ?2, usn = ?3 WHERE nid = ?4",
-                params![deck_id, modified, usn, note.id],
-            )
-            .map_err(backend)?;
-        transaction.commit().map_err(backend)
+        self.write_note(note, Some(deck_id), None)
     }
 
     fn remove_card(&mut self, id: Id) -> Result<(), StoreError> {
@@ -3087,5 +3211,99 @@ mod tests {
             collection.note(note.id).unwrap().unwrap().fields,
             vec![String::from("{{c1::one}} {{c2::two}}"), String::new()]
         );
+    }
+
+    fn assert_due_indexes(collection: &Collection) {
+        for name in [
+            "idx_ranki_cards_queue_due",
+            "idx_ranki_cards_queue_ord",
+            "idx_ranki_cards_new_gather",
+        ] {
+            let count: i64 = collection
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing index {name}");
+        }
+    }
+
+    #[test]
+    fn find_cards_page_returns_requested_page_in_id_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("collection.anki2");
+        let mut collection = Collection::create(&path).unwrap();
+        let mut ids = Vec::new();
+        for index in 0..5 {
+            ids.extend(
+                collection
+                    .add_note(&NewNote {
+                        model_id: 1,
+                        deck_id: 1,
+                        fields: vec![
+                            format!("paged {index}"),
+                            String::from("back"),
+                        ],
+                        tags: Vec::new(),
+                    })
+                    .unwrap(),
+            );
+        }
+        ids.sort_unstable();
+
+        let first = collection.find_cards_page("paged", 2, 0).unwrap();
+        let second = collection.find_cards_page("paged", 2, 2).unwrap();
+
+        assert_eq!(first.as_slice(), &ids[..2]);
+        assert_eq!(second.as_slice(), &ids[2..4]);
+    }
+
+    #[test]
+    fn open_recreates_due_indexes_before_due_cards() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("collection.anki2");
+        let collection = Collection::create(&path).unwrap();
+        assert_due_indexes(&collection);
+
+        collection
+            .conn
+            .execute_batch(
+                "DROP INDEX IF EXISTS idx_ranki_cards_queue_due; \
+                 DROP INDEX IF EXISTS idx_ranki_cards_queue_ord",
+            )
+            .unwrap();
+        drop(collection);
+
+        let collection = Collection::open(&path).unwrap();
+        assert_due_indexes(&collection);
+        assert_eq!(
+            collection
+                .due_cards(None, 10, super::anki::now_secs().unwrap())
+                .unwrap(),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn note_deck_id_reads_a_card_and_handles_a_missing_note() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("collection.anki2");
+        let mut collection = Collection::create(&path).unwrap();
+        let deck = collection.create_deck("Other").unwrap();
+        let cards = collection
+            .add_note(&NewNote {
+                model_id: 1,
+                deck_id: deck.id,
+                fields: vec![String::from("front"), String::from("back")],
+                tags: Vec::new(),
+            })
+            .unwrap();
+        let note_id = collection.card(cards[0]).unwrap().unwrap().note_id;
+
+        assert_eq!(collection.note_deck_id(note_id).unwrap(), Some(deck.id));
+        assert_eq!(collection.note_deck_id(i64::MAX).unwrap(), None);
     }
 }
