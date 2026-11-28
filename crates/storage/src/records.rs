@@ -192,6 +192,11 @@ fn template_ordinal(template: &Json, position: usize) -> u16 {
         .unwrap_or_else(|| u16::try_from(position).unwrap_or_default())
 }
 
+/// Reads note types from schema-11 JSON.
+///
+/// # Errors
+///
+/// Returns an error when the JSON is malformed or a note type id is invalid.
 pub fn models_from_json(json: &str) -> Result<Vec<NoteModel>, StoreError> {
     if json.trim().is_empty() {
         return Ok(Vec::new());

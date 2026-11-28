@@ -43,6 +43,10 @@ use std::path::PathBuf;
 use std::slice;
 use std::str;
 
+pub use options::{
+    deck_from_json, deck_from_proto, deck_to_json, deck_to_proto,
+    preset_from_json, preset_from_proto, preset_to_json, preset_to_proto,
+};
 pub use ranki_model::DeckPreset;
 pub use ranki_model::EffectiveDeck;
 pub use ranki_model::StoreError;
@@ -57,11 +61,13 @@ pub use anki::protobuf_floats;
 pub use anki::with_deck_kind_config_id;
 pub use anki::{
     checksum, csum_value, html_to_text_line, legacy_checksum,
-    legacy_field_text, sort_field, strip_html,
+    legacy_field_text, sort_field, sort_field_with, strip_html,
     strip_html_preserving_media_filenames,
 };
 pub use reopening::ReopeningCollection;
+pub use tags::canonify as canonify_tags;
 
+pub use records::models_from_json;
 pub use records::models_from_tables_with_prefix;
 pub use records::models_to_json;
 
@@ -2240,6 +2246,30 @@ fn insert_model_tables(
         }
     }
     Ok(())
+}
+
+/// Writes a note type into normalized tables with explicit import stamps.
+///
+/// # Errors
+///
+/// Returns an error when a normalized row cannot be written.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "import passes explicit connection, note type, and stamps"
+)]
+pub fn insert_model_tables_for_import(
+    conn: &Connection,
+    model: &NoteModel,
+    mtime_secs: i64,
+    usn: i32,
+) -> Result<(), StoreError> {
+    let stamp = ColStamp {
+        usn,
+        modified: mtime_secs,
+        scm: mtime_secs,
+        now_secs: mtime_secs,
+    };
+    insert_model_tables(conn, model, &stamp)
 }
 
 fn placeholders(start: i64, count: usize) -> String {

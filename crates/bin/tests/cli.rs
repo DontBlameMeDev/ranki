@@ -558,6 +558,20 @@ fn colpkg_import_replaces_collection_and_restores_conflicting_media() {
 }
 
 #[test]
+fn invalid_import_update_policy_is_rejected_before_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let isolated = Isolated::new(&dir, "invalid-policy");
+    let output = isolated
+        .command()
+        .args(["import", "missing.apkg", "--update-notes", "newer"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid update condition"), "{stderr}");
+}
+
+#[test]
 fn connect_creates_a_missing_collection_and_reports_its_address() {
     let dir = tempfile::tempdir().unwrap();
     let app = Isolated::new(&dir, "app");

@@ -248,6 +248,15 @@ fn strings(connection: &Connection, sql: &str) -> Vec<String> {
         .collect()
 }
 
+fn ids(connection: &Connection, sql: &str) -> Vec<i64> {
+    let mut statement = connection.prepare(sql).unwrap();
+    statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .map(|value| value.unwrap())
+        .collect()
+}
+
 fn query_string(connection: &Connection, sql: &str, value: &str) -> String {
     connection
         .query_row(sql, params![value], |row| row.get(0))
@@ -326,14 +335,9 @@ fn roundtrip_notes_cards_and_review_log() {
     let package = fixture.package();
     let (collection, _media, report) = fixture.import(&package, "fresh");
 
-    assert_eq!(
-        report,
-        ImportReport {
-            notes: 2,
-            cards: 2,
-            media: 0
-        }
-    );
+    assert_eq!(report.notes, 2);
+    assert_eq!(report.cards, 2);
+    assert_eq!(report.media, 0);
     let connection = Connection::open(collection).unwrap();
     assert_eq!(count(&connection, "notes"), 2);
     assert_eq!(count(&connection, "cards"), 2);
@@ -1648,6 +1652,9 @@ CREATE TABLE IF NOT EXISTS deck_config (
     id INTEGER PRIMARY KEY NOT NULL, name TEXT NOT NULL COLLATE unicase,
     mtime_secs INTEGER NOT NULL, usn INTEGER NOT NULL, config BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tags (
+    tag TEXT PRIMARY KEY COLLATE unicase, usn INTEGER NOT NULL, collapsed INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS notetypes (
     id INTEGER PRIMARY KEY NOT NULL, name TEXT NOT NULL COLLATE unicase,
     mtime_secs INTEGER NOT NULL, usn INTEGER NOT NULL, config BLOB NOT NULL
@@ -2067,15 +2074,28 @@ fn schema18_destination_keeps_tables_in_sync_with_merged_metadata() {
 
     let connection = import_into(dir.path(), &package, &destination);
 
-    let decks = col_column(&connection, "decks");
     assert_eq!(
-        entry_names(&decks),
+        strings(&connection, "SELECT name FROM decks ORDER BY id"),
         ["Default".to_owned(), "Flags".to_owned()]
     );
-    assert_eq!(entry_ids(&decks, "Default"), [1]);
-    assert_eq!(entry_ids(&decks, "Flags"), [701]);
-    let models = col_column(&connection, "models");
-    assert_eq!(entry_ids(&models, "Basic"), [1]);
+    assert_eq!(
+        ids(&connection, "SELECT id FROM decks ORDER BY id"),
+        [1, 701]
+    );
+    assert_eq!(
+        strings(&connection, "SELECT name FROM notetypes ORDER BY id"),
+        ["Basic".to_owned()]
+    );
+    for column in ["models", "decks", "dconf", "tags"] {
+        let stored: String = connection
+            .query_row(
+                &format!("SELECT {column} FROM col WHERE id = 1"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "", "{column} must stay empty in schema 18");
+    }
     assert_eq!(
         strings(&connection, "SELECT name FROM decks ORDER BY id"),
         ["Default".to_owned(), "Flags".to_owned()]

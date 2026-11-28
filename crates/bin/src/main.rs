@@ -13,9 +13,9 @@ use clap::Parser;
 use clap::Subcommand;
 use ranki_core::FsrsScheduler;
 use ranki_format::ExportOptions;
+use ranki_format::UpdateCondition;
 use ranki_format::export_apkg_with_options;
 use ranki_format::export_colpkg_with_options;
-use ranki_format::import_apkg;
 use ranki_format::restore_colpkg;
 use ranki_model::Id;
 use ranki_model::NewNote;
@@ -300,7 +300,34 @@ enum Command {
         deck: Option<DeckRef>,
     },
     /// Import an Anki package into the collection.
-    Import { package: PathBuf },
+    Import {
+        package: PathBuf,
+        /// Update matching notes: if-newer, always, or never.
+        #[arg(
+            long,
+            value_name = "WHEN",
+            default_value = "if-newer",
+            value_parser = parse_update_condition
+        )]
+        update_notes: UpdateCondition,
+        /// Update matching note types: if-newer, always, or never.
+        #[arg(
+            long,
+            value_name = "WHEN",
+            default_value = "if-newer",
+            value_parser = parse_update_condition
+        )]
+        update_notetypes: UpdateCondition,
+        /// Merge fields and templates of incompatible same-id note types.
+        #[arg(long)]
+        merge_notetypes: bool,
+        /// Skip imported card scheduling and review history.
+        #[arg(long)]
+        no_scheduling: bool,
+        /// Keep the target's deck presets instead of importing new ones.
+        #[arg(long)]
+        no_deck_configs: bool,
+    },
     /// Export the collection as an Anki package.
     Export {
         package: PathBuf,
@@ -363,6 +390,10 @@ enum Command {
     },
     /// Serve the Model Context Protocol over stdio.
     Mcp,
+}
+
+fn parse_update_condition(value: &str) -> Result<UpdateCondition, String> {
+    value.parse()
 }
 
 fn parse_rating(value: &str) -> Result<Rating, String> {
@@ -484,8 +515,7 @@ fn run_with_sync(
     let warn_shutdown_sync = !matches!(&command, Command::Gui);
     #[cfg(not(feature = "desktop"))]
     let warn_shutdown_sync = true;
-    let restore_command =
-        matches!(&command, Command::Import { package } if is_colpkg(package));
+    let restore_command = matches!(&command, Command::Import { package, .. } if is_colpkg(package));
     let result = match command {
         Command::Mcp => mcp::serve(&settings.paths, scheduler),
         #[cfg(feature = "desktop")]
@@ -498,7 +528,14 @@ fn run_with_sync(
             }
             Err(error) => Err(error),
         },
-        Command::Import { package } => {
+        Command::Import {
+            package,
+            update_notes,
+            update_notetypes,
+            merge_notetypes,
+            no_scheduling,
+            no_deck_configs,
+        } => {
             let result = if is_colpkg(&package) {
                 restore_package(
                     collection_path,
@@ -507,7 +544,14 @@ fn run_with_sync(
                     &package,
                 )
             } else {
-                import_package(collection_path, media_dir, &package)
+                let options = ranki_format::ImportOptions {
+                    update_notes,
+                    update_notetypes,
+                    merge_notetypes,
+                    with_scheduling: !no_scheduling,
+                    with_deck_configs: !no_deck_configs,
+                };
+                import_package(collection_path, media_dir, &package, options)
             };
             if result.is_ok() {
                 maybe_optimize(config, &settings);
@@ -1057,15 +1101,28 @@ fn open_gui(
     Ok(latest_guard.clone())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "CLI import takes collection, media, package, and options"
+)]
 fn import_package(
     path: &Path,
     media_dir: &Path,
     package: &Path,
+    options: ranki_format::ImportOptions,
 ) -> CliResult<()> {
-    let report = import_apkg(package, path, media_dir)?;
+    let report = ranki_format::import_apkg_with_options(
+        package, path, media_dir, options,
+    )?;
     println!(
-        "imported notes={} cards={} media={}",
-        report.notes, report.cards, report.media
+        "imported notes={} (new={} updated={} duplicate={} conflicting={}) cards={} media={}",
+        report.notes,
+        report.note_outcomes.new,
+        report.note_outcomes.updated,
+        report.note_outcomes.duplicate,
+        report.note_outcomes.conflicting,
+        report.cards,
+        report.media
     );
     Ok(())
 }
