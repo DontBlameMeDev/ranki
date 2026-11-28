@@ -1418,6 +1418,7 @@ impl Root {
             }
             if let Ok(paths) = env::var("RANKI_UI_DEV_OPEN_BROWSE_GROUP") {
                 root.view = View::Browse;
+                root.refresh_browse(cx);
                 for path in paths.split('|').filter(|path| !path.is_empty()) {
                     let _ = root.browse.expanded.insert(path.to_owned());
                 }
@@ -3440,6 +3441,7 @@ impl Root {
                 cx.notify();
             }
             Ok(true) => {
+                self.record_local_write();
                 let before = self.progress_fraction();
                 self.review.last_grade = None;
                 if self.review.session_dirty {
@@ -3489,7 +3491,6 @@ impl Root {
                     self.review.animation_seq.wrapping_add(1);
                 self.apply_loaded(&restored, loaded, cx);
                 self.review.last_grade_at = None;
-                self.record_local_write();
                 self.review.focused_elapsed = entry.spent;
                 self.review.studied =
                     self.review.studied.saturating_sub(entry.spent);
@@ -4566,7 +4567,14 @@ impl Render for Root {
                 this.dispatch(UiAction::from(action), window, cx);
             }))
             .on_action(cx.listener(|this, _: &AddOcclusionMask, _, cx| {
-                if this.view == View::AddCard {
+                let occlusion_model = this
+                    .models
+                    .get(this.add.model_index)
+                    .is_some_and(ranki_model::NoteModel::is_image_occlusion);
+                if this.view == View::AddCard
+                    && occlusion_model
+                    && this.add.occlusion.image.is_some()
+                {
                     this.add_default_occlusion_mask(cx);
                 }
             }))
@@ -4575,6 +4583,21 @@ impl Render for Root {
                     this.remove_last_occlusion_mask(cx);
                 }
             }))
+            .on_action(cx.listener(
+                |this, action: &UseReducedMotion, window, cx| {
+                    this.dispatch(UiAction::from(action), window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, action: &UseFullMotion, window, cx| {
+                    this.dispatch(UiAction::from(action), window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, action: &UseSystemMotion, window, cx| {
+                    this.dispatch(UiAction::from(action), window, cx);
+                },
+            ))
             .on_action(cx.listener(|this, action: &CancelAdd, window, cx| {
                 this.dispatch(UiAction::from(action), window, cx);
             }))

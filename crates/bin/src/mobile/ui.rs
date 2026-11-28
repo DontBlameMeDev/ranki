@@ -760,6 +760,14 @@ fn render_review_content(
                 ui.add_space(8.0);
                 ui.label(&review.summary);
             });
+        if short && app.review.last.is_some() {
+            ui.add_space(8.0);
+            let undo = secondary_button(RichText::new("Undo"), TAP_HEIGHT, p)
+                .min_size(vec2(ui.available_width(), TAP_HEIGHT));
+            if ui.add(undo).clicked() {
+                let _ = app.undo();
+            }
+        }
         return;
     }
 
@@ -814,10 +822,11 @@ fn render_review_content(
 fn review_actions_height(app: &AppState, compact: bool, short: bool) -> f32 {
     if short {
         let primary = match app.review.phase {
-            ReviewPhase::Waiting => 0.0,
             ReviewPhase::Answer if compact => TAP_HEIGHT,
             ReviewPhase::Answer => RATING_HEIGHT,
-            ReviewPhase::Question | ReviewPhase::Summary => TAP_HEIGHT,
+            ReviewPhase::Question
+            | ReviewPhase::Summary
+            | ReviewPhase::Waiting => TAP_HEIGHT,
         };
         return REVIEW_GAP + primary + REVIEW_GAP;
     }

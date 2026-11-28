@@ -30,12 +30,13 @@ fn review_button_handle(
     index: usize,
 ) -> FocusHandle {
     let mut handles = root.review_button_focus.borrow_mut();
-    if let Some(handle) = handles.get(index) {
-        return handle.clone();
+    while handles.len() <= index {
+        handles.push(cx.focus_handle());
     }
-    let handle = cx.focus_handle();
-    handles.push(handle.clone());
-    handle
+    handles
+        .get(index)
+        .cloned()
+        .unwrap_or_else(|| cx.focus_handle())
 }
 
 const NARROW_REVIEW_WIDTH: f32 = 400.0;
@@ -67,6 +68,7 @@ impl Root {
         let colors = self.colors();
         if self.review_answer_scroll_pending
             && self.review.phase == Phase::Answer
+            && self.review.current.is_some()
         {
             if let Some(anchor) = self.review_answer_anchor.as_ref() {
                 anchor.scroll_to(window, cx);

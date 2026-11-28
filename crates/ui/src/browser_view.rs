@@ -606,16 +606,18 @@ impl Root {
         if cards.is_empty() {
             return;
         }
-        let position = cards
+        let selected = cards
             .iter()
-            .position(|(_, id)| Some(*id) == self.browse.selected)
-            .unwrap_or(0);
-        let next = if step < 0 {
-            position.saturating_sub(step.unsigned_abs())
-        } else {
-            position
+            .position(|(_, id)| Some(*id) == self.browse.selected);
+        let next = match selected {
+            Some(position) if step < 0 => {
+                position.saturating_sub(step.unsigned_abs())
+            }
+            Some(position) => position
                 .saturating_add(step.unsigned_abs())
-                .min(cards.len() - 1)
+                .min(cards.len() - 1),
+            None if step < 0 => cards.len() - 1,
+            None => 0,
         };
         let (entry, id) = cards[next];
         self.scroll_browse_entry_into_view(entry);

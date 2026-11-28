@@ -428,76 +428,6 @@ impl Root {
                     .into_any_element(),
             );
         }
-        let toast_width = (viewport_width - 2.0 * (nav_width + 32.0)).max(0.0);
-        if let Some(toast) = self.live_toast() {
-            let (hue, icon_name, prefix) = match toast.kind {
-                crate::app::ToastKind::Success => {
-                    (colors.green, "icon-check", "Done")
-                }
-                crate::app::ToastKind::Error => {
-                    (colors.red, "icon-bell", "Error")
-                }
-            };
-            let dismiss = cx.listener(|root, _: &ClickEvent, _, cx| {
-                root.clear_toast();
-                cx.notify();
-            });
-            let body = div()
-                .flex()
-                .w_full()
-                .min_w(px(0.))
-                .items_center()
-                .gap(px(SPACE_GROUP))
-                .px(px(SPACE_RELATED))
-                .py(px(SPACE_RELATED))
-                .rounded(px(12.))
-                .bg(crate::theme::alpha(hue, 0.16))
-                .border_1()
-                .border_color(crate::theme::alpha(hue, 0.4))
-                .text_size(px(13.))
-                .text_color(colors.text)
-                .child(icon(icon_name, 16., hue))
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(hue)
-                        .child(prefix),
-                )
-                .child(div().flex_1().min_w(px(0.)).child(toast.text.clone()))
-                .child(
-                    Interaction::surface(colors)
-                        .apply(
-                            div()
-                                .id("toast-dismiss")
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .w(px(24.))
-                                .h(px(24.))
-                                .flex_none()
-                                .rounded(px(6.))
-                                .cursor_pointer(),
-                        )
-                        .on_click(dismiss)
-                        .tooltip(label_tooltip("Dismiss", colors))
-                        .child(icon("icon-x", 14., colors.subtext)),
-                );
-            layers.push(
-                div()
-                    .absolute()
-                    .bottom(px(72.))
-                    .left(px(nav_width + 32.))
-                    .right(px(nav_width + 32.))
-                    .w(px(toast_width))
-                    .child(crate::components::fade_in(
-                        body,
-                        ("toast", usize::try_from(toast.seq).unwrap_or(0)),
-                        self.motion_ms(crate::theme::MOTION_QUICK_MS),
-                    ))
-                    .into_any_element(),
-            );
-        }
         if self.view == View::Decks
             && let Some(menu) = self.deck_menu
             && self
@@ -1151,6 +1081,77 @@ impl Root {
                     .into_any_element(),
             );
         }
+        let toast_width = (viewport_width - 2.0 * (nav_width + 32.0)).max(0.0);
+        if let Some(toast) = self.live_toast() {
+            let (hue, icon_name, prefix) = match toast.kind {
+                crate::app::ToastKind::Success => {
+                    (colors.green, "icon-check", "Done")
+                }
+                crate::app::ToastKind::Error => {
+                    (colors.red, "icon-bell", "Error")
+                }
+            };
+            let dismiss = cx.listener(|root, _: &ClickEvent, _, cx| {
+                root.clear_toast();
+                cx.notify();
+            });
+            let body = div()
+                .flex()
+                .w_full()
+                .min_w(px(0.))
+                .items_center()
+                .gap(px(SPACE_GROUP))
+                .px(px(SPACE_RELATED))
+                .py(px(SPACE_RELATED))
+                .rounded(px(12.))
+                .bg(crate::theme::alpha(hue, 0.16))
+                .border_1()
+                .border_color(crate::theme::alpha(hue, 0.4))
+                .text_size(px(13.))
+                .text_color(colors.text)
+                .child(icon(icon_name, 16., hue))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(hue)
+                        .child(prefix),
+                )
+                .child(div().flex_1().min_w(px(0.)).child(toast.text.clone()))
+                .child(
+                    Interaction::surface(colors)
+                        .apply(
+                            div()
+                                .id("toast-dismiss")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w(px(24.))
+                                .h(px(24.))
+                                .flex_none()
+                                .rounded(px(6.))
+                                .cursor_pointer(),
+                        )
+                        .on_click(dismiss)
+                        .tooltip(label_tooltip("Dismiss", colors))
+                        .child(icon("icon-x", 14., colors.subtext)),
+                );
+            layers.push(
+                div()
+                    .absolute()
+                    .bottom(px(72.))
+                    .left(px(nav_width + 32.))
+                    .right(px(nav_width + 32.))
+                    .w(px(toast_width))
+                    .child(crate::components::fade_in(
+                        body,
+                        ("toast", usize::try_from(toast.seq).unwrap_or(0)),
+                        self.motion_ms(crate::theme::MOTION_QUICK_MS),
+                    ))
+                    .into_any_element(),
+            );
+        }
+
         layers
     }
 

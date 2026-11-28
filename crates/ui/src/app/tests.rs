@@ -5657,6 +5657,19 @@ fn reduce_motion_setting_is_saved_and_applies(cx: &mut gpui::TestAppContext) {
         });
     });
     assert_eq!(cx.update(|_, cx| root.read(cx).motion_ms(240)), 0);
+
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.dispatch(UiAction::SetReduceMotion(Some(false)), window, cx);
+        });
+    });
+    cx.dispatch_action(super::UseReducedMotion);
+    cx.run_until_parked();
+    assert!(
+        cx.read_entity(&root, |root, _| root.options.reduce_motion
+            == Some(true)),
+        "the settings action must reach the app"
+    );
     let recorded = latest
         .lock()
         .expect("settings lock")
@@ -5886,9 +5899,7 @@ fn auto_sync_toggle_persists_and_rolls_back(cx: &mut gpui::TestAppContext) {
 fn remote_download_keeps_the_view_and_drafts_but_ends_review(
     cx: &mut gpui::TestAppContext,
 ) {
-    let Ok(directory) = tempfile::tempdir() else {
-        return;
-    };
+    let directory = tempfile::tempdir().expect("temp dir");
     let collection = directory.path().join("collection.anki2");
     if ranki_storage::Collection::create(&collection).is_err() {
         return;

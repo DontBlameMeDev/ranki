@@ -45,7 +45,7 @@ fn render_sides(
     let question_markup =
         render_template(&template.question_format, fields, question_env);
     let answer_env = RenderEnv {
-        front_side: if include_front {
+        front_side: if include_front || model.is_cloze() {
             question_markup.as_str()
         } else {
             ""
