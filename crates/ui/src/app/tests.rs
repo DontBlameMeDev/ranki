@@ -123,7 +123,6 @@ struct BrowseStore {
     ids: Vec<Id>,
     card_reads: Arc<AtomicUsize>,
     find_reads: Arc<AtomicUsize>,
-    history_reads: Arc<AtomicUsize>,
     fail_reads: bool,
     fail_browse: bool,
 }
@@ -189,7 +188,6 @@ impl BrowseStore {
             ids: Vec::new(),
             card_reads: Arc::new(AtomicUsize::new(0)),
             find_reads: Arc::new(AtomicUsize::new(0)),
-            history_reads: Arc::new(AtomicUsize::new(0)),
             fail_browse: false,
             fail_reads: false,
         };
@@ -410,7 +408,6 @@ fn browse_loads_cards_past_the_first_page(cx: &mut gpui::TestAppContext) {
         ids: Vec::new(),
         card_reads: Arc::new(AtomicUsize::new(0)),
         find_reads: Arc::new(AtomicUsize::new(0)),
-        history_reads: Arc::new(AtomicUsize::new(0)),
         fail_browse: false,
         fail_reads: false,
     };
@@ -464,7 +461,6 @@ fn browse_reads_only_the_cards_it_shows(cx: &mut gpui::TestAppContext) {
         ids: Vec::new(),
         card_reads: Arc::clone(&reads),
         find_reads: Arc::new(AtomicUsize::new(0)),
-        history_reads: Arc::new(AtomicUsize::new(0)),
         fail_browse: false,
         fail_reads: false,
     };
@@ -4415,7 +4411,6 @@ fn editing_a_browse_card_saves_the_add_card_view(
         ids: Vec::new(),
         card_reads: Arc::new(AtomicUsize::new(0)),
         find_reads: Arc::new(AtomicUsize::new(0)),
-        history_reads: Arc::new(AtomicUsize::new(0)),
         fail_browse: false,
         fail_reads: false,
     };
@@ -4460,7 +4455,6 @@ fn editing_a_card_reports_a_store_read_failure(cx: &mut gpui::TestAppContext) {
         ids: Vec::new(),
         card_reads: Arc::new(AtomicUsize::new(0)),
         find_reads: Arc::new(AtomicUsize::new(0)),
-        history_reads: Arc::new(AtomicUsize::new(0)),
         fail_browse: false,
         fail_reads: true,
     };
@@ -5511,7 +5505,6 @@ fn focused_again_button_handles_enter_and_space_once(
 fn browse_and_statistics_wait_for_their_view(cx: &mut gpui::TestAppContext) {
     let store = BrowseStore::with_cards(2);
     let finds = Arc::clone(&store.find_reads);
-    let history = Arc::clone(&store.history_reads);
     let (root, cx) = cx.add_window_view(|window, cx| {
         super::Root::new(
             super::Launch {
@@ -5528,11 +5521,6 @@ fn browse_and_statistics_wait_for_their_view(cx: &mut gpui::TestAppContext) {
         root.clone()
     });
     assert_eq!(finds.load(Ordering::Relaxed), 0, "Browse was not shown");
-    assert_eq!(
-        history.load(Ordering::Relaxed),
-        0,
-        "Statistics was not shown"
-    );
 
     cx.update(|window, cx| {
         root.update(cx, |root, cx| {
@@ -6996,7 +6984,6 @@ fn clicking_a_virtual_parent_toggles_expansion(cx: &mut gpui::TestAppContext) {
         ids: Vec::new(),
         card_reads: Arc::new(AtomicUsize::new(0)),
         find_reads: Arc::new(AtomicUsize::new(0)),
-        history_reads: Arc::new(AtomicUsize::new(0)),
         fail_reads: false,
         fail_browse: false,
     };

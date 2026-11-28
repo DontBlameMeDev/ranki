@@ -52,8 +52,7 @@ impl MobileApp {
 impl eframe::App for MobileApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_style(ctx, self.state.settings.theme);
-        let reviewing = self.state.screen == Screen::Review
-            && self.state.review.current.is_some();
+        let reviewing = self.state.screen == Screen::Review;
         let focused = reviewing && ctx.input(|input| input.focused);
         self.state.tick_focus(focused);
         if self.state.review.phase == ReviewPhase::Waiting {
@@ -848,6 +847,16 @@ fn render_review_actions(
         ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
         ui.add_space(REVIEW_GAP);
         let phase = app.review.phase;
+        if short && matches!(phase, ReviewPhase::Summary | ReviewPhase::Waiting)
+        {
+            let back =
+                secondary_button(RichText::new("Back to decks"), TAP_HEIGHT, p)
+                    .min_size(vec2(ui.available_width(), TAP_HEIGHT));
+            if ui.add(back).clicked() {
+                app.end_review();
+            }
+            return;
+        }
         match phase {
             ReviewPhase::Question => {
                 let reveal = touch_button(
