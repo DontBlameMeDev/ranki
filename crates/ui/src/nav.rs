@@ -361,6 +361,7 @@ impl Root {
         let colors = self.colors();
         let theme = self.theme();
         let style = Style::new(colors, theme);
+        let popup_ms = self.motion_ms(crate::theme::MOTION_POPUP_MS);
         let mut layers: Vec<AnyElement> = Vec::new();
         let mut bars = self.active_scrollbars(window);
         let deck_picker_bar = bars
@@ -374,56 +375,64 @@ impl Root {
         }
         if self.external_change {
             let refresh = self.action_click(UiAction::Reload);
+            let banner = div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(SPACE_BLOCK))
+                .px(px(SPACE_BLOCK))
+                .py(px(SPACE_RELATED))
+                .rounded(px(14.))
+                .bg(crate::theme::alpha(colors.red, 0.16))
+                .border_1()
+                .border_color(crate::theme::alpha(colors.red, 0.5))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_GROUP))
+                        .child(icon("icon-bell", 18., colors.red))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(colors.text)
+                                .child(
+                                    "Collection changed outside Ranki. Refresh before reviewing.",
+                                ),
+                        ),
+                )
+                .child(
+                    Interaction::accent(style)
+                        .apply(
+                            div()
+                                .id("external-refresh")
+                                .flex()
+                                .items_center()
+                                .gap(px(SPACE_GROUP))
+                                .h(px(36.))
+                                .px(px(SPACE_RELATED))
+                                .rounded(px(10.))
+                                .bg(colors.mauve)
+                                .text_color(style.ink())
+                                .cursor_pointer(),
+                        )
+                        .on_click(refresh)
+                        .child("Refresh")
+                        .child(keycap("F5", colors, true)),
+                );
             layers.push(
                 div()
                     .absolute()
                     .top(px(16.))
                     .left(px(nav_width + 32.))
                     .right(px(32.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(SPACE_BLOCK))
-                    .px(px(SPACE_BLOCK))
-                    .py(px(SPACE_RELATED))
-                    .rounded(px(14.))
-                    .bg(crate::theme::alpha(colors.red, 0.16))
-                    .border_1()
-                    .border_color(crate::theme::alpha(colors.red, 0.5))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(SPACE_GROUP))
-                            .child(icon("icon-bell", 18., colors.red))
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(colors.text)
-                                    .child(
-                                        "Collection changed outside Ranki. Refresh before reviewing.",
-                                    ),
-                            ),
-                    )
-                    .child(
-                        Interaction::accent(style)
-                            .apply(
-                                div()
-                                    .id("external-refresh")
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(SPACE_GROUP))
-                                    .h(px(36.))
-                                    .px(px(SPACE_RELATED))
-                                    .rounded(px(10.))
-                                    .bg(colors.mauve)
-                                    .text_color(style.ink())
-                                    .cursor_pointer(),
-                            )
-                            .on_click(refresh)
-                            .child("Refresh")
-                            .child(keycap("F5", colors, true)),
-                    )
+                    .child(crate::components::rise_in(
+                        banner,
+                        "external-change-enter",
+                        popup_ms,
+                        -crate::theme::ENTER_RISE_PX,
+                    ))
                     .into_any_element(),
             );
         }
@@ -445,7 +454,7 @@ impl Root {
                     .snap_to_window_with_margin(px(16.))
                     .position(menu.anchor)
                     .offset(point(px(15.), px(19.)))
-                    .child(
+                    .child(crate::components::rise_in(
                         div()
                             .id("deck-actions-menu")
                             .debug_selector(|| "deck-actions-menu".to_owned())
@@ -555,7 +564,10 @@ impl Root {
                                     .text_size(px(13.))
                                     .child("Remove"),
                             ),
-                    )
+                        "deck-actions-menu-enter",
+                        popup_ms,
+                        -4.0,
+                    ))
                     .into_any_element(),
             );
         }
@@ -571,7 +583,7 @@ impl Root {
                     .snap_to_window_with_margin(px(16.))
                     .position(menu.anchor)
                     .offset(point(px(15.), px(19.)))
-                    .child(
+                    .child(crate::components::rise_in(
                         div()
                             .id("card-actions-menu")
                             .debug_selector(|| "card-actions-menu".to_owned())
@@ -651,7 +663,10 @@ impl Root {
                                     .text_size(px(13.))
                                     .child("Remove"),
                             ),
-                    )
+                        "card-actions-menu-enter",
+                        popup_ms,
+                        -4.0,
+                    ))
                     .into_any_element(),
             );
         }
@@ -662,7 +677,12 @@ impl Root {
                     .snap_to_window_with_margin(px(16.))
                     .position(self.add.deck_picker_anchor)
                     .offset(point(px(0.), px(SPACE_BLOCK + SPACE_INLINE)))
-                    .child(self.render_deck_picker(colors, window, cx))
+                    .child(crate::components::rise_in(
+                        self.render_deck_picker(colors, window, cx),
+                        "deck-picker-enter",
+                        popup_ms,
+                        -4.0,
+                    ))
                     .into_any_element(),
             );
         }
@@ -678,7 +698,12 @@ impl Root {
                     .snap_to_window_with_margin(px(16.))
                     .position(anchor)
                     .offset(point(px(0.), px(SPACE_BLOCK + SPACE_INLINE)))
-                    .child(self.render_color_picker(cx))
+                    .child(crate::components::rise_in(
+                        div().child(self.render_color_picker(cx)),
+                        "color-picker-enter",
+                        popup_ms,
+                        -4.0,
+                    ))
                     .into_any_element(),
             );
         }
@@ -692,7 +717,7 @@ impl Root {
                 this.cancel_create(window, cx);
             });
             let create_error = self.create_error.clone();
-            layers.push(
+            layers.push(crate::components::fade_in(
                 div()
                     .absolute()
                     .inset_0()
@@ -719,7 +744,7 @@ impl Root {
                             this.dispatch(UiAction::CancelDialog, window, cx);
                         },
                     ))
-                    .child(
+                    .child(crate::components::rise_in(
                         div()
                             .w(px(modal_width))
                             .min_w(px(0.))
@@ -804,9 +829,13 @@ impl Root {
                                         cx,
                                     )),
                             ),
-                    )
-                    .into_any_element(),
-            );
+                        "create-deck-panel-enter",
+                        popup_ms,
+                        crate::theme::ENTER_RISE_PX,
+                    )),
+                "create-deck-backdrop-enter",
+                popup_ms,
+            ));
         }
         if let Some(confirmation) = self.confirmation.clone() {
             let (title, detail, accept, tone) = match confirmation {
@@ -832,7 +861,7 @@ impl Root {
                 ),
             };
             let cancel = self.action_click(UiAction::CancelDialog);
-            layers.push(
+            layers.push(crate::components::fade_in(
                 div()
                     .absolute()
                     .inset_0()
@@ -853,7 +882,7 @@ impl Root {
                             this.dispatch(UiAction::CancelDialog, window, cx);
                         },
                     ))
-                    .child(
+                    .child(crate::components::rise_in(
                         panel(colors)
                             .w(px(modal_width))
                             .min_w(px(0.))
@@ -888,15 +917,19 @@ impl Root {
                                         cx,
                                     )),
                             ),
-                    )
-                    .into_any_element(),
-            );
+                        "confirm-panel-enter",
+                        popup_ms,
+                        crate::theme::ENTER_RISE_PX,
+                    )),
+                "confirm-backdrop-enter",
+                popup_ms,
+            ));
         }
         if self.help_open {
             let close = self.action_click(UiAction::ToggleHelp);
             let help_width = (viewport_width - 32.0).clamp(0.0, 300.0);
             let help_height = (viewport_height - 32.0).max(0.0);
-            layers.push(
+            layers.push(crate::components::fade_in(
                 div()
                     .absolute()
                     .inset_0()
@@ -934,7 +967,7 @@ impl Root {
                             }
                         },
                     ))
-                    .child(
+                    .child(crate::components::rise_in(
                         div()
                             .id("help-modal")
                             .w(px(help_width))
@@ -1046,9 +1079,13 @@ impl Root {
                                         .child("Close"),
                                 ),
                             ),
-                    )
-                    .into_any_element(),
-            );
+                        "help-modal-enter",
+                        popup_ms,
+                        crate::theme::ENTER_RISE_PX,
+                    )),
+                "help-backdrop-enter",
+                popup_ms,
+            ));
         }
         if self.scrollbar_drag.is_some() {
             layers.push(
@@ -1142,10 +1179,11 @@ impl Root {
                     .left(px(nav_width + 32.))
                     .right(px(nav_width + 32.))
                     .w(px(toast_width))
-                    .child(crate::components::fade_in(
+                    .child(crate::components::rise_in(
                         body,
                         ("toast", usize::try_from(toast.seq).unwrap_or(0)),
-                        self.motion_ms(crate::theme::MOTION_QUICK_MS),
+                        popup_ms,
+                        10.0,
                     ))
                     .into_any_element(),
             );

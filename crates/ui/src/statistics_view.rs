@@ -765,13 +765,12 @@ impl Root {
                             })
                             .child(value_label),
                     )
-                    .child(
-                        div()
-                            .w(px(bar_width))
-                            .h(px(height))
-                            .rounded(px(8.))
-                            .bg(hue),
-                    )
+                    .child(crate::components::grow_height(
+                        div().w(px(bar_width)).rounded(px(8.)).bg(hue),
+                        gpui::ElementId::named_usize("forecast-bar", index),
+                        self.motion_ms(crate::theme::MOTION_PROGRESS_MS),
+                        height,
+                    ))
                     .child(
                         div()
                             .max_w(px(bar_width))

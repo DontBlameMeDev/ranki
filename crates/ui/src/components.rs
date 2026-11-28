@@ -315,8 +315,69 @@ pub fn fade_in(
             gpui::Animation::new(std::time::Duration::from_millis(
                 milliseconds,
             ))
-            .with_easing(|delta| 1.0 - (1.0 - delta) * (1.0 - delta)),
+            .with_easing(crate::theme::ease_out_cubic),
             gpui::Styled::opacity,
+        )
+        .into_any_element()
+}
+
+/// Fades an element in and lifts it into place. `rise` is the starting
+/// vertical offset in pixels: positive starts lower, negative starts higher.
+/// The clock starts on the frame that mounts `id`; a zero duration returns the
+/// element unwrapped, which is what reduced motion uses.
+///
+/// The entrance sets `top` unless `rise` is zero, so the element must not
+/// position itself with `top`. Wrap a positioned element instead.
+pub fn rise_in(
+    element: impl IntoElement + Styled + 'static,
+    id: impl Into<gpui::ElementId>,
+    milliseconds: u64,
+    rise: f32,
+) -> gpui::AnyElement {
+    use gpui::AnimationExt as _;
+    if milliseconds == 0 {
+        return element.into_any_element();
+    }
+    element
+        .with_animation(
+            id,
+            gpui::Animation::new(std::time::Duration::from_millis(
+                milliseconds,
+            ))
+            .with_easing(crate::theme::ease_out_cubic),
+            move |element, delta| {
+                let element = element.opacity(delta);
+                if rise == 0.0 {
+                    element
+                } else {
+                    element.top(px(rise * (1.0 - delta)))
+                }
+            },
+        )
+        .into_any_element()
+}
+
+/// Grows an element to `target` pixels tall over `milliseconds`, starting
+/// from zero. A zero duration paints the target immediately.
+pub fn grow_height(
+    element: impl IntoElement + Styled + 'static,
+    id: impl Into<gpui::ElementId>,
+    milliseconds: u64,
+    target: f32,
+) -> gpui::AnyElement {
+    use gpui::AnimationExt as _;
+    let target = target.max(0.0);
+    if milliseconds == 0 {
+        return element.h(px(target)).into_any_element();
+    }
+    element
+        .with_animation(
+            id,
+            gpui::Animation::new(std::time::Duration::from_millis(
+                milliseconds,
+            ))
+            .with_easing(crate::theme::ease_out_cubic),
+            move |element, delta| element.h(px(target * delta)),
         )
         .into_any_element()
 }

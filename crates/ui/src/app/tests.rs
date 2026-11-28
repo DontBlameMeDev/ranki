@@ -21,11 +21,26 @@ use super::{
     build_deck_rows, collect_tags, compute_visible_deck_rows, deck_meta,
     due_total, duration_label, empty_copy, empty_kind, filter_decks,
     focused_delta, forecast_bar_height, forecast_total, model_index,
-    models_with_stock, next_due_deck, next_view, prepare_deck_rows,
-    queue_counts, refreshed_card, session_progress, suggest_tags,
-    sum_leaf_counts, validate_draft, validate_occlusion,
+    models_with_stock, next_due_deck, next_view, page_motion_id,
+    prepare_deck_rows, queue_counts, refreshed_card, session_progress,
+    suggest_tags, sum_leaf_counts, validate_draft, validate_occlusion,
 };
 use gpui::{SharedString, point, px, size};
+
+#[test]
+fn every_view_gets_its_own_page_entrance() {
+    let ids = [
+        View::Decks,
+        View::Browse,
+        View::Review,
+        View::AddCard,
+        View::Settings,
+        View::Statistics,
+    ]
+    .map(page_motion_id);
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len());
+}
 
 struct ModalStore;
 
@@ -5682,7 +5697,10 @@ fn reduce_motion_setting_is_saved_and_applies(cx: &mut gpui::TestAppContext) {
             root.dispatch(UiAction::SetReduceMotion(Some(false)), window, cx);
         });
     });
-    assert_eq!(cx.update(|_, cx| root.read(cx).motion_ms(240)), 240);
+    assert!(
+        cx.update(|_, cx| root.read(cx).motion_ms(240)) > 0,
+        "full motion keeps a non-zero duration"
+    );
     let recorded = latest
         .lock()
         .expect("settings lock")

@@ -100,6 +100,20 @@ impl From<View> for UiView {
         }
     }
 }
+
+/// Element id for the page entrance. Each view gets its own id so a switch
+/// replays the transition and a redraw of the same view does not.
+const fn page_motion_id(view: View) -> &'static str {
+    match view {
+        View::Decks => "page-decks",
+        View::Browse => "page-browse",
+        View::Review => "page-review",
+        View::AddCard => "page-add-card",
+        View::Settings => "page-settings",
+        View::Statistics => "page-statistics",
+    }
+}
+
 /// Review content phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Phase {
@@ -2302,11 +2316,13 @@ impl Root {
     }
 
     /// Motion is on unless the setting or the desktop preference disables it.
+    /// `RANKI_UI_DEV_MOTION_SCALE` slows every transition for a visual check,
+    /// so the headless harness can capture frames mid-flight.
     pub(crate) fn motion_ms(&self, milliseconds: u64) -> u64 {
         if theme::reduced_motion(self.options.reduce_motion) {
             0
         } else {
-            milliseconds
+            milliseconds.saturating_mul(dev_motion_scale())
         }
     }
 
@@ -4693,6 +4709,11 @@ impl Render for Root {
             .overflow_hidden()
             .when(mobile_nav, |this| this.pb(px(theme::MOBILE_NAV_HEIGHT)))
             .child(main);
+        let page = crate::components::fade_in(
+            page,
+            page_motion_id(view),
+            self.motion_ms(theme::MOTION_PAGE_MS),
+        );
         let overlays = self.render_overlay(window, cx);
         let root = if mobile_nav {
             root_base.child(page).children(nav).children(overlays)
@@ -5410,6 +5431,18 @@ const END_SESSION_CONTEXT: &str = "ranki && !ranki_dialog";
 /// Browse navigation stays out of the search field and dialogs.
 const BROWSE_CONTEXT: &str =
     "ranki && ranki_browse && !ranki_input && !ranki_dialog";
+
+/// Slow-motion factor for visual checks. Unset or invalid means real time.
+fn dev_motion_scale() -> u64 {
+    static SCALE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        env::var("RANKI_UI_DEV_MOTION_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .map_or(1, |scale| scale.clamp(1, 20))
+    })
+}
+
 #[must_use]
 pub fn key_bindings() -> Vec<KeyBinding> {
     let mut bindings = vec![

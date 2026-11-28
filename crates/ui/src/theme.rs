@@ -250,11 +250,26 @@ pub const fn accent_ink(theme: Theme) -> Rgba {
     }
 }
 
-/// Motion durations for the two purposeful transitions. Both stay under the
-/// 150 ms ceiling the mockup spec allows for a state swap, and neither blocks
-/// input: gpui advances animations on the frame clock, not on the action.
+/// Motion durations. Every animated surface reads one of these through
+/// `Root::motion_ms`, so the reduce-motion setting and desktop preference
+/// switch the whole app at once. None blocks input: gpui advances animations
+/// on the frame clock, not on the action.
 pub const MOTION_QUICK_MS: u64 = 120;
 pub const MOTION_PROGRESS_MS: u64 = 180;
+/// Full-page swap, such as Decks to Browse.
+pub const MOTION_PAGE_MS: u64 = 160;
+/// Menus, popovers, dialogs, banners, and toasts.
+pub const MOTION_POPUP_MS: u64 = 120;
+/// How far a surface travels vertically while it fades in, in pixels.
+pub const ENTER_RISE_PX: f32 = 8.0;
+
+/// Cubic ease-out: quick start, soft landing. Entrances all share this curve
+/// so surfaces settle with the same weight.
+#[must_use]
+pub fn ease_out_cubic(delta: f32) -> f32 {
+    let inverse = 1.0 - delta.clamp(0.0, 1.0);
+    1.0 - inverse * inverse * inverse
+}
 
 /// Mixes two roles. Used only to derive hover and pressed shades of an
 /// existing role, never to introduce a new hue.
@@ -785,13 +800,14 @@ mod tests {
     use super::{
         ADD_GAP, BUTTON_HEIGHT, BUTTON_PADDING_X, BUTTON_RADIUS,
         BUTTON_TEXT_SIZE, LATTE, MOBILE_NAV_HEIGHT, MOBILE_TOUCH_TARGET,
-        MOBILE_WIDTH, MOCHA, MOTION_PROGRESS_MS, MOTION_QUICK_MS,
-        NAV_AUTO_COMPACT_WIDTH, NAV_COMPACT_WIDTH, NAV_WIDTH, NAV_WIDTH_MAX,
-        NAV_WIDTH_MIN, PAGE_X, PAGE_Y, PROGRESS_HEIGHT, PROGRESS_WIDTH,
-        RATING_GAP, SPACE_BLOCK, SPACE_GROUP, SPACE_GUTTER, SPACE_INLINE,
-        SPACE_RELATED, SPACE_SECTION, STAGE_HEIGHT, STAGE_PADDING,
-        STAGE_RADIUS, STAGE_WIDTH, Theme, accent_hover, accent_press, alpha,
-        blend, card_colors, contrast, font_candidates, gtk_animations_disabled,
+        MOBILE_WIDTH, MOCHA, MOTION_PAGE_MS, MOTION_POPUP_MS,
+        MOTION_PROGRESS_MS, MOTION_QUICK_MS, NAV_AUTO_COMPACT_WIDTH,
+        NAV_COMPACT_WIDTH, NAV_WIDTH, NAV_WIDTH_MAX, NAV_WIDTH_MIN, PAGE_X,
+        PAGE_Y, PROGRESS_HEIGHT, PROGRESS_WIDTH, RATING_GAP, SPACE_BLOCK,
+        SPACE_GROUP, SPACE_GUTTER, SPACE_INLINE, SPACE_RELATED, SPACE_SECTION,
+        STAGE_HEIGHT, STAGE_PADDING, STAGE_RADIUS, STAGE_WIDTH, Theme,
+        accent_hover, accent_press, alpha, blend, card_colors, contrast,
+        ease_out_cubic, font_candidates, gtk_animations_disabled,
         interval_label, is_mobile_width, kde_animations_disabled, keycap_ink,
         nav_width, page_width, palette, parse_flag_bool, parse_hex_color,
         placeholder_color, rating_fill, rating_label, reduced_motion,
@@ -1002,11 +1018,26 @@ mod tests {
     }
 
     #[test]
-    fn motion_durations_stay_under_the_spec_ceiling() {
+    fn motion_durations_stay_short() {
         const { assert!(MOTION_QUICK_MS <= 150) };
         const { assert!(MOTION_PROGRESS_MS <= 200) };
+        const { assert!(MOTION_PAGE_MS <= 200) };
+        const { assert!(MOTION_POPUP_MS <= 150) };
         assert!(reduced_motion(Some(true)));
         assert!(!reduced_motion(Some(false)));
+    }
+
+    #[test]
+    fn ease_out_cubic_settles_at_the_ends() {
+        assert!(ease_out_cubic(-1.0).abs() < 0.0001);
+        assert!((ease_out_cubic(1.0) - 1.0).abs() < 0.0001);
+        assert!((ease_out_cubic(2.0) - 1.0).abs() < 0.0001);
+        let mut last = -1.0;
+        for step in 0..=10u8 {
+            let value = ease_out_cubic(f32::from(step) / 10.0);
+            assert!(value >= last, "easing must not go backwards");
+            last = value;
+        }
     }
 
     #[test]

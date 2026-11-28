@@ -12,6 +12,7 @@ use crate::{
     card_view,
     components::{
         ClickHandler, Interaction, chip, fade_in, icon, keycap, progress_bar,
+        rise_in,
     },
     theme::{
         BUTTON_HEIGHT, BUTTON_PADDING_X, BUTTON_RADIUS, BUTTON_TEXT_SIZE,
@@ -688,8 +689,16 @@ impl Root {
                         .child(keycap("Space", colors, true))
                         .into_any_element()
                 } else {
-                    rating_row(card_width, colors, &previews, self, compact, cx)
-                        .into_any_element()
+                    rise_in(
+                        rating_row(
+                            card_width, colors, &previews, self, compact, cx,
+                        ),
+                        SharedString::from(format!(
+                            "rating-{key}-{animation_seq}"
+                        )),
+                        quick,
+                        6.0,
+                    )
                 })
                 .into_any_element()
         };

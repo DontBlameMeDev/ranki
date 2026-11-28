@@ -492,6 +492,16 @@ impl Root {
                             .copied()
                             .max()
                             .unwrap_or_default();
+                        // Reserve the tallest bar so growth never resizes the
+                        // card and pushes the deck table down.
+                        let bar_ceiling = self.forecast.iter().fold(
+                            6.0_f32,
+                            |tallest, count| {
+                                tallest.max(app::forecast_bar_height(
+                                    *count, peak,
+                                ))
+                            },
+                        );
                         let mut bars = div()
                             .mt(px(SPACE_BLOCK))
                             .flex()
@@ -523,15 +533,33 @@ impl Root {
                                     .child(
                                         div()
                                             .w_full()
-                                            .h(px(app::forecast_bar_height(
-                                                *count, peak,
-                                            )))
-                                            .rounded(px(8.))
-                                            .bg(if *count == 0 {
-                                                colors.surface1
-                                            } else {
-                                                colors.mauve
-                                            }),
+                                            .h(px(bar_ceiling))
+                                            .flex()
+                                            .items_end()
+                                            .child(
+                                                crate::components::grow_height(
+                                                    div()
+                                                        .w_full()
+                                                        .rounded(px(8.))
+                                                        .bg(if *count == 0 {
+                                                            colors.surface1
+                                                        } else {
+                                                            colors.mauve
+                                                        }),
+                                                    gpui::ElementId::
+                                                        named_usize(
+                                                            "deck-forecast-bar",
+                                                            index,
+                                                        ),
+                                                    self.motion_ms(
+                                                        crate::theme::
+                                                            MOTION_PROGRESS_MS,
+                                                    ),
+                                                    app::forecast_bar_height(
+                                                        *count, peak,
+                                                    ),
+                                                ),
+                                            ),
                                     )
                                     .child(
                                         div()

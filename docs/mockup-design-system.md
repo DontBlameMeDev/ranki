@@ -124,11 +124,14 @@ are used on all deck count columns.
 
 ## Motion
 
-No transitions, animations, hover effects, or reduced-motion rules exist in the
-exported CSS. The only implied motion is a state swap: question to answer,
-segment selection, and queue-tab underline. Keep reveal and grading immediate.
-If a transition is added later, use a 100-150 ms opacity or color fade and honor
-reduced motion. Do not add card flips, scale pulses, or sliding panels.
+The mockups ship no transitions. The app adds one motion layer on top of this
+system: page swaps cross-fade, menus, pickers, dialogs, banners, and toasts fade
+and settle a few pixels into place, the answer and rating row rise in, and
+forecast bars grow from the baseline. Entrances run 120 ms, page swaps 160 ms,
+bar growth 180 ms, all on a cubic ease-out. They read the shared tokens in
+`crates/ui/src/theme.rs` and honor the reduced-motion setting and desktop
+preference, which paint every state instantly. Hover and press colors stay
+instant, and card flips, confetti, scale pulses, and auto-advance stay out.
 
 ## Catppuccin mapping
 
