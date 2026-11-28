@@ -214,6 +214,7 @@ capture() {
   local name="$1"
   local view="${2:-}"
   local reveal="${3:-}"
+  local toasts="${4:-}"
   local app_pid
   local -a app_env=(env XDG_CONFIG_HOME="$config" XDG_DATA_HOME="$data" RANKI_REDUCE_MOTION=1)
   if [[ -n "$view" ]]; then
@@ -221,6 +222,9 @@ capture() {
   fi
   if [[ -n "$reveal" ]]; then
     app_env+=("RANKI_UI_DEV_REVEAL=1")
+  fi
+  if [[ -n "$toasts" ]]; then
+    app_env+=("RANKI_UI_DEV_TOAST=$toasts")
   fi
   setsid "${app_env[@]}" \
     nix develop --command nix shell "${nix_packages[@]}" --command env \
@@ -251,6 +255,7 @@ capture decks decks
 capture question question
 capture answer answer 1
 capture add add
+capture toasts decks "" 'success:Deck created|warning:Sync needs a manual choice: both collections changed since the last sync|error:Sync failed'
 
 hidden swaymsg output '*' resolution 900x600 >/dev/null
 capture small question

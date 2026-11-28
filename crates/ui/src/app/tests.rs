@@ -673,7 +673,7 @@ fn opening_statistics_uses_the_cached_summary(cx: &mut gpui::TestAppContext) {
 
     assert_eq!(reads.load(Ordering::Relaxed), before);
     assert_eq!(cx.update(|_, app| root.read(app).view), View::Statistics);
-    assert!(cx.update(|_, app| root.read(app).toast.is_none()));
+    assert!(cx.update(|_, app| root.read(app).toasts.is_empty()));
 }
 #[gpui::test]
 fn create_deck_error_lives_by_the_input_until_the_name_changes(
@@ -712,7 +712,7 @@ fn create_deck_error_lives_by_the_input_until_the_name_changes(
         error.as_deref(),
         Some("Could not create deck: invalid data: deck already exists: taken")
     );
-    assert!(cx.update(|_, app| root.read(app).toast.is_none()));
+    assert!(cx.update(|_, app| root.read(app).toasts.is_empty()));
 
     cx.update(|_, app| {
         root.update(app, |root, cx| {
@@ -1891,7 +1891,7 @@ fn session_sync_counts(
         root.grade(ranki_model::Rating::Easy, cx);
     });
     cx.run_until_parked();
-    let quiet = cx.read_entity(&root, |root, _| root.toast.is_none());
+    let quiet = cx.read_entity(&root, |root, _| root.toasts.is_empty());
     assert_eq!(quiet, settled);
     (syncs.load(Ordering::Relaxed), media.load(Ordering::Relaxed))
 }
@@ -4518,7 +4518,7 @@ fn editing_a_card_reports_a_store_read_failure(cx: &mut gpui::TestAppContext) {
     });
 
     let toast = cx
-        .update(|_, app| root.read(app).toast.clone())
+        .update(|_, app| root.read(app).latest_toast().cloned())
         .expect("error toast");
     assert!(matches!(toast.kind, super::ToastKind::Error));
     assert_eq!(
@@ -5371,7 +5371,7 @@ fn external_change_aborts_grade_undo_and_save_note(
     assert_eq!(writes.load(Ordering::Relaxed), 0, "grade must not write");
     assert!(cx.update(|_, cx| root.read(cx).external_change));
     let toast = cx.update(|_, cx| {
-        root.read(cx).toast.as_ref().map(|toast| toast.text.clone())
+        root.read(cx).latest_toast().map(|toast| toast.text.clone())
     });
     assert!(
         toast.as_ref().is_some_and(|text| text.contains("Reload")),
@@ -5646,7 +5646,7 @@ fn import_guard_blocks_duplicates_and_reload(cx: &mut gpui::TestAppContext) {
         root.import_path(PathBuf::from("deck.apkg"), cx);
     });
     let toast = cx.update(|_, cx| {
-        root.read(cx).toast.as_ref().map(|toast| toast.text.clone())
+        root.read(cx).latest_toast().map(|toast| toast.text.clone())
     });
     assert!(
         toast
@@ -5667,7 +5667,7 @@ fn import_guard_blocks_duplicates_and_reload(cx: &mut gpui::TestAppContext) {
     assert_eq!(view, View::Review, "reload must wait for the import");
     assert!(confirmation.is_none());
     let toast = cx.update(|_, cx| {
-        root.read(cx).toast.as_ref().map(|toast| toast.text.clone())
+        root.read(cx).latest_toast().map(|toast| toast.text.clone())
     });
     assert!(
         toast
@@ -5918,9 +5918,9 @@ fn auto_sync_toggle_persists_and_rolls_back(cx: &mut gpui::TestAppContext) {
             .is_some_and(|settings| settings.sync.auto)
     );
     assert!(
-        cx.read_entity(&root, |root, _| root.toast.is_none()),
+        cx.read_entity(&root, |root, _| root.toasts.is_empty()),
         "unexpected toast: {:?}",
-        cx.read_entity(&root, |root, _| root.toast.clone())
+        cx.read_entity(&root, |root, _| root.latest_toast().cloned())
     );
 
     fail.store(true, Ordering::Relaxed);
@@ -5930,7 +5930,7 @@ fn auto_sync_toggle_persists_and_rolls_back(cx: &mut gpui::TestAppContext) {
         "a failed save must restore the previous value"
     );
     assert_eq!(
-        cx.read_entity(&root, |root, _| root.toast.clone())
+        cx.read_entity(&root, |root, _| root.latest_toast().cloned())
             .map(|toast| toast.text),
         Some(String::from("Could not save sync setting: disk full"))
     );
@@ -6003,7 +6003,7 @@ fn remote_download_keeps_the_view_and_drafts_but_ends_review(
             root.view,
             root.review.current.is_some(),
             !root.review.queue.is_empty(),
-            root.toast.clone().map(|toast| toast.text),
+            root.latest_toast().cloned().map(|toast| toast.text),
         )
     });
     assert_eq!(view, View::Decks);
@@ -6241,8 +6241,8 @@ fn unschedulable_answers_return_to_the_question(cx: &mut gpui::TestAppContext) {
     let (phase, toast, sequence) = cx.read_entity(&root, |root, _| {
         (
             root.review.phase,
-            root.toast.as_ref().map(|toast| toast.text.clone()),
-            root.toast.as_ref().map(|toast| toast.seq),
+            root.latest_toast().map(|toast| toast.text.clone()),
+            root.latest_toast().map(|toast| toast.seq),
         )
     });
     assert_eq!(
@@ -6260,7 +6260,7 @@ fn unschedulable_answers_return_to_the_question(cx: &mut gpui::TestAppContext) {
         root.grade(ranki_model::Rating::Good, cx);
     });
     assert_eq!(
-        cx.read_entity(&root, |root, _| root.toast.as_ref().map(|t| t.seq)),
+        cx.read_entity(&root, |root, _| root.latest_toast().map(|t| t.seq)),
         sequence,
         "a second grade must reveal, not repeat the error toast"
     );
@@ -6486,7 +6486,7 @@ fn enter_applies_inline_rename_and_reports_it(cx: &mut gpui::TestAppContext) {
                 .map(|deck| deck.name.clone())
                 .collect::<Vec<_>>(),
             root.deck_edit.is_some(),
-            root.toast.clone(),
+            root.latest_toast().cloned(),
             root.focus.is_focused(window),
         )
     });
@@ -6683,7 +6683,7 @@ fn deck_remove_confirmation_focuses_dialog_and_enter_confirms(
                 .iter()
                 .map(|deck| deck.name.clone())
                 .collect::<Vec<_>>(),
-            root.toast.clone(),
+            root.latest_toast().cloned(),
         )
     });
     assert!(state.0, "Enter confirms the deck removal");
@@ -6839,7 +6839,7 @@ fn creating_a_deck_selects_it_for_add_card(cx: &mut gpui::TestAppContext) {
                 .deck_id
                 .and_then(|id| root.decks.iter().find(|deck| deck.id == id))
                 .map(|deck| deck.name.clone()),
-            root.toast.clone(),
+            root.latest_toast().cloned(),
         )
     });
     assert_eq!(state.0.as_deref(), Some("Fresh"));
@@ -7505,7 +7505,8 @@ fn successful_add_clears_tag_chips(cx: &mut gpui::TestAppContext) {
 
     let (toast, chips) = cx.read_entity(&root, |root, _| {
         (
-            root.toast
+            root.latest_toast()
+                .cloned()
                 .as_ref()
                 .map(|toast| (toast.kind, toast.text.clone())),
             root.add.tag_chips.clone(),
@@ -7534,9 +7535,116 @@ fn add_toast_agrees_with_the_card_count(cx: &mut gpui::TestAppContext) {
     cx.run_until_parked();
 
     let toast = cx.read_entity(&root, |root, _| {
-        root.toast.as_ref().map(|toast| toast.text.clone())
+        root.latest_toast().map(|toast| toast.text.clone())
     });
     assert_eq!(toast.as_deref(), Some("Added 2 cards"));
+}
+
+#[gpui::test]
+fn toasts_stack_in_order_and_dismiss_only_one(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(editor_launch(EditorStore::new()), window, cx)
+    });
+    cx.update_entity(&root, |root, cx| {
+        root.set_toast(ToastKind::Success, "Deck created");
+        root.set_toast(ToastKind::Warning, "Sync needs a choice");
+        root.set_toast(ToastKind::Error, "Sync failed");
+        cx.notify();
+    });
+
+    let (texts, kinds, seqs) = cx.read_entity(&root, |root, _| {
+        (
+            root.toasts
+                .iter()
+                .map(|toast| toast.text.clone())
+                .collect::<Vec<_>>(),
+            root.toasts
+                .iter()
+                .map(|toast| toast.kind)
+                .collect::<Vec<_>>(),
+            root.toasts
+                .iter()
+                .map(|toast| toast.seq)
+                .collect::<Vec<_>>(),
+        )
+    });
+    assert_eq!(
+        texts,
+        ["Deck created", "Sync needs a choice", "Sync failed"]
+    );
+    assert_eq!(
+        kinds,
+        [ToastKind::Success, ToastKind::Warning, ToastKind::Error]
+    );
+    assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]));
+
+    cx.update_entity(&root, |root, _| {
+        root.clear_toast_if(Some(seqs[1]));
+    });
+    let texts = cx.read_entity(&root, |root, _| {
+        root.toasts
+            .iter()
+            .map(|toast| toast.text.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(texts, ["Deck created", "Sync failed"]);
+
+    cx.update_entity(&root, |root, cx| {
+        root.set_create_error("Name is taken", cx);
+    });
+    let texts = cx.read_entity(&root, |root, _| {
+        root.toasts
+            .iter()
+            .map(|toast| toast.text.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(texts, ["Deck created", "Sync failed"]);
+}
+
+#[gpui::test]
+fn toast_stack_keeps_only_the_newest_four(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(editor_launch(EditorStore::new()), window, cx)
+    });
+    cx.update_entity(&root, |root, cx| {
+        for index in 0..6 {
+            root.set_toast(ToastKind::Success, format!("Message {index}"));
+        }
+        cx.notify();
+    });
+    let texts = cx.read_entity(&root, |root, _| {
+        root.toasts
+            .iter()
+            .map(|toast| toast.text.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(texts, ["Message 2", "Message 3", "Message 4", "Message 5"]);
+}
+
+#[gpui::test]
+fn long_toast_stays_in_the_bottom_right(cx: &mut gpui::TestAppContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        super::Root::new(editor_launch(EditorStore::new()), window, cx)
+    });
+    cx.simulate_resize(size(px(1280.), px(800.)));
+    cx.update_entity(&root, |root, cx| {
+        root.set_toast(
+            ToastKind::Error,
+            "Sync needs a manual choice: both collections changed since the last sync",
+        );
+        cx.notify();
+    });
+    cx.draw(point(px(0.), px(0.)), size(px(1280.), px(800.)), |_, _| {
+        root.clone()
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+
+    let bounds = cx.debug_bounds("toast-card").expect("toast card bounds");
+    assert!(bounds.size.width <= px(320.));
+    assert!(bounds.origin.x + bounds.size.width > px(900.));
+    assert!(bounds.origin.y + bounds.size.height > px(700.));
 }
 
 #[gpui::test]
@@ -7929,7 +8037,7 @@ fn startup_reads_the_summary_off_the_ui_thread(cx: &mut gpui::TestAppContext) {
     );
     cx.run_until_parked();
     assert_eq!(reads.load(Ordering::Relaxed), 0);
-    assert!(cx.update(|_, app| root.read(app).toast.is_none()));
+    assert!(cx.update(|_, app| root.read(app).toasts.is_empty()));
 }
 
 #[gpui::test]
@@ -7990,7 +8098,7 @@ fn startup_sync_runs_after_the_window_opens(cx: &mut gpui::TestAppContext) {
         *deferred.lock().unwrap(),
         Some(ranki_sync::SyncOutcome::NoChanges)
     );
-    assert!(cx.update(|_, app| root.read(app).toast.is_none()));
+    assert!(cx.update(|_, app| root.read(app).toasts.is_empty()));
     cx.update(|_, cx| {
         root.update(cx, |root, cx| {
             root.sync.conflict = Some(String::from("earlier choice"));
