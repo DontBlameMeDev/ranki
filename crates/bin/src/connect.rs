@@ -2050,6 +2050,18 @@ mod tests {
         assert_eq!(response.result, Value::Null);
     }
 
+    struct StopServer<'a> {
+        server: &'a Server,
+        stalled: Option<TcpStream>,
+    }
+
+    impl Drop for StopServer<'_> {
+        fn drop(&mut self) {
+            drop(self.stalled.take());
+            self.server.unblock();
+        }
+    }
+
     #[expect(
         clippy::excessive_nesting,
         reason = "the concurrency test drives two clients inside a scoped server thread"
@@ -2073,6 +2085,10 @@ mod tests {
                     b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4096\r\n\r\n",
                 )
                 .unwrap();
+            let stop = StopServer {
+                server: &server,
+                stalled: Some(stalled),
+            };
             thread::sleep(Duration::from_millis(100));
 
             let body = r#"{"action":"version","version":6}"#;
@@ -2098,8 +2114,7 @@ mod tests {
                 }
             }
 
-            drop(stalled);
-            server.unblock();
+            drop(stop);
             assert!(runner.join().unwrap().is_ok());
         });
     }
