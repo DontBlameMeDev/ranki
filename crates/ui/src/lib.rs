@@ -45,7 +45,8 @@ mod text_field;
 mod theme;
 
 use gpui::{
-    App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size,
+    App, AppContext, Application, Bounds, Window, WindowBounds, WindowOptions,
+    px, size,
 };
 use ranki_model::Store;
 use std::sync::Arc;
@@ -80,12 +81,10 @@ pub fn run(
                     ..Default::default()
                 },
                 |window, cx| {
-                    // Keep the window alive until the event loop exits. A
-                    // close request still queues Wayland frame callbacks, and
-                    // those log "window not found" if GPUI removes the window
-                    // first. The process exit tears the window down.
-                    window.on_window_should_close(cx, |_, app| {
-                        app.quit();
+                    // Close the window now. Shutdown work runs after the
+                    // event loop, so it must not keep the window on screen.
+                    window.on_window_should_close(cx, |window, app| {
+                        close_window(window, app);
                         false
                     });
                     let root = cx.new(|cx| {
@@ -114,4 +113,23 @@ pub fn run(
             }
             app.activate(true);
         });
+}
+
+fn close_window(window: &mut Window, app: &App) {
+    window.remove_window();
+    app.quit();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::close_window;
+    use gpui::{AppContext as _, EmptyView, TestAppContext};
+
+    #[gpui::test]
+    fn close_request_removes_the_window(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        cx.update_window(*window, |_, window, app| close_window(window, app))
+            .unwrap();
+        assert!(cx.windows().is_empty());
+    }
 }
